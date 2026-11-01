@@ -1,7 +1,8 @@
 # Windows games: Proton with D3DMetal for graphics
 
-Status: design (2026-11-01). Step 0 done: D3DMetal runs in a plain Mac
-process through d3dmetal-native (below). Depends on FEX running under
+Status: design (2026-11-01). Steps 0 and 1 done: D3DMetal runs in a plain
+Mac process through d3dmetal-native, and its frames reach macwl-compositor
+as ordinary `wl_shm` buffers (below). Depends on FEX running under
 macwl-run (not started) for x86 games, but not for the graphics work.
 
 ## The goal
@@ -32,8 +33,8 @@ Metal) where D3DMetal is one, and Apple tunes D3DMetal for its GPUs.
  macwl-d3d: a Mac helper process, x86_64 under Rosetta
    │  the same calls, made for real
    ▼
- D3DMetal → Metal → IOSurface
-   │  attached to the game's Wayland surface
+ D3DMetal → Metal → shared texture (linear, in a shm fd)
+   │  the fd, as a wl_shm buffer on the game's Wayland surface
    ▼
  macwl-compositor → macwl-shell
 ```
@@ -168,21 +169,34 @@ The hard part, as for any API remoting.
 
 ### Presenting
 
-The proxy forwards swap chain calls; in the helper the swap chain is
-created for a pseudo-HWND over a `CAMetalLayer` the helper owns and never
-shows (`dmn_window_create_for_layer`). Each drawable's texture is an
-IOSurface, and `Present` gives that to the compositor.
-macwl-compositor gets a small private protocol (`macwl_surface_import`): the
-guest's DXGI proxy exports a token for the game window's `wl_surface`
-(Wine's Wayland driver has it), the helper imports it and attaches IOSurface
-buffers to it. The shell already draws surfaces as Metal layers, so frames
-reach the screen with no copies. This is also the compositor's IOSurface
-buffer item (ROADMAP, Compositor), done once for everyone.
+Simpler than it looked: on macOS, d3dmetal-native backs a shared texture
+(`D3D11_RESOURCE_MISC_SHARED`, or a D3D12 shared heap) with a **linear
+image in a shared-memory fd**, and its handle says where (`dxn_shared_texture`:
+fd, offset, row pitch). That is exactly a `wl_shm` buffer. So the helper
+renders into shared textures, the fds go to the guest, and Wine's Wayland
+driver attaches them as ordinary `wl_shm` buffers: no private protocol, no
+IOSurfaces, and the compositor needs nothing new.
 
-To check in step 1: that drawables of an offscreen layer can be held by
-the compositor until it's done with them (or must be copied into IOSurfaces
-of our own, one GPU blit per frame), and how frame pacing (the waitable
-object, `displaySyncEnabled`) maps onto the compositor's frame callbacks.
+The proxy forwards swap chain calls; in the helper the swap chain's back
+buffers are shared textures (or are copied into some at `Present`, one GPU
+blit, as d3dmetal-native's own present path does). `Present` waits for the
+GPU (a fence; the step 1 probe uses an event query), then tells the guest
+which buffer to attach; `wl_buffer.release` returns it.
+
+Today the compositor copies each committed `wl_shm` buffer's damaged area
+into a texture. Wrapping a shm pool in an `MTLBuffer`
+(`newBufferWithBytesNoCopy`) and drawing from a texture over it would make
+that zero-copy for every shm client, games included; that's the
+compositor's IOSurface item done another way (ROADMAP, Compositor).
+
+**Step 1, 2026-11-01** (`experiments/d3d-wayland`, not in the repo): an
+x86_64 D3D11 program renders a spinning triangle into two shared textures
+through d3dmetal-native and sends their fds over a Unix socket; an arm64
+Wayland client (from `hello-client`) wraps them as `wl_shm` buffers, asks
+for a frame on each frame callback, attaches it, and returns releases.
+The headless compositor's dumps show the triangle, rotated as expected by
+the last frame; 240 frames in 2.5 s, paced by the compositor's frame
+callbacks (95 fps headless), at 640×480 (pitch 2560, offset 0).
 
 ### Packaging
 
@@ -210,10 +224,9 @@ macwl-run doesn't have); libraries come from the guest root.
 
 0. **Probe** (done, 2026-11-01): D3DMetal works without Wine through
    d3dmetal-native; see above.
-1. **On screen.** An x86_64 Mac program draws d3dmetal-native's triangle
-   into an offscreen `CAMetalLayer` and shows it in macwl-compositor as a
-   Mac Wayland client (like `hello-client`), through IOSurfaces.
-   `macwl_surface_import`, first version.
+1. **On screen** (done, 2026-11-01): D3D11 frames from an x86_64 producer
+   in an arm64 Wayland client's window, as `wl_shm` buffers over shared
+   textures; see **Presenting**.
 2. **The tunnel, without Wine.** `/dev/macwl-d3d`, the helper, the ring.
    A D3D12 heap over a guest memfd (`dmn_open_existing_heap_from_fd`).
 3. **Proxy DLLs, D3D11.** Under arm64 Wine with Windows-on-ARM test
@@ -247,7 +260,8 @@ Steps 1–3 and 4 are independent.
   on? Without it FEX orders memory in software, which is much slower for
   multithreaded games. Decides whether this is fast or a curiosity; worth
   testing early, though it's FEX's problem more than this design's.
-- Presenting from an offscreen layer: holding drawables, pacing (above).
+- Pacing for real games: the waitable object and `Present`'s sync
+  interval against the compositor's frame callbacks.
 - 64-bit atomics (step 0): a D3DMetal bug or an M5 one, and whether a
   newer GPTK fixes it.
 - Whether guest memfds meet `dmn_open_existing_heap_from_fd`'s needs

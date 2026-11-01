@@ -2,3 +2,4 @@ target/
 *.ppm
 *.log
 .DS_Store
+/experiments/
