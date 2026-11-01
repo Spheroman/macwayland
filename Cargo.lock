@@ -322,6 +322,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "dispatch2",
+ "libc",
  "macwl-compositor",
  "objc2",
  "objc2-app-kit",
