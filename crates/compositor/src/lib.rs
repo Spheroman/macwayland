@@ -73,13 +73,16 @@ use smithay::{
             XdgShellHandler, XdgShellState,
             decoration::{XdgDecorationHandler, XdgDecorationState},
         },
-        shm::{ShmHandler, ShmState, with_buffer_contents},
+        shm::{ShmHandler, ShmState, shm_buffer_pool, with_buffer_contents},
         socket::ListeningSocketSource,
     },
 };
 use tracing::{info, warn};
 
-pub use smithay::{reexports::wayland_server::protocol::wl_shm::Format as ShmFormat, wayland::shm::BufferData};
+pub use smithay::{
+    reexports::wayland_server::protocol::wl_shm::Format as ShmFormat,
+    wayland::shm::{BufferData, ShmPoolHandle},
+};
 
 pub mod keymap;
 
@@ -185,6 +188,22 @@ pub trait Host: Send {
     /// their layout, and what changed since its last frame (clipped to the
     /// buffer; all of it when the client didn't say).
     fn frame(&mut self, id: u32, pixels: &[u8], data: &BufferData, damage: &[Rect]);
+    /// Surface `id` committed a buffer, offered without a copy: the pool
+    /// it's in and where, and what changed. A host that can read the pool
+    /// itself takes it: it keeps `release` for as long as it reads the
+    /// buffer (dropping it gives the buffer back to the client) and returns
+    /// `None`. One that can't returns `release`, and the buffer comes again
+    /// as [`Host::frame`].
+    fn frame_shared(
+        &mut self,
+        _id: u32,
+        _pool: ShmPoolHandle,
+        _data: &BufferData,
+        _damage: &[Rect],
+        release: BufferRelease,
+    ) -> Option<BufferRelease> {
+        Some(release)
+    }
     /// What's on screen changed: these surfaces, bottom to top. A surface
     /// not listed isn't shown: forget it, and if it comes back, take all
     /// of its next frame.
@@ -193,6 +212,32 @@ pub trait Host: Send {
     fn copied(&mut self, _text: &str) {}
     /// What the pointer should look like now.
     fn cursor(&mut self, _cursor: Cursor) {}
+}
+
+/// A committed buffer a host is reading: dropping this gives it back to the
+/// client (`wl_buffer.release`, sent from the compositor's thread). Until
+/// then the client won't write to it.
+pub struct BufferRelease {
+    buffer: Option<wl_buffer::WlBuffer>,
+    to: channel::Sender<wl_buffer::WlBuffer>,
+}
+
+impl BufferRelease {
+    /// Give the buffer back now (on the compositor's thread).
+    fn now(mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            buffer.release();
+        }
+    }
+}
+
+impl Drop for BufferRelease {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            // The compositor may be gone (shutting down): then so is the client.
+            let _ = self.to.send(buffer);
+        }
+    }
 }
 
 /// What the pointer looks like, as the client under it asks.
@@ -272,6 +317,8 @@ struct App {
     copy_pending: Option<String>,
     /// Where the copies read come back to the event loop.
     copies: channel::Sender<String>,
+    /// Buffers hosts are done with, to release.
+    releases: channel::Sender<wl_buffer::WlBuffer>,
     /// When frame callbacks were last sent.
     last_callbacks: Instant,
     start: Instant,
@@ -368,13 +415,30 @@ impl App {
                 if shown {
                     let was_mapped = mapped(surface).is_some();
                     let (id, host) = (surface_id(surface), &mut self.host);
-                    let result = with_buffer_contents(&buffer, |ptr, len, data| {
-                        let pixels = unsafe { std::slice::from_raw_parts(ptr, len) };
-                        host.frame(id, pixels, &data, &buffer_damage(&damage, scale, data.width, data.height));
-                        set_mapped(surface, Some(Mapped { size: (data.width, data.height), scale }));
-                    });
-                    if let Err(e) = result {
-                        warn!("not an shm buffer: {e:?}");
+                    // The host reads the buffer where it is, if it can (and
+                    // releases it later); otherwise it gets a copy now.
+                    let release = BufferRelease { buffer: Some(buffer.clone()), to: self.releases.clone() };
+                    let declined = match shm_buffer_pool(&buffer) {
+                        Ok((pool, data)) => {
+                            let rects = buffer_damage(&damage, scale, data.width, data.height);
+                            let declined = host.frame_shared(id, pool, &data, &rects, release);
+                            if declined.is_none() {
+                                set_mapped(surface, Some(Mapped { size: (data.width, data.height), scale }));
+                            }
+                            declined
+                        }
+                        Err(_) => Some(release),
+                    };
+                    if let Some(release) = declined {
+                        let result = with_buffer_contents(&buffer, |ptr, len, data| {
+                            let pixels = unsafe { std::slice::from_raw_parts(ptr, len) };
+                            host.frame(id, pixels, &data, &buffer_damage(&damage, scale, data.width, data.height));
+                            set_mapped(surface, Some(Mapped { size: (data.width, data.height), scale }));
+                        });
+                        if let Err(e) = result {
+                            warn!("not an shm buffer: {e:?}");
+                        }
+                        release.now();
                     }
                     // A window appearing goes on top, with the keyboard.
                     if role == Some(XDG_TOPLEVEL_ROLE)
@@ -385,8 +449,9 @@ impl App {
                         self.windows.push(window);
                         self.focus_top();
                     }
+                } else {
+                    buffer.release();
                 }
-                buffer.release();
             }
             Some(BufferAssignment::Removed) => {
                 set_mapped(surface, None);
@@ -1083,6 +1148,7 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
     output.change_current_state(Some(mode), Some(Transform::Normal), Some(Scale::Integer(scale)), Some((0, 0).into()));
     output.set_preferred(mode);
     let (copies, copied) = channel::channel::<String>();
+    let (releases, released) = channel::channel::<wl_buffer::WlBuffer>();
     let mut state = App {
         dh: dh.clone(),
         host,
@@ -1107,6 +1173,7 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
         layout: Vec::new(),
         copy_pending: None,
         copies,
+        releases,
         last_callbacks: Instant::now(),
         start: Instant::now(),
     };
@@ -1129,6 +1196,11 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
         // Safety: the display isn't dropped while the event loop holds it.
         unsafe { display.get_mut().dispatch_clients(state)? };
         Ok(PostAction::Continue)
+    })?;
+    handle.insert_source(released, |event, _, _| {
+        if let channel::Event::Msg(buffer) = event {
+            buffer.release();
+        }
     })?;
     handle.insert_source(copied, |event, _, state| {
         if let channel::Event::Msg(text) = event {

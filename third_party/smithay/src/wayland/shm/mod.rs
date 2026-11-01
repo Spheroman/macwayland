@@ -256,6 +256,46 @@ where
     }
 }
 
+/// The shm pool behind a buffer (macwayland addition): its file and size,
+/// for a host that maps the pool itself to read buffers without copying
+/// them. The pool, and its file, live at least as long as the handle.
+#[derive(Debug, Clone)]
+pub struct ShmPoolHandle(Arc<Pool>);
+
+impl ShmPoolHandle {
+    /// The pool's file.
+    pub fn fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        self.0.fd()
+    }
+
+    /// The pool's size now (a client may grow it, never shrink it).
+    pub fn size(&self) -> usize {
+        self.0.size()
+    }
+
+    /// Whether `other` is the same pool.
+    pub fn same_pool(&self, other: &ShmPoolHandle) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Whether this handle (and its clones) is all that keeps the pool: the
+    /// client has destroyed it and every buffer in it.
+    pub fn is_orphaned(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+}
+
+/// The pool a buffer lies in, and where in it (macwayland addition).
+///
+/// Returns `Err(BufferAccessError::NotManaged)` for buffers that aren't shm
+/// buffers.
+pub fn shm_buffer_pool(buffer: &wl_buffer::WlBuffer) -> Result<(ShmPoolHandle, BufferData), BufferAccessError> {
+    let data = buffer
+        .data::<ShmBufferUserData>()
+        .ok_or(BufferAccessError::NotManaged)?;
+    Ok((ShmPoolHandle(data.pool.clone()), data.data))
+}
+
 /// Call given closure with the contents of the given buffer for mutable access
 ///
 /// If the buffer is managed by the provided `ShmGlobal`, its contents are

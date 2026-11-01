@@ -64,13 +64,13 @@ use objc2_app_kit::{
     NSDeviceRGBColorSpace, NSEventPhase, NSEventType, NSImage, NSPasteboard, NSPasteboardTypeString, NSScreen,
     NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use macwl_compositor::{BufferData, Cursor, InputEvent, Layer, Options, Rect};
+use macwl_compositor::{BufferData, BufferRelease, Cursor, InputEvent, Layer, Options, Rect, ShmPoolHandle};
 use objc2_foundation::{NSDefaultRunLoopMode, NSRunLoop, NSRunLoopCommonModes, NSString};
 use objc2_metal::{
-    MTLBlendFactor, MTLBlitCommandEncoder, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+    MTLRenderPipelineState, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
     MTLTextureUsage,
 };
 use objc2_quartz_core::{
@@ -81,9 +81,13 @@ use objc2_quartz_core::{
 const KEY_ESCAPE: u16 = 53;
 
 /// A client surface (a window or popup), kept up to date by the compositor
-/// thread (which copies in only what each commit changed) and uploaded by
-/// the render loop (only what changed since its last upload).
+/// thread and drawn by the render loop. Usually its buffer is drawn where it
+/// is, in the client's memory (`lease`); otherwise the compositor thread
+/// copies in what each commit changed and the render loop uploads what
+/// changed since its last upload.
 struct ClientFrame {
+    /// The buffer, read in place; `pixels` is then empty.
+    lease: Option<Arc<Lease>>,
     width: usize,
     height: usize,
     /// Whether its alpha is to be ignored (XRGB).
@@ -100,7 +104,17 @@ struct ClientFrame {
 
 impl ClientFrame {
     fn new(width: usize, height: usize, opaque: bool) -> Self {
-        ClientFrame { width, height, opaque, stride: width * 4, pixels: vec![0; width * 4 * height], seq: 0, committed: 0.0, dirty: None }
+        ClientFrame {
+            lease: None,
+            width,
+            height,
+            opaque,
+            stride: width * 4,
+            pixels: vec![0; width * 4 * height],
+            seq: 0,
+            committed: 0.0,
+            dirty: None,
+        }
     }
 
     /// Copy `r` from a buffer (`pixels` at `offset`, `stride` bytes a row).
@@ -133,19 +147,120 @@ struct Scene {
     seq: u64,
 }
 
+/// A client's shm pool, mapped by the shell (read-only) and wrapped as a
+/// Metal buffer, so the GPU reads its buffers where they are.
+struct MappedPool {
+    ptr: *mut c_void,
+    len: usize,
+    buffer: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+}
+
+// SAFETY: Metal buffers can be used from any thread, and the mapping is
+// only unmapped on drop, after the buffer is gone.
+unsafe impl Send for MappedPool {}
+unsafe impl Sync for MappedPool {}
+
+impl MappedPool {
+    /// Map `pool` and wrap it, if its file is as big as it says.
+    fn new(device: &ProtocolObject<dyn MTLDevice>, pool: &ShmPoolHandle) -> Option<MappedPool> {
+        use std::os::fd::AsRawFd;
+        let fd = pool.fd().as_raw_fd();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || (st.st_size as usize) < pool.size() {
+            return None;
+        }
+        // newBufferWithBytesNoCopy wants whole pages; the last one may run
+        // past the end of the file, which reads as zeros.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = pool.size().div_ceil(page) * page;
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        let buffer = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(
+                NonNull::new(ptr)?,
+                len,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        };
+        let mapped = MappedPool { ptr, len, buffer };
+        mapped.buffer.is_some().then_some(mapped)
+    }
+}
+
+impl Drop for MappedPool {
+    fn drop(&mut self) {
+        drop(self.buffer.take());
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
+/// A committed buffer drawn where it is: a texture over its part of the
+/// pool. Held while it's on screen and while the GPU may be reading it;
+/// when the last holder lets go, the buffer goes back to the client.
+struct Lease {
+    texture: Texture,
+    _pool: Arc<MappedPool>,
+    _release: BufferRelease,
+}
+
+/// Leases alive (MACWL_DEBUG_LEASES=1 prints this each second).
+static LEASES: AtomicIsize = AtomicIsize::new(0);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        LEASES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: as for MappedPool; the release only sends to the compositor.
+unsafe impl Send for Lease {}
+unsafe impl Sync for Lease {}
+
 /// The compositor's [`macwl_compositor::Host`]: hands frames and layout to
 /// the render loop.
-struct ShellHost(Arc<Mutex<Scene>>);
+struct ShellHost {
+    scene: Arc<Mutex<Scene>>,
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// What a linear texture's offset and row length must be multiples of.
+    align: usize,
+    /// Clients' pools, mapped: each as big as it was when last mapped (a
+    /// pool that grew is mapped again).
+    pools: Vec<(ShmPoolHandle, Arc<MappedPool>)>,
+    /// MACWL_SHM_COPY=1: copy every buffer, as before (to compare).
+    copy: bool,
+}
+
+// SAFETY: the device is only used to make buffers and textures, which Metal
+// allows from any thread.
+unsafe impl Send for ShellHost {}
+
+impl ShellHost {
+    /// `pool`, mapped (and wrapped as a Metal buffer).
+    fn mapped(&mut self, pool: &ShmPoolHandle) -> Option<Arc<MappedPool>> {
+        self.pools.retain(|(p, _)| !p.is_orphaned());
+        if let Some((_, m)) = self.pools.iter().find(|(p, m)| p.same_pool(pool) && m.len >= pool.size()) {
+            return Some(m.clone());
+        }
+        let m = Arc::new(MappedPool::new(&self.device, pool)?);
+        self.pools.retain(|(p, _)| !p.same_pool(pool));
+        self.pools.push((pool.clone(), m.clone()));
+        Some(m)
+    }
+}
 
 impl macwl_compositor::Host for ShellHost {
     fn frame(&mut self, id: u32, pixels: &[u8], data: &BufferData, damage: &[Rect]) {
         let (w, h) = (data.width as usize, data.height as usize);
         let opaque = data.format != macwl_compositor::ShmFormat::Argb8888;
-        let mut scene = self.0.lock().unwrap();
+        let mut scene = self.scene.lock().unwrap();
         scene.seq += 1;
         let seq = scene.seq;
         // A new size: start over, with all of it.
-        let existing = scene.surfaces.get_mut(&id).filter(|f| f.width == w && f.height == h && f.opaque == opaque);
+        let existing =
+            scene.surfaces.get_mut(&id).filter(|f| f.lease.is_none() && f.width == w && f.height == h && f.opaque == opaque);
         let fresh = existing.is_none();
         let frame = match existing {
             Some(frame) => frame,
@@ -159,6 +274,70 @@ impl macwl_compositor::Host for ShellHost {
         frame.committed = CACurrentMediaTime();
         drop(scene);
         request_render();
+    }
+
+    /// Draw the buffer where it is, if Metal can: a linear BGRA texture over
+    /// the pool, at the buffer's offset and stride (both multiples of
+    /// `align`). Otherwise the compositor copies it, as [`Self::frame`].
+    fn frame_shared(
+        &mut self,
+        id: u32,
+        pool: ShmPoolHandle,
+        data: &BufferData,
+        _damage: &[Rect],
+        release: BufferRelease,
+    ) -> Option<BufferRelease> {
+        use macwl_compositor::ShmFormat;
+        let (w, h) = (data.width as usize, data.height as usize);
+        let (offset, stride) = (data.offset as usize, data.stride as usize);
+        let fits = matches!(data.format, ShmFormat::Argb8888 | ShmFormat::Xrgb8888)
+            && w > 0
+            && h > 0
+            && stride >= w * 4
+            && offset % self.align == 0
+            && stride % self.align == 0
+            && offset + stride * (h - 1) + w * 4 <= pool.size();
+        if self.copy || !fits {
+            return Some(release);
+        }
+        let Some(mapped) = self.mapped(&pool) else { return Some(release) };
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                w,
+                h,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::ShaderRead);
+        let Some(texture) = mapped.buffer.as_ref().and_then(|b| b.newTextureWithDescriptor_offset_bytesPerRow(&desc, offset, stride))
+        else {
+            return Some(release);
+        };
+        LEASES.fetch_add(1, Ordering::Relaxed);
+        let lease = Arc::new(Lease { texture, _pool: mapped, _release: release });
+        let opaque = data.format != ShmFormat::Argb8888;
+        let mut scene = self.scene.lock().unwrap();
+        scene.seq += 1;
+        let seq = scene.seq;
+        scene.surfaces.insert(
+            id,
+            ClientFrame {
+                lease: Some(lease),
+                width: w,
+                height: h,
+                opaque,
+                stride: 0,
+                pixels: Vec::new(),
+                seq,
+                committed: CACurrentMediaTime(),
+                dirty: None,
+            },
+        );
+        drop(scene);
+        request_render();
+        None
     }
 
     /// The client under the pointer changed its cursor.
@@ -182,7 +361,7 @@ impl macwl_compositor::Host for ShellHost {
     }
 
     fn layout(&mut self, layers: &[Layer]) {
-        let mut scene = self.0.lock().unwrap();
+        let mut scene = self.scene.lock().unwrap();
         scene.surfaces.retain(|id, _| layers.iter().any(|l| l.id == *id));
         scene.layers = layers.to_vec();
         scene.seq += 1;
@@ -403,8 +582,9 @@ struct Renderer {
     queue: Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     latency_mode: bool,
     scene: Arc<Mutex<Scene>>,
-    /// Each surface's texture, the frame it holds, and whether it's opaque.
-    textures: HashMap<u32, (Texture, u64, bool)>,
+    /// Each surface's texture, the frame it holds, whether it's opaque, and
+    /// (when it's the client's buffer itself) the lease that keeps it.
+    textures: HashMap<u32, (Texture, u64, bool, Option<Arc<Lease>>)>,
     scene_seq: u64,
     /// What's on screen, bottom to top, as last drawn.
     layers: Vec<Layer>,
@@ -487,6 +667,16 @@ impl Renderer {
             });
             unsafe { mtl_drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
         }
+        // Clients' buffers this frame reads stay theirs-not-to-touch until
+        // the GPU is done with it.
+        let held: Vec<Arc<Lease>> = self.textures.values().filter_map(|e| e.3.clone()).collect();
+        if !held.is_empty() {
+            let held = Mutex::new(Some(held));
+            let handler = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                held.lock().unwrap().take();
+            });
+            unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&handler)) };
+        }
         cmd.presentDrawable(mtl_drawable);
         cmd.commit();
         self.check_auto_keys_done();
@@ -554,17 +744,24 @@ impl Renderer {
                 self.layers = scene.layers.clone();
                 self.textures.retain(|id, _| scene.surfaces.contains_key(id));
                 for (&id, frame) in scene.surfaces.iter_mut() {
-                    if self.textures.get(&id).is_some_and(|&(_, seq, _)| seq == frame.seq) {
+                    if self.textures.get(&id).is_some_and(|(_, seq, ..)| *seq == frame.seq) {
                         continue;
                     }
                     new_frame = Some(new_frame.map_or(frame.committed, |t: f64| t.max(frame.committed)));
-                    let tex = upload(&self.device, self.textures.get(&id).map(|(t, ..)| t), frame);
-                    self.textures.insert(id, (tex, frame.seq, frame.opaque));
+                    let (tex, lease) = match &frame.lease {
+                        Some(lease) => (lease.texture.clone(), Some(lease.clone())),
+                        None => {
+                            // Never upload into a client's own buffer.
+                            let existing = self.textures.get(&id).filter(|e| e.3.is_none()).map(|(t, ..)| t);
+                            (upload(&self.device, existing, frame), None)
+                        }
+                    };
+                    self.textures.insert(id, (tex, frame.seq, frame.opaque, lease));
                 }
             }
         }
         let (tw, th) = (target.width() as i32, target.height() as i32);
-        let mut layers = self.layers.iter().filter_map(|l| self.textures.get(&l.id).map(|(t, _, opaque)| (l, t, *opaque)));
+        let mut layers = self.layers.iter().filter_map(|l| self.textures.get(&l.id).map(|(t, _, opaque, _)| (l, t, *opaque)));
         if let Some((window, tex, _)) = layers.next() {
             // The part on screen.
             let (x0, y0) = (window.x.max(0), window.y.max(0));
@@ -963,6 +1160,8 @@ fn main() {
 
     let screen = NSScreen::mainScreen(mtm).expect("no screen");
 
+    let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
+
     // The compositor, on its own thread: told the screen's size in pixels and
     // its scale, and fed the keyboard and mouse through `keys`.
     let (keys, key_events) = macwl_compositor::input_channel();
@@ -978,7 +1177,19 @@ fn main() {
     let auto_keys: Option<usize> = std::env::var("MACWL_AUTO_KEYS").ok().and_then(|n| n.parse().ok());
     if !latency_mode {
         tracing_subscriber::fmt().init();
-        let host = ShellHost(scene.clone());
+        let host = ShellHost {
+            scene: scene.clone(),
+            device: device.clone(),
+            align: device.minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::BGRA8Unorm),
+            pools: Vec::new(),
+            copy: std::env::var("MACWL_SHM_COPY").is_ok_and(|v| v == "1"),
+        };
+        if std::env::var("MACWL_DEBUG_LEASES").is_ok_and(|v| v == "1") {
+            std::thread::spawn(|| loop {
+                std::thread::sleep(Duration::from_secs(1));
+                eprintln!("shell: {} leases alive", LEASES.load(Ordering::Relaxed));
+            });
+        }
         let scale = screen.backingScaleFactor();
         let pixels = (
             (screen.frame().size.width * scale) as i32,
@@ -1014,7 +1225,6 @@ fn main() {
     window.setTitle(&NSString::from_str("macwayland"));
     window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
 
-    let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
     let queue = device.newCommandQueue().expect("no command queue");
 
     let layer = CAMetalLayer::new();

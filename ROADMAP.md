@@ -467,9 +467,20 @@ Needed whichever way Linux apps end up running.
 - What's drawn: a window and its popups, as layers the host composites
   (the window copied in, popups blended over it). Subsurfaces aren't drawn
   yet (GTK 4's GL renderer, video players use them).
-- IOSurface-backed buffers instead of copying shm pixels into a texture (only
-  damaged areas are copied now, which covers typing; scrolling and video still
-  copy whole frames).
+- Buffers drawn where they are (2026-11-01): the shell maps each client's
+  `wl_shm` pool itself, wraps it as an `MTLBuffer`
+  (`newBufferWithBytesNoCopy`) and draws from a linear texture over the
+  buffer's part of it, so a commit costs no CPU copies. A buffer goes back
+  to the client (`wl_buffer.release`) once a newer one has replaced it and
+  the GPU is done with the frames that read it. Buffers Metal can't take
+  that way (offset or stride not a multiple of the GPU's linear-texture
+  alignment, other formats) are copied as before; `MACWL_SHM_COPY=1`
+  copies everything (to compare). At 2560×1600, 120 fps, the shell's CPU
+  time drops by about 63% (2.6 s to 0.95 s for 600 frames); pacing is the
+  same, the copies having fit in the frame. The vendored Smithay exposes
+  a buffer's pool for this (`shm_buffer_pool`). Clients now get buffers
+  back later than at commit, so one that blocks waiting on a release
+  inside a frame callback can stall; double-buffered clients are fine.
 - Window management: windows stack in the order they map; the top one
   without a parent fills the screen, and dialogs (windows with a parent:
   GTK's file chooser) take their own size, centred over their parent by

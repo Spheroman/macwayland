@@ -192,11 +192,12 @@ blit, as d3dmetal-native's own present path does). `Present` waits for the
 GPU (a fence; the step 1 probe uses an event query), then tells the guest
 which buffer to attach; `wl_buffer.release` returns it.
 
-Today the compositor copies each committed `wl_shm` buffer's damaged area
-into a texture. Wrapping a shm pool in an `MTLBuffer`
-(`newBufferWithBytesNoCopy`) and drawing from a texture over it would make
-that zero-copy for every shm client, games included; that's the
-compositor's IOSurface item done another way (ROADMAP, Compositor).
+The shell draws `wl_shm` buffers where they are (ROADMAP, Compositor): it
+maps the pool, wraps it in an `MTLBuffer` and samples a linear texture over
+it, so a game's frame goes from D3DMetal's render target to the screen
+with no CPU copies at all. Buffers come back once the GPU is done with
+them, so a swap chain wants three: one on screen, one the GPU may still be
+reading, one to draw in.
 
 **Step 1, 2026-11-01** (`experiments/d3d-wayland`, not in the repo): an
 x86_64 D3D11 program renders a spinning triangle into two shared textures
