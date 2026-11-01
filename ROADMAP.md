@@ -529,6 +529,19 @@ step 4 lands. Real apps (foot, waybar, browsers) arrive with Track B. Until
 then Hayashi on macOS is mainly useful for developing its window-management
 logic on the Mac.
 
+## Target: Windows games (Proton with D3DMetal)
+
+Steam in the session with a **Proton-D3DMetal** compatibility tool: Valve's
+Proton (arm64 Wine, FEX for the game's x86 code) with DXVK and VKD3D-Proton
+replaced by proxy DLLs that tunnel Direct3D calls to Apple's D3DMetal in an
+x86_64 helper process on the Mac, presenting through IOSurfaces. Design and
+steps: [docs/d3dmetal-proton.md](docs/d3dmetal-proton.md). Step 0 done
+(2026-11-01): D3DMetal runs in a plain Mac process through UTM's
+d3dmetal-native (D3D11 triangle on screen, 51 of 55 of its tests pass);
+next, that triangle in macwl-compositor. Needs FEX under
+macwl-run for real games, but the graphics side can be built and tested
+with arm64 Wine and Windows-on-ARM test programs first.
+
 ## Target: ROS 2 and Gazebo
 
 ROS 2 Jazzy with Gazebo Harmonic, as a robotics workstation. Until this
