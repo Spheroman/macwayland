@@ -1,8 +1,9 @@
 # Windows games: Proton with D3DMetal for graphics
 
-Status: design (2026-11-01). Steps 0 and 1 done: D3DMetal runs in a plain
-Mac process through d3dmetal-native, and its frames reach macwl-compositor
-as ordinary `wl_shm` buffers (below). Depends on FEX running under
+Status: design (2026-11-01). Steps 0–2 done: D3DMetal runs in a plain Mac
+process through d3dmetal-native, its frames reach macwl-compositor as
+ordinary `wl_shm` buffers, and a Linux program under macwl-run drives it
+through a command ring in shared memory (below). Depends on FEX running under
 macwl-run (not started) for x86 games, but not for the graphics work.
 
 ## The goal
@@ -101,10 +102,15 @@ D3DMetal). It maps the shared ring and replays commands. Objects are named by ID
 needn't wait for an answer); the helper keeps an ID → COM pointer table.
 
 How a guest gets one: the guest can't start Mac programs except by
-replacing itself (`exec_host`), so the runtime does it. Opening a device
-file, `/dev/macwl-d3d`, makes macwl-run spawn the helper (host side, so it
-works whether or not Mac programs are enabled; spawned, never forked: see
-step 0) and returns a socket to it.
+replacing itself (`exec_host`), so something on the host does it. A
+**broker** listens on a Unix socket, `$XDG_RUNTIME_DIR/macwl-d3d`, as the
+compositor and the session bus do; each connection gets a fresh helper
+(`posix_spawn`, never a fork of a process using Metal: see step 0) with the
+connection as its socket. Guests already reach host sockets, so this needs
+nothing from the runtime; the session script starts the broker. (The first
+plan was a device file, `/dev/macwl-d3d`, whose `open` made macwl-run spawn
+the helper. That ties the helper to the process rather than the session,
+and can come later if it's worth it.)
 The ring is a memfd passed over that socket: guest `MAP_SHARED` memory is a
 host `mmap` (`crates/runtime/src/shared.rs`), so the helper maps the same
 pages.
@@ -136,9 +142,12 @@ deferred one; each D3D12 command list records into its own buffer, sent on
 `ExecuteCommandLists`). Large inline data (initial data, `UpdateSubresource`
 sources) goes in a separate arena in the same shared memory.
 
-Waking the helper: it spins briefly after the ring empties, then sleeps on
-a host semaphore; the guest only signals (one system call, so a VM exit)
-when a flag in shared memory says the helper is asleep. Waking the guest
+Waking the helper: it spins briefly after the ring empties (200 µs in the
+probe), then sleeps on the socket; the guest only sends a KICK (one system
+call, so a VM exit) when a flag in shared memory says the helper is asleep.
+The helper says it's asleep and then looks at the ring once more; the guest
+publishes and then looks at the flag; with sequentially consistent fences
+on both sides one of them always sees the other. Waking the guest
 for an answer: the helper can't wake a guest futex (guest futexes live in
 the runtime), so the guest spins briefly on the answer slot, then blocks
 reading the socket, which the helper writes to.
@@ -227,8 +236,8 @@ macwl-run doesn't have); libraries come from the guest root.
 1. **On screen** (done, 2026-11-01): D3D11 frames from an x86_64 producer
    in an arm64 Wayland client's window, as `wl_shm` buffers over shared
    textures; see **Presenting**.
-2. **The tunnel, without Wine.** `/dev/macwl-d3d`, the helper, the ring.
-   A D3D12 heap over a guest memfd (`dmn_open_existing_heap_from_fd`).
+2. **The tunnel, without Wine** (done, 2026-11-01): the broker, the ring,
+   and a D3D12 heap over a guest memfd; see **Step 2** below.
 3. **Proxy DLLs, D3D11.** Under arm64 Wine with Windows-on-ARM test
    programs: a triangle, then a D3D11 sample suite. Present through
    Wine's Wayland driver.
@@ -239,6 +248,32 @@ macwl-run doesn't have); libraries come from the guest root.
 7. **Steam** under FEX, with Proton-D3DMetal in the dropdown.
 
 Steps 1–3 and 4 are independent.
+
+## Step 2, 2026-11-01
+
+`experiments/d3d-wayland` (not in the repo): `d3d-helper` (x86_64, as in
+**The helper**, with `--broker`) and `d3d-wayland`, a Rust client built
+both for macOS and for aarch64-linux-musl. The client sends the ring (a
+64 KiB memfd), gets the helper's two shared textures as `wl_shm` buffers,
+then:
+
+- **Pings** through the ring (a command, an answer on the socket). From the
+  Linux client under macwl-run: **6.4 µs** median while the helper is awake
+  (5.1 µs from a Mac client), 71 µs when it sleeps and needs a KICK.
+- **The D3D12 heap test.** The client writes 4 KiB into its memfd and sends
+  it; the helper makes an UPLOAD heap over [0, 64K) and a READBACK heap
+  over [64K, 128K) with `dmn_open_existing_heap_from_fd`, places a buffer
+  on each, and the GPU copies one to the other. The client finds its bytes
+  in the second half, all 4096 right: the GPU reads and writes guest
+  memory directly.
+- **240 frames** of the triangle (DRAW and RELEASE commands; FRAME answers
+  on the socket) at 110 fps, paced by the headless compositor; the dumps
+  match the Mac client's.
+
+At ~9 ms between frames the helper falls asleep each time, so nearly every
+command needed a KICK (533 for 2531 commands). A game submits continuously
+and would keep it awake; tuning the spin (or spinning only while frames
+are in flight) is for when there's real traffic to measure.
 
 ## Tests
 
