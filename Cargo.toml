@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/compositor", "crates/hello-client", "crates/native-probe", "crates/shell", "crates/native-probe", "crates/hv-limits", "crates/linux-abi", "crates/runtime"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+# smithay with a macOS fix (keymap files): see third_party/smithay/MACWAYLAND.md.
+[patch.crates-io]
+smithay = { path = "third_party/smithay" }

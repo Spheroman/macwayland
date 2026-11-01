@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+# libxkbcommon from home-manager (the dotfiles link lib/ into the profile)
+rustflags = ["-L", "/etc/profiles/per-user/jack/lib"]
+# Sign with the hypervisor entitlement before `cargo run`/`cargo test`.
+runner = "scripts/hv-runner.sh"

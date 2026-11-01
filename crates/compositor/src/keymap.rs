@@ -1,0 +1,164 @@
+//! macOS virtual key codes (`kVK_*`, what `NSEvent.keyCode` reports) to Linux
+//! evdev key codes (`KEY_*`), by physical position: the keymap (xkb) then
+//! decides what each key types, as on Linux.
+
+/// The evdev code for macOS key code `mac`, if it has one.
+pub fn evdev_from_mac(mac: u16) -> Option<u32> {
+    Some(match mac {
+        0x00 => 30,  // A
+        0x01 => 31,  // S
+        0x02 => 32,  // D
+        0x03 => 33,  // F
+        0x04 => 35,  // H
+        0x05 => 34,  // G
+        0x06 => 44,  // Z
+        0x07 => 45,  // X
+        0x08 => 46,  // C
+        0x09 => 47,  // V
+        0x0a => 86,  // ISO section: KEY_102ND
+        0x0b => 48,  // B
+        0x0c => 16,  // Q
+        0x0d => 17,  // W
+        0x0e => 18,  // E
+        0x0f => 19,  // R
+        0x10 => 21,  // Y
+        0x11 => 20,  // T
+        0x12 => 2,   // 1
+        0x13 => 3,   // 2
+        0x14 => 4,   // 3
+        0x15 => 5,   // 4
+        0x16 => 7,   // 6
+        0x17 => 6,   // 5
+        0x18 => 13,  // =
+        0x19 => 10,  // 9
+        0x1a => 8,   // 7
+        0x1b => 12,  // -
+        0x1c => 9,   // 8
+        0x1d => 11,  // 0
+        0x1e => 27,  // ]
+        0x1f => 24,  // O
+        0x20 => 22,  // U
+        0x21 => 26,  // [
+        0x22 => 23,  // I
+        0x23 => 25,  // P
+        0x24 => 28,  // Return
+        0x25 => 38,  // L
+        0x26 => 36,  // J
+        0x27 => 40,  // '
+        0x28 => 37,  // K
+        0x29 => 39,  // ;
+        0x2a => 43,  // backslash
+        0x2b => 51,  // ,
+        0x2c => 53,  // /
+        0x2d => 49,  // N
+        0x2e => 50,  // M
+        0x2f => 52,  // .
+        0x30 => 15,  // Tab
+        0x31 => 57,  // Space
+        0x32 => 41,  // `
+        0x33 => 14,  // Delete: KEY_BACKSPACE
+        0x35 => 1,   // Escape
+        0x36 => 126, // right Command: KEY_RIGHTMETA
+        0x37 => 125, // Command: KEY_LEFTMETA
+        0x38 => 42,  // Shift
+        0x39 => 58,  // Caps Lock
+        0x3a => 56,  // Option: KEY_LEFTALT
+        0x3b => 29,  // Control
+        0x3c => 54,  // right Shift
+        0x3d => 100, // right Option: KEY_RIGHTALT
+        0x3e => 97,  // right Control
+        0x40 => 187, // F17
+        0x41 => 83,  // keypad .
+        0x43 => 55,  // keypad *
+        0x45 => 78,  // keypad +
+        0x47 => 69,  // keypad Clear: KEY_NUMLOCK
+        0x48 => 115, // volume up
+        0x49 => 114, // volume down
+        0x4a => 113, // mute
+        0x4b => 98,  // keypad /
+        0x4c => 96,  // keypad Enter
+        0x4e => 74,  // keypad -
+        0x4f => 188, // F18
+        0x50 => 189, // F19
+        0x51 => 117, // keypad =
+        0x52 => 82,  // keypad 0
+        0x53 => 79,  // keypad 1
+        0x54 => 80,  // keypad 2
+        0x55 => 81,  // keypad 3
+        0x56 => 75,  // keypad 4
+        0x57 => 76,  // keypad 5
+        0x58 => 77,  // keypad 6
+        0x59 => 71,  // keypad 7
+        0x5a => 190, // F20
+        0x5b => 72,  // keypad 8
+        0x5c => 73,  // keypad 9
+        0x5d => 124, // JIS yen: KEY_YEN
+        0x5e => 89,  // JIS underscore: KEY_RO
+        0x5f => 121, // JIS keypad comma
+        0x60 => 63,  // F5
+        0x61 => 64,  // F6
+        0x62 => 65,  // F7
+        0x63 => 61,  // F3
+        0x64 => 66,  // F8
+        0x65 => 67,  // F9
+        0x66 => 94,  // JIS eisu: KEY_MUHENKAN
+        0x67 => 87,  // F11
+        0x68 => 92,  // JIS kana: KEY_HENKAN
+        0x69 => 183, // F13
+        0x6a => 186, // F16
+        0x6b => 184, // F14
+        0x6d => 68,  // F10
+        0x6f => 88,  // F12
+        0x71 => 185, // F15
+        0x72 => 110, // Help: KEY_INSERT
+        0x73 => 102, // Home
+        0x74 => 104, // Page Up
+        0x75 => 111, // forward delete: KEY_DELETE
+        0x76 => 62,  // F4
+        0x77 => 107, // End
+        0x78 => 60,  // F2
+        0x79 => 109, // Page Down
+        0x7a => 59,  // F1
+        0x7b => 105, // Left
+        0x7c => 106, // Right
+        0x7d => 108, // Down
+        0x7e => 103, // Up
+        _ => return None,
+    })
+}
+
+/// The modifier keys, as (macOS key code, `NSEvent.modifierFlags` bit that
+/// says it's down). The low bits are the device-dependent ones, which tell
+/// left from right.
+pub const MODIFIERS: [(u16, u64); 8] = [
+    (0x38, 0x0002),    // left Shift
+    (0x3c, 0x0004),    // right Shift
+    (0x3b, 0x0001),    // left Control
+    (0x3e, 0x2000),    // right Control
+    (0x3a, 0x0020),    // left Option
+    (0x3d, 0x0040),    // right Option
+    (0x37, 0x0008),    // left Command
+    (0x36, 0x0010),    // right Command
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letters_digits_and_arrows() {
+        // "qwerty" row, digits, the arrows: their evdev codes.
+        assert_eq!([0x0c, 0x0d, 0x0e, 0x0f, 0x11, 0x10].map(|k| evdev_from_mac(k).unwrap()), [16, 17, 18, 19, 20, 21]);
+        assert_eq!(evdev_from_mac(0x12), Some(2));
+        assert_eq!(evdev_from_mac(0x1d), Some(11));
+        assert_eq!([0x7b, 0x7c, 0x7d, 0x7e].map(|k| evdev_from_mac(k).unwrap()), [105, 106, 108, 103]);
+        assert_eq!(evdev_from_mac(0x3f), None, "fn has no evdev key");
+        // Every key code maps to a different evdev code.
+        let mut seen = std::collections::BTreeSet::new();
+        for k in 0..=0x7f {
+            if let Some(e) = evdev_from_mac(k) {
+                assert!(seen.insert(e), "two keys map to {e}");
+            }
+        }
+    }
+}

@@ -1,0 +1,608 @@
+//! The system call dispatcher: one Linux arm64 system call → its host
+//! implementation.
+//!
+//! Status: memory (`brk`, `mmap`, ...), files and directories, an emulated
+//! `/proc`, pipes, `ppoll`, and sockets including fd passing. Everything else
+//! returns -ENOSYS and is logged once per call number, so running a program
+//! shows what to implement next.
+
+mod epoll;
+mod futex;
+mod inotify;
+mod io;
+mod kfd;
+mod mem;
+mod misc;
+mod net;
+mod path;
+mod process;
+mod signal;
+mod signalfd;
+mod timer;
+mod tty;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use epoll::{new_instance as new_epoll, rewatch};
+pub(crate) use inotify::{inotify_copy, inotify_pending, inotify_read};
+pub(crate) use kfd::{eventfd_copy, timerfd_copy};
+pub(crate) use signalfd::{signalfd_copy, signalfd_read};
+pub use signalfd::SignalFd;
+pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
+pub use timer::set_interrupt;
+pub use inotify::Inotify;
+pub use kfd::{EventFd, TimerFd};
+pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
+pub use signal::{set_kick, set_yield_check, Delivery, HandlerCall, SigInfo, StackT, HOST_PENDING};
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    os::fd::{AsFd, OwnedFd},
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc, Mutex},
+};
+
+use crate::{
+    abi,
+    errno,
+    fs::{FdEntry, FdTable, Filesystem},
+    memory::{GuestMemory, GuestMemoryExt},
+    nr,
+};
+
+/// Linux's IOV_MAX.
+const IOV_MAX: u64 = 1024;
+
+/// Largest single read or write we stage through a host buffer. Longer ones
+/// come back short, which Linux allows, so a bogus guest length can't make the
+/// host allocate without bound.
+const MAX_IO: u64 = 16 << 20;
+
+/// Per-process state the dispatcher works on (everything except memory, which
+/// the core owns and passes in). Shared by the process's threads.
+#[derive(Debug)]
+pub struct Process {
+    pub fds: FdTable,
+    pub fs: Filesystem,
+    pub pid: i64,
+    /// Guest path of the running executable, for `/proc/self/exe`.
+    exe: Mutex<Vec<u8>>,
+    signals: Mutex<signal::Signals>,
+    rlimits: Mutex<[[u64; 2]; 16]>,
+    /// `prctl` flags.
+    dumpable: AtomicBool,
+    no_new_privs: AtomicBool,
+    /// Forked children not yet waited for.
+    children: Mutex<process::Children>,
+    /// If this process was forked: the control socket to its parent.
+    parent_ctl: Option<OwnedFd>,
+    /// The process's threads other than the caller's own view of itself, for
+    /// signals sent to one of them.
+    threads: Mutex<BTreeMap<i64, ThreadHandle>>,
+    /// Threads waiting in `futex`.
+    futexes: futex::Futexes,
+    /// `exit_group` (or a fatal signal, or `execve`) is ending every thread.
+    exiting: AtomicBool,
+    /// POSIX timers.
+    timers: Mutex<timer::Timers>,
+    /// Thread ids handed out so far.
+    tids: std::sync::atomic::AtomicI64,
+    /// Unimplemented calls (and ioctls, sockopts) already reported, so each
+    /// is logged once.
+    unimplemented: Mutex<BTreeSet<String>>,
+    /// Which files are mapped where.
+    file_maps: Mutex<mem::FileMaps>,
+}
+
+/// What other threads need of a thread: where to put signals for it, and how
+/// to get its attention.
+pub struct ThreadHandle {
+    pending: Arc<Mutex<signal::Pending>>,
+    waker: Arc<Waker>,
+    wake: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for ThreadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ThreadHandle")
+    }
+}
+
+/// One thread's own state. The core owns one per guest thread and passes it
+/// to [`dispatch`] with the shared [`Process`].
+#[derive(Debug)]
+pub struct Thread {
+    pub tid: i64,
+    pub(crate) signals: signal::ThreadSignals,
+    /// The thread's name (`prctl(PR_SET_NAME)`); empty until set: derived
+    /// from the executable.
+    comm: Vec<u8>,
+    /// How other threads wake this one from a blocking wait.
+    pub waker: Arc<Waker>,
+    /// `set_tid_address` / CLONE_CHILD_CLEARTID: zeroed, and futex-woken, when
+    /// the thread exits (how `pthread_join` knows).
+    pub clear_child_tid: u64,
+}
+
+impl Thread {
+    /// The process's first thread (tid = pid).
+    pub fn main(p: &Process) -> Thread {
+        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker: Waker::registered(), clear_child_tid: 0 }
+    }
+
+    /// A thread `self` creates (`clone` with CLONE_THREAD), as tid `tid`.
+    pub fn spawn(&self, tid: i64) -> Thread {
+        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker: Waker::registered(), clear_child_tid: 0 }
+    }
+
+    /// The signals it blocks (Linux numbering, bit n-1 for signal n).
+    pub fn blocked_signals(&self) -> u64 {
+        self.signals.blocked
+    }
+}
+
+impl Process {
+    /// A process with no open fds, seeing the host directory `root` as `/`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Process {
+            fds: FdTable::default(),
+            fs: Filesystem::new(root),
+            pid: std::process::id() as i64,
+            exe: Mutex::default(),
+            signals: Mutex::default(),
+            rlimits: Mutex::new(misc::default_rlimits()),
+            dumpable: AtomicBool::new(true),
+            no_new_privs: AtomicBool::new(false),
+            children: Mutex::default(),
+            parent_ctl: None,
+            threads: Mutex::default(),
+            futexes: futex::Futexes::default(),
+            exiting: AtomicBool::new(false),
+            tids: std::sync::atomic::AtomicI64::new(0),
+            timers: Mutex::default(),
+            unimplemented: Mutex::default(),
+            file_maps: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn file_maps(&self) -> std::sync::MutexGuard<'_, mem::FileMaps> {
+        self.file_maps.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The file mapped at `addr` (its guest path), and the offset in it.
+    pub fn mapped_file(&self, addr: u64) -> Option<(Vec<u8>, u64)> {
+        self.file_maps().at(addr).map(|(path, offset)| (path.to_vec(), offset))
+    }
+
+    /// Like [`Process::new`], with guest fds 0–2 duplicated from the host's
+    /// stdin, stdout and stderr.
+    pub fn with_host_stdio(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let p = Self::new(root);
+        let stdio: [OwnedFd; 3] = [
+            std::io::stdin().as_fd().try_clone_to_owned()?,
+            std::io::stdout().as_fd().try_clone_to_owned()?,
+            std::io::stderr().as_fd().try_clone_to_owned()?,
+        ];
+        for (fd, host) in stdio.into_iter().enumerate() {
+            p.fds.insert_at(fd, FdEntry::new(host));
+        }
+        Ok(p)
+    }
+
+    /// A new thread id. The first thread's is the pid; others are numbers no
+    /// host process is likely to have (Linux tids share the pid space), and
+    /// unique within the process.
+    pub fn new_tid(&self) -> i64 {
+        let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        0x1000_0000 + (self.pid % 0x8000) * 0x1000 + (n % 0x1000)
+    }
+
+    /// Guest path of the running executable.
+    pub fn exe(&self) -> Vec<u8> {
+        self.exe.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_exe(&self, exe: Vec<u8>) {
+        *self.exe.lock().unwrap_or_else(|e| e.into_inner()) = exe;
+    }
+
+    /// Make thread `t` reachable by the others: signals for it land in its
+    /// pending set, and `wake` (which must be async-signal-safe-ish: it's
+    /// called from other threads at any time) gets it to look.
+    pub fn register_thread(&self, t: &Thread, wake: Box<dyn Fn() + Send + Sync>) {
+        let handle = ThreadHandle { pending: t.signals.pending.clone(), waker: t.waker.clone(), wake };
+        self.threads.lock().unwrap_or_else(|e| e.into_inner()).insert(t.tid, handle);
+    }
+
+    pub fn unregister_thread(&self, tid: i64) {
+        self.threads.lock().unwrap_or_else(|e| e.into_inner()).remove(&tid);
+    }
+
+    /// How many threads are registered.
+    pub fn thread_count(&self) -> usize {
+        self.threads.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Wake every registered thread (to look at signals, or to exit).
+    pub fn wake_all_threads(&self) {
+        for h in self.threads.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            h.waker.wake();
+            (h.wake)();
+        }
+    }
+
+    /// Start ending every thread (`exit_group`, a fatal signal, `execve`).
+    pub fn set_exiting(&self, on: bool) {
+        self.exiting.store(on, std::sync::atomic::Ordering::Release);
+        if on {
+            self.wake_all_threads();
+        }
+    }
+
+    pub fn exiting(&self) -> bool {
+        self.exiting.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Wake up to `n` threads waiting in `futex` on `addr` (a thread's exit
+    /// with CLONE_CHILD_CLEARTID: what `pthread_join` waits for).
+    pub fn futex_wake(&self, addr: u64, n: u64) -> i64 {
+        self.futexes.wake(addr, n, u32::MAX)
+    }
+
+    fn thread_pending(&self, tid: i64) -> Option<Arc<Mutex<signal::Pending>>> {
+        self.threads.lock().unwrap_or_else(|e| e.into_inner()).get(&tid).map(|h| h.pending.clone())
+    }
+
+    fn wake_thread(&self, tid: i64) {
+        if let Some(h) = self.threads.lock().unwrap_or_else(|e| e.into_inner()).get(&tid) {
+            h.waker.wake();
+            (h.wake)();
+        }
+    }
+
+    /// Log `what` as unimplemented, once.
+    fn unimplemented(&self, what: String) {
+        let mut seen = self.unimplemented.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&what) {
+            eprintln!("linux-abi: unimplemented {what}");
+            seen.insert(what);
+        }
+    }
+}
+
+/// What the core should do after a system call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Put this value in x0 and resume the guest.
+    Return(i64),
+    /// The process exited with this status (0–255): `exit_group`, which ends
+    /// every thread.
+    Exit(i32),
+    /// The calling thread exited (`exit`), with this status if it's the
+    /// last one.
+    ExitThread(i32),
+    /// `rt_sigreturn`: the core restores the state the signal frame on the
+    /// guest stack saved.
+    SigReturn,
+    /// Make a child process (`clone` as fork or vfork). The child resumes
+    /// with x0 = 0, the parent with its pid.
+    Fork(Fork),
+    /// Replace the program (`execve`). If the core can't load it, the call
+    /// fails with the errno it reports.
+    Exec(Exec),
+    /// Replace the program with a Mac one (`execve` of a Mach-O file): the
+    /// core tears down the VM and hands it to [`exec_host`], which returns
+    /// only on failure.
+    ExecHost(HostExec),
+    /// Start a thread (`clone` with CLONE_THREAD). The core makes it (with
+    /// [`Process::new_tid`]) and returns its tid, or fails with EAGAIN.
+    Spawn(Spawn),
+}
+
+/// Run system call `nr` with arguments x0–x5, for thread `t`.
+pub fn dispatch<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, nr: u64, args: [u64; 6]) -> Action {
+    let action = dispatch_call(p, t, mem, nr, args);
+    crate::fs::end_call();
+    t.sync_host_mask();
+    action
+}
+
+fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, nr: u64, args: [u64; 6]) -> Action {
+    let [a0, a1, a2, a3, a4, a5] = args;
+    let ret = match nr {
+        nr::EXIT => return Action::ExitThread((a0 & 0xff) as i32),
+        nr::EXIT_GROUP => return Action::Exit((a0 & 0xff) as i32),
+        nr::SET_TID_ADDRESS => {
+            t.clear_child_tid = a0;
+            Ok(t.tid)
+        }
+        // Only consulted when a thread dies holding a robust futex.
+        nr::SET_ROBUST_LIST => Ok(0),
+        nr::GETPID => Ok(p.pid),
+        nr::GETTID => Ok(t.tid),
+        nr::GETPPID => Ok(unsafe { libc::getppid() } as i64),
+        nr::GETUID => Ok(unsafe { libc::getuid() } as i64),
+        nr::GETEUID => Ok(unsafe { libc::geteuid() } as i64),
+        nr::GETGID => Ok(unsafe { libc::getgid() } as i64),
+        nr::GETEGID => Ok(unsafe { libc::getegid() } as i64),
+        nr::GETGROUPS => misc::getgroups(mem, a0, a1),
+        // The guest process is the host process: same pid, group and session.
+        nr::GETPGID => ok(unsafe { libc::getpgid(a0 as i32) } as i64),
+        nr::SETPGID => process::setpgid(p, a0 as i32 as i64, a1 as i32 as i64),
+        nr::GETSID => ok(unsafe { libc::getsid(a0 as i32) } as i64),
+        nr::SETSID => ok(unsafe { libc::setsid() } as i64),
+        nr::SETUID => misc::setids(&[a0], false),
+        nr::SETGID => misc::setids(&[a0], true),
+        nr::SETREUID => misc::setids(&[a0, a1], false),
+        nr::SETREGID => misc::setids(&[a0, a1], true),
+        nr::SETRESUID => misc::setids(&[a0, a1, a2], false),
+        nr::SETRESGID => misc::setids(&[a0, a1, a2], true),
+        nr::GETRESUID => misc::getresids(mem, [a0, a1, a2], false),
+        nr::GETRESGID => misc::getresids(mem, [a0, a1, a2], true),
+        nr::SCHED_YIELD => Ok(0),
+        // Every thread is SCHED_OTHER at nice 0, for now (docs/mn-threads.md,
+        // step 5, is where priorities come in). getpriority returns 20 - nice.
+        nr::GETPRIORITY => Ok(20),
+        nr::SCHED_GETSCHEDULER => Ok(0),
+        nr::SCHED_GETPARAM => mem.write_pod(a1, &0i32).map(|()| 0),
+        // SCHED_FIFO and SCHED_RR are 1 to 99; the others only 0.
+        nr::SCHED_GET_PRIORITY_MAX => sched_priority(a0, 99),
+        nr::SCHED_GET_PRIORITY_MIN => sched_priority(a0, 1),
+        nr::FLOCK => p.fds.host(a0).and_then(|host| ok(unsafe { libc::flock(host, a1 as i32) } as i64)),
+        // Restartable sequences need the kernel to notice preemption; without
+        // them glibc falls back on atomics, as on kernels before 4.18.
+        nr::RSEQ => Err(errno::ENOSYS),
+        // glibc tries clone3 first and falls back on clone.
+        nr::CLONE3 => Err(errno::ENOSYS),
+        nr::CLONE => match process::clone(p, a0, a1, a2, a3, a4) {
+            Ok(action) => return action,
+            Err(e) => Err(e),
+        },
+        nr::EXECVE => match process::execve(p, mem, a0, a1, a2) {
+            Ok(action) => return action,
+            Err(e) => Err(e),
+        },
+        nr::WAIT4 => process::wait4(p, mem, a0 as i32 as i64 as u64, a1, a2, a3),
+        nr::WAITID => process::waitid(p, mem, a0, a1, a2, a3, a4),
+        // Advice only.
+        nr::FADVISE64 | nr::READAHEAD => p.fds.host(a0).map(|_| 0),
+        // Linux xattr names ("user.", "security."...) don't map onto Darwin's;
+        // until they do, files look like they're on a filesystem without them.
+        nr::SETXATTR..=nr::FREMOVEXATTR => Err(errno::EOPNOTSUPP),
+        nr::FUTEX => futex::futex(p, t, mem, a0, a1, a2, a3, a4, a5),
+        nr::CLOCK_GETTIME => misc::clock_gettime(mem, a0, a1, false),
+        nr::CLOCK_GETRES => misc::clock_gettime(mem, a0, a1, true),
+        nr::GETTIMEOFDAY => misc::gettimeofday(mem, a0, a1),
+        nr::GETRUSAGE => misc::getrusage(mem, a0, a1),
+        nr::SYSINFO => misc::sysinfo(mem, a0),
+        nr::SCHED_GETAFFINITY => misc::sched_getaffinity(mem, a1, a2),
+        nr::NANOSLEEP => misc::nanosleep(mem, a0, a1),
+        nr::CLOCK_NANOSLEEP => misc::clock_nanosleep(mem, a0, a1, a2, a3),
+        nr::UNAME => misc::uname(mem, a0),
+        nr::GETRANDOM => misc::getrandom(mem, a0, a1),
+        nr::PRLIMIT64 => misc::prlimit64(p, mem, a0, a1, a2, a3),
+        nr::PRCTL => misc::prctl(p, t, mem, a0, a1, a2),
+
+        nr::RT_SIGACTION => signal::rt_sigaction(p, mem, a0, a1, a2, a3),
+        nr::RT_SIGPROCMASK => signal::rt_sigprocmask(t, mem, a0, a1, a2, a3),
+        nr::SIGALTSTACK => signal::sigaltstack(t, mem, a0, a1),
+        nr::RT_SIGSUSPEND => signal::rt_sigsuspend(p, t, mem, a0, a1),
+        nr::RT_SIGPENDING => signal::rt_sigpending(p, t, mem, a0, a1),
+        nr::RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(p, t, mem, a0, a1, a2, a3),
+        nr::RT_SIGRETURN => return Action::SigReturn,
+        nr::KILL => signal::kill(p, a0 as i64, a1),
+        nr::TKILL => signal::tkill(p, t, None, a0 as i64, a1),
+        nr::TGKILL => signal::tkill(p, t, Some(a0 as i64), a1 as i64, a2),
+        nr::SETITIMER => misc::setitimer(mem, a0, a1, a2),
+        nr::TIMER_CREATE => timer::timer_create(p, t, mem, a0, a1, a2),
+        nr::TIMER_SETTIME => timer::timer_settime(p, mem, a0, a1, a2, a3),
+        nr::TIMER_GETTIME => timer::timer_gettime(p, mem, a0, a1),
+        nr::TIMER_GETOVERRUN => timer::timer_getoverrun(p, a0),
+        nr::TIMER_DELETE => timer::timer_delete(p, a0),
+        nr::GETITIMER => misc::setitimer(mem, a0, 0, a1),
+
+        nr::BRK => Ok(mem.brk(a0) as i64),
+        nr::MMAP => mem::mmap(p, mem, args),
+        nr::MUNMAP => mem::munmap(p, mem, a0, a1),
+        nr::MPROTECT => neg(mem.mprotect(a0, a1, a2)),
+        nr::MADVISE => mem::madvise(p, mem, a0, a1, a2),
+
+        nr::READ => io::read(p, mem, a0, a1, a2),
+        nr::WRITE => io::write(p, mem, a0, a1, a2),
+        nr::READV => io::readv(p, mem, a0, a1, a2),
+        nr::WRITEV => io::writev(p, mem, a0, a1, a2),
+        nr::PREAD64 => io::pread(p, mem, a0, a1, a2, a3),
+        nr::PWRITE64 => io::pwrite(p, mem, a0, a1, a2, a3),
+        nr::LSEEK => io::lseek(p, a0, a1 as i64, a2),
+        nr::CLOSE => p.fds.remove(a0).map(|_| 0),
+        nr::DUP => io::dup(p, a0),
+        nr::DUP3 => io::dup3(p, a0, a1, a2),
+        nr::FCNTL => io::fcntl(p, mem, a0, a1, a2),
+        nr::IOCTL => io::ioctl(p, mem, a0, a1, a2),
+        nr::PIPE2 => io::pipe2(p, mem, a0, a1),
+        nr::PPOLL => io::ppoll(p, mem, a0, a1, a2),
+        nr::PSELECT6 => io::pselect6(p, t, mem, a0, [a1, a2, a3], a4, a5),
+        nr::EPOLL_CREATE1 => epoll::epoll_create1(p, a0),
+        nr::EVENTFD2 => kfd::eventfd2(p, a0, a1),
+        nr::SIGNALFD4 => signalfd::signalfd4(p, mem, a0, a1, a2, a3),
+        nr::CLOSE_RANGE => io::close_range(p, a0, a1, a2),
+        nr::INOTIFY_INIT1 => inotify::inotify_init1(p, a0),
+        nr::INOTIFY_ADD_WATCH => inotify::inotify_add_watch(p, mem, a0, a1, a2),
+        nr::INOTIFY_RM_WATCH => inotify::inotify_rm_watch(p, a0, a1),
+        nr::TIMERFD_CREATE => kfd::timerfd_create(p, a0, a1),
+        nr::TIMERFD_SETTIME => kfd::timerfd_settime(p, mem, a0, a1, a2, a3),
+        nr::TIMERFD_GETTIME => kfd::timerfd_gettime(p, mem, a0, a1),
+        nr::EPOLL_CTL => epoll::epoll_ctl(p, mem, a0, a1, a2, a3),
+        nr::EPOLL_PWAIT => {
+            let timeout = (a3 as i32 >= 0).then(|| abi::Timespec { tv_sec: (a3 as i32 / 1000) as i64, tv_nsec: (a3 as i32 % 1000) as i64 * 1_000_000 });
+            epoll::epoll_wait(p, t, mem, a0, a1, a2, timeout, a4)
+        }
+        nr::EPOLL_PWAIT2 => match if a3 == 0 { Ok(None) } else { mem.read_pod::<abi::Timespec>(a3).map(Some) } {
+            Ok(timeout) => epoll::epoll_wait(p, t, mem, a0, a1, a2, timeout, a4),
+            Err(e) => Err(e),
+        },
+        nr::SENDFILE => io::sendfile(p, mem, a0, a1, a2, a3),
+        // "Not between these files": callers (coreutils' cp and cat) copy
+        // with read and write instead, as they must on older kernels.
+        nr::COPY_FILE_RANGE => Err(errno::EXDEV),
+        nr::FTRUNCATE => io::ftruncate(p, a0, a1),
+        nr::FALLOCATE => io::fallocate(p, a0, a1, a2, a3),
+        nr::FSYNC | nr::FDATASYNC => io::fsync(p, a0),
+        nr::MEMFD_CREATE => io::memfd_create(p, mem, a0, a1),
+
+        nr::OPENAT => path::openat(p, mem, a0, a1, a2, a3),
+        nr::GETDENTS64 => path::getdents64(p, mem, a0, a1, a2),
+        nr::NEWFSTATAT => path::fstatat(p, mem, a0, a1, a2, a3),
+        nr::STATX => path::statx(p, mem, a0, a1, a2, a3, a4),
+        nr::STATFS => path::statfs(p, mem, a0, a1),
+        nr::FSTATFS => path::fstatfs(p, mem, a0, a1),
+        nr::FSTAT => path::fstat(p, mem, a0, a1),
+        nr::READLINKAT => path::readlinkat(p, mem, a0, a1, a2, a3),
+        nr::FACCESSAT => path::faccessat(p, mem, a0, a1, a2, 0),
+        nr::FACCESSAT2 => path::faccessat(p, mem, a0, a1, a2, a3),
+        nr::MKDIRAT => path::mkdirat(p, mem, a0, a1, a2),
+        nr::UNLINKAT => path::unlinkat(p, mem, a0, a1, a2),
+        nr::SYMLINKAT => path::symlinkat(p, mem, a0, a1, a2),
+        nr::LINKAT => path::linkat(p, mem, a0, a1, a2, a3, a4),
+        nr::RENAMEAT => path::renameat2(p, mem, a0, a1, a2, a3, 0),
+        nr::RENAMEAT2 => path::renameat2(p, mem, a0, a1, a2, a3, a4),
+        nr::FCHMODAT => path::fchmodat(p, mem, a0, a1, a2),
+        nr::FCHMOD => path::fchmod(p, a0, a1),
+        nr::FCHOWNAT => path::fchownat(p, mem, a0, a1, a2, a3, a4),
+        nr::FCHOWN => path::fchown(p, a0, a1, a2),
+        nr::UTIMENSAT => path::utimensat(p, mem, a0, a1, a2, a3),
+        nr::TRUNCATE => path::truncate(p, mem, a0, a1),
+        nr::GETCWD => path::getcwd(p, mem, a0, a1),
+        nr::CHDIR => path::chdir(p, mem, a0),
+        nr::FCHDIR => path::fchdir(p, a0),
+        nr::UMASK => Ok(unsafe { libc::umask(a0 as libc::mode_t & 0o777) } as i64),
+
+        nr::SOCKET => net::socket(p, a0, a1, a2),
+        nr::SOCKETPAIR => net::socketpair(p, mem, a0, a1, a2, a3),
+        nr::BIND => net::bind(p, mem, a0, a1, a2),
+        nr::LISTEN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::listen(h, a1 as i32) } as i64)),
+        nr::ACCEPT => net::accept4(p, mem, a0, a1, a2, 0),
+        nr::ACCEPT4 => net::accept4(p, mem, a0, a1, a2, a3),
+        nr::CONNECT => net::connect(p, mem, a0, a1, a2),
+        nr::GETSOCKNAME => net::getname(p, mem, a0, a1, a2, false),
+        nr::GETPEERNAME => net::getname(p, mem, a0, a1, a2, true),
+        nr::SENDTO => net::sendto(p, mem, a0, a1, a2, a3, a4, a5),
+        nr::RECVFROM => net::recvfrom(p, mem, a0, a1, a2, a3, a4, a5),
+        nr::SETSOCKOPT => net::setsockopt(p, mem, a0, a1, a2, a3, a4),
+        nr::GETSOCKOPT => net::getsockopt(p, mem, a0, a1, a2, a3, a4),
+        nr::SHUTDOWN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::shutdown(h, a1 as i32) } as i64)),
+        nr::SENDMSG => net::sendmsg(p, mem, a0, a1, a2),
+        nr::RECVMSG => net::recvmsg(p, mem, a0, a1, a2),
+        nr::SENDMMSG => net::sendmmsg(p, mem, a0, a1, a2, a3),
+        nr::RECVMMSG => net::recvmmsg(p, mem, a0, a1, a2, a3),
+
+        _ => {
+            p.unimplemented(format!("system call {nr} ({})", nr::name(nr)));
+            Err(errno::ENOSYS)
+        }
+    };
+    // A Unix datagram socket whose peer has closed (how SOCK_SEQPACKET
+    // pairs are made, see net::socketpair) says so the Darwin way: as Linux,
+    // reads see the end of the file, and writes EPIPE (seqpacket) or
+    // ECONNREFUSED (datagram).
+    let ret = match (nr, ret) {
+        (nr::READ | nr::READV | nr::RECVFROM | nr::RECVMSG, Err(errno::ECONNRESET | errno::ENOTCONN)) if net::unix_dgram(p, a0) => Ok(0),
+        (nr::WRITE | nr::WRITEV | nr::SENDTO | nr::SENDMSG, Err(errno::EDESTADDRREQ | errno::ENOTCONN)) if net::unix_dgram(p, a0) => {
+            Err(if net::is_seqpacket(p, a0) { errno::EPIPE } else { errno::ECONNREFUSED })
+        }
+        (_, ret) => ret,
+    };
+    // Writing to a pipe or socket with no reader raises SIGPIPE (whose
+    // default kills: how `yes | head` ends), unless MSG_NOSIGNAL says not to.
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    let writes = match nr {
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 => true,
+        nr::SENDTO => a3 & MSG_NOSIGNAL == 0,
+        nr::SENDMSG => a2 & MSG_NOSIGNAL == 0,
+        nr::SENDMMSG => a3 & MSG_NOSIGNAL == 0,
+        _ => false,
+    };
+    if writes && ret == Err(errno::EPIPE) {
+        signal::raise(t, 13);
+    }
+    Action::Return(ret.unwrap_or_else(|e| -e))
+}
+
+/// A raw "value or negative errno" as this module's `Result`.
+fn neg(v: i64) -> Result<i64, i64> {
+    if v < 0 { Err(-v) } else { Ok(v) }
+}
+
+/// The Linux errno for the host's current `errno`.
+pub(crate) fn last_errno() -> i64 {
+    errno::from_io(&std::io::Error::last_os_error())
+}
+
+/// A host call's result: negative (-1) means failure with `errno` set.
+/// `sched_get_priority_max`/`min` for `policy`: `realtime` for SCHED_FIFO
+/// and SCHED_RR, 0 for SCHED_OTHER, SCHED_BATCH and SCHED_IDLE.
+fn sched_priority(policy: u64, realtime: i64) -> Result<i64, i64> {
+    match policy {
+        1 | 2 => Ok(realtime),
+        0 | 3 | 5 => Ok(0),
+        _ => Err(errno::EINVAL),
+    }
+}
+
+fn ok(r: i64) -> Result<i64, i64> {
+    if r < 0 { Err(last_errno()) } else { Ok(r) }
+}
+
+/// A NUL-terminated path argument.
+fn path_arg<M: GuestMemory + ?Sized>(mem: &M, addr: u64) -> Result<Vec<u8>, i64> {
+    if addr == 0 {
+        return Err(errno::EFAULT);
+    }
+    mem.read_cstr(addr)
+}
+
+/// Read a guest iovec array, returning (base, len) pairs.
+fn iovecs<M: GuestMemory + ?Sized>(mem: &M, iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
+    if count > IOV_MAX {
+        return Err(errno::EINVAL);
+    }
+    (0..count)
+        .map(|i| {
+            let v: crate::abi::Iovec = mem.read_pod(iov + i * 16)?;
+            Ok((v.base, v.len))
+        })
+        .collect()
+}
+
+/// Gather the iovecs' contents (capped at [`MAX_IO`] in total).
+fn gather<M: GuestMemory + ?Sized>(mem: &M, iov: &[(u64, u64)]) -> Result<Vec<u8>, i64> {
+    let mut data = Vec::new();
+    for &(base, len) in iov {
+        let start = data.len();
+        let take = len.min(MAX_IO - start as u64);
+        data.resize(start + take as usize, 0);
+        mem.read(base, &mut data[start..])?;
+        if data.len() as u64 == MAX_IO {
+            break;
+        }
+    }
+    Ok(data)
+}
+
+/// Scatter `data` across the iovecs.
+fn scatter<M: GuestMemory + ?Sized>(mem: &M, iov: &[(u64, u64)], mut data: &[u8]) -> Result<(), i64> {
+    for &(base, len) in iov {
+        if data.is_empty() {
+            break;
+        }
+        let n = (len as usize).min(data.len());
+        mem.write(base, &data[..n])?;
+        data = &data[n..];
+    }
+    Ok(())
+}
+
+/// Total length of the iovecs, capped at [`MAX_IO`].
+fn iov_len(iov: &[(u64, u64)]) -> u64 {
+    iov.iter().fold(0u64, |acc, &(_, l)| acc.saturating_add(l)).min(MAX_IO)
+}
