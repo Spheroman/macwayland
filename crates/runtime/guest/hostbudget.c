@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -98,7 +99,12 @@ int main(int argc, char **argv) {
         CHECK(timer_settime(ids[i], 0, &its, NULL) == 0);
     }
     sleep_ms(300);
-    for (int i = 0; i < TIMERS; i++) CHECK(timer_delete(ids[i]) == 0);
+    for (int i = 0; i < TIMERS; i++) {
+        // musl's timer_delete returns the call's result itself, not -1 and
+        // errno.
+        int r = timer_delete(ids[i]);
+        if (r != 0) { dprintf(2, "FAIL: timer_delete(%d) of timer %d returned %d\n", (int)(intptr_t)ids[i], i, r); _exit(1); }
+    }
     int least = 1 << 30, most = 0;
     for (int i = 0; i < TIMERS; i++) {
         int n = atomic_load(&fired[i]);

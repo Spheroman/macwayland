@@ -120,10 +120,13 @@ pub(crate) fn should_yield() -> bool {
 /// watch, which are few; more wait their turn.
 const MAX_WORKERS: usize = 256;
 
-/// Host threads kept for the host's own besides its CPUs and waiters (the
-/// ticker, timers, reclaiming, host signals and the like), out of the
-/// budget workers may use.
-const RESERVED: usize = 8;
+/// Host threads kept for the host's own besides its CPUs and waiters, out
+/// of the budget workers may use. There are eight kinds today (the ticker,
+/// timers, reclaiming, host signals, the parent's requests, receipts, and
+/// the relay's two), each one at a time: twice that, so one starting as
+/// another ends, or a kind added later, never finds the budget spent by
+/// idle workers.
+const RESERVED: usize = 16;
 
 /// The most workers a host may have: [`MAX_WORKERS`], or less if the host
 /// thread budget (linux_abi::host_threads) is lower, so that what workers
