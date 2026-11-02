@@ -550,9 +550,93 @@ fn processes_go_when_they_end() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     };
-    wait_until("ended children", &|live| live.len() == 2 && live.contains(&main) && !announced.iter().any(|p| live.contains(p)));
+    // (With MACWL_ONE_VM=1 the processes are the host's: it's the one Mac
+    // process, with no spare.)
+    let mac_processes = if macwl_runtime::one_vm() { 1 } else { 2 };
+    wait_until("ended children", &|live| live.len() == mac_processes && live.contains(&main) && !announced.iter().any(|p| live.contains(p)));
     drop(child.stdin.take());
     assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procstress ok"));
     assert!(child.wait().unwrap().success());
     wait_until("after the parent", &|live| live.is_empty());
+}
+
+/// `guest/procs` TEST under one VM (`MACWL_ONE_VM=1`, whatever the tests run
+/// with): its stdout, after checking it ended well.
+fn procs_in_one_vm(test: &str) -> String {
+    let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let out = macwl_run().env("MACWL_ONE_VM", "1").arg(&path).arg(test).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success() && stdout.ends_with(&format!("procs {test} ok\n")), "{test}: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    stdout
+}
+
+/// Copy-on-write fork in one VM: each side's writes its own, after a second
+/// fork while the first child still shares frames, and while threads write
+/// as the process forks; MAP_SHARED and a vfork child's memory shared.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_copy_on_write() {
+    procs_in_one_vm("cow");
+}
+
+/// Zombies and `wait` in one VM: a zombie until waited for, WNOHANG,
+/// WNOWAIT, WUNTRACED and WCONTINUED, SIGCHLD's si_code for stops and
+/// exits, SIGCHLD ignored reaping at once, a stopped child killed, an orphan
+/// reparented.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_zombies_and_wait() {
+    procs_in_one_vm("wait");
+}
+
+/// Signals, process groups and sessions across the processes of one host:
+/// kill to a group and to 0, setpgid from both sides, setsid's rules,
+/// EACCES on an exec'd child, the sender's pid in siginfo, tgkill of
+/// another process's thread.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_signals_and_groups() {
+    procs_in_one_vm("groups");
+}
+
+/// More live Linux processes than a Mac has VMs (128): 300 at once in one
+/// host, which stays one Mac process meanwhile.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_more_processes_than_vms() {
+    use std::io::{BufRead, BufReader};
+    let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    // A copy of macwl-run, so its processes can be told from other tests'.
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("macwl-run");
+    std::fs::copy(macwl_run().get_program(), &copy).unwrap();
+    let copy = std::fs::canonicalize(copy).unwrap();
+    let mut child = std::process::Command::new(&copy)
+        .env("MACWL_ONE_VM", "1")
+        .args([path.as_os_str(), "many".as_ref(), "300".as_ref(), "hold".as_ref()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("300 alive"));
+    assert_eq!(live_processes_of(&copy), vec![child.id() as i32], "one Mac process for 301 Linux ones");
+    drop(child.stdin.take());
+    assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procs many ok"));
+    assert!(child.wait().unwrap().success());
+}
+
+/// The host process never execs: in one VM an execve of a Mac program
+/// fails with ENOEXEC (step 6 brings them back as processes of their own),
+/// even with Mac programs turned on.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_refuses_mac_programs() {
+    let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let out = macwl_run().env("MACWL_ONE_VM", "1").env("MACWL_MAC_PROGRAMS", "1").arg(&path).arg("execmac").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "execve: ENOEXEC\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success());
 }

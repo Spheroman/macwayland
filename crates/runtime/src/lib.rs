@@ -1224,7 +1224,18 @@ fn run_loop<'scope, 'env>(
             };
             last_fault = if last_fault.0 == far { (far, last_fault.1 + 1) } else { (far, 0) };
             if last_fault.1 < MAX_FAULT_RETRIES {
-                let fixed = space.lock().handle_fault(far, access);
+                let fixed = {
+                    let mut s = space.lock();
+                    let breaks = s.cow_breaks();
+                    let fixed = s.handle_fault(far, access);
+                    // A page made this address space's own is progress, not
+                    // a repeat: a thread writing it in a loop while another
+                    // forks again and again faults on it each time.
+                    if s.cow_breaks() != breaks {
+                        last_fault = (u64::MAX, 0);
+                    }
+                    fixed
+                };
                 match fixed {
                     // Resuming erets to the faulting instruction, which retries.
                     Ok(true) => continue,

@@ -360,6 +360,8 @@ pub struct AddressSpace {
     /// Page-table entries the guest may have cached changed; flush the TLB
     /// before it runs again.
     tlb_stale: bool,
+    /// Pages shared copy on write that it has made its own, so far.
+    cow_breaks: u64,
 }
 
 impl AddressSpace {
@@ -380,6 +382,7 @@ impl AddressSpace {
             brk_start: MIN_ADDR,
             brk: MIN_ADDR,
             tlb_stale: false,
+            cow_breaks: 0,
         };
         // Where signal handlers without their own return path return to.
         let tramp = crate::signal::TRAMPOLINE_VA;
@@ -396,6 +399,12 @@ impl AddressSpace {
 
     pub fn asid(&self) -> u64 {
         self.asid
+    }
+
+    /// How many pages shared copy on write it has made its own (see
+    /// [`AddressSpace::handle_fault`]).
+    pub fn cow_breaks(&self) -> u64 {
+        self.cow_breaks
     }
 
     /// Its number: unique for the life of the host process.
@@ -431,6 +440,7 @@ impl AddressSpace {
             brk_start: self.brk_start,
             brk: self.brk,
             tlb_stale: false,
+            cow_breaks: 0,
         };
         self.tlb_stale = true;
         self.user.fork_into(&mut self.phys, &child.user, &mut child.phys)?;
@@ -455,6 +465,7 @@ impl AddressSpace {
         };
         self.phys.write_u64(slot, pa | page_attrs(vma));
         self.tlb_stale = true;
+        self.cow_breaks += 1;
         Ok(pa)
     }
 
@@ -506,7 +517,7 @@ impl AddressSpace {
         let asid = machine.alloc_asid().map_err(|_| Truncated)?;
         let phys = PhysMem::new(machine.pool());
         let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
-        Ok(AddressSpace { machine, phys, windows, user, asid, serial, ran: false, vmas, brk_start, brk, tlb_stale: false })
+        Ok(AddressSpace { machine, phys, windows, user, asid, serial, ran: false, vmas, brk_start, brk, tlb_stale: false, cow_breaks: 0 })
     }
 
     /// Map guest physical memory into `vm`: the pool, and shared windows (now

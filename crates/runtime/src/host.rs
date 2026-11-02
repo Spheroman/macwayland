@@ -131,6 +131,32 @@ impl RangePids {
     }
 }
 
+impl Drop for RangePids {
+    /// The host is done with its ranges (as it would be by exiting).
+    fn drop(&mut self) {
+        let ours = std::mem::take(&mut self.lock().ranges);
+        let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(&self.file) else { return };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return;
+        }
+        let mut text = String::new();
+        if file.read_to_string(&mut text).is_err() {
+            return;
+        }
+        let me = std::process::id().to_string();
+        let kept: String = text
+            .lines()
+            .filter(|l| {
+                let mut f = l.split_whitespace();
+                let (start, owner) = (f.next().and_then(|s| s.parse::<i64>().ok()), f.next());
+                !(owner == Some(me.as_str()) && start.is_some_and(|s| ours.contains(&s)))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let _ = file.set_len(0).and_then(|()| file.rewind()).and_then(|()| file.write_all(kept.as_bytes()));
+    }
+}
+
 impl PidAllocator for RangePids {
     fn alloc(&self) -> Option<i64> {
         let mut s = self.lock();
@@ -798,26 +824,8 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     process.set_kernel(Arc::new(TableKernel(Arc::downgrade(&table))));
     // Each process's umask is applied as it creates files; the host's own
     // would apply on top.
-    unsafe { libc::umask(0) };
-    // Signals from the Mac side are the host's, to route.
-    let inbox = Arc::new(Inbox::default());
-    inbox.receive_host_signals();
-    let wait = HostSignalWait::new(&inbox).map_err(|e| Error::Io(std::io::Error::from_raw_os_error(e as i32)))?;
-    catch_host_signals(&FROM_HOST);
-    {
-        let table = table.clone();
-        std::thread::spawn(move || {
-            // The inbox lives as long as the host process: host signal
-            // handlers find it through a raw pointer.
-            let _inbox = inbox;
-            loop {
-                let got = wait.wait();
-                for sig in (1..=64).filter(|s| got & (1 << (s - 1)) != 0) {
-                    table.from_host(sig);
-                }
-            }
-        });
-    }
+    let old_umask = unsafe { libc::umask(0) };
+    route_host_signals(&table)?;
 
     profile_mark("load start");
     let machine = Machine::new()?;
@@ -848,7 +856,40 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
         }
     });
     let exit = table.first_exit.lock().unwrap_or_else(|e| e.into_inner()).take();
+    unsafe { libc::umask(old_umask) };
     exit.unwrap_or(Ok(Exit::Code(0)))
+}
+
+/// The host whose processes get the Mac side's signals: the one running
+/// now (a test binary runs one after another).
+static HOST_TABLE: Mutex<Weak<Table>> = Mutex::new(Weak::new());
+
+/// Signals from the Mac side are the host's, to route ([`Table::from_host`]):
+/// caught into an inbox of the host's own, which a thread (one per host
+/// process) waits on.
+fn route_host_signals(table: &Arc<Table>) -> Result<(), Error> {
+    static STARTED: std::sync::OnceLock<Result<(), i64>> = std::sync::OnceLock::new();
+    *HOST_TABLE.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(table);
+    let started = STARTED.get_or_init(|| {
+        let inbox = Arc::new(Inbox::default());
+        inbox.receive_host_signals();
+        let wait = HostSignalWait::new(&inbox)?;
+        catch_host_signals(&FROM_HOST);
+        std::thread::spawn(move || {
+            // The inbox lives as long as the host process: host signal
+            // handlers find it through a raw pointer.
+            let _inbox = inbox;
+            loop {
+                let got = wait.wait();
+                let Some(table) = HOST_TABLE.lock().unwrap_or_else(|e| e.into_inner()).upgrade() else { continue };
+                for sig in (1..=64).filter(|s| got & (1 << (s - 1)) != 0) {
+                    table.from_host(sig);
+                }
+            }
+        });
+        Ok(())
+    });
+    started.map_err(|e| Error::Io(std::io::Error::from_raw_os_error(e as i32)))
 }
 
 fn profile_mark(what: &str) {
