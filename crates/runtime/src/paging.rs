@@ -47,7 +47,11 @@ const DESC_AF: u64 = 1 << 10;
 const DESC_NG: u64 = 1 << 11;
 const DESC_PXN: u64 = 1 << 53;
 const DESC_UXN: u64 = 1 << 54;
-const DESC_ADDR: u64 = 0x0000_ffff_ffff_f000;
+/// Software bit (55–58 are the OS's): the page's frame is shared copy on
+/// write with another address space (a fork inside the VM), so the page
+/// stays read-only, whatever its protection, until it's written.
+pub const DESC_COW: u64 = 1 << 55;
+pub const DESC_ADDR: u64 = 0x0000_ffff_ffff_f000;
 
 /// Linux `PROT_*` bits, as stored in VMAs.
 pub mod prot {
@@ -379,6 +383,21 @@ impl Pool {
         Ok(pool)
     }
 
+    /// Another hold on each of `frames` (a fork shares them).
+    pub fn hold(&self, frames: &[u64]) {
+        let mut s = self.state();
+        for &pa in frames {
+            let r = &mut s.refs[(pa / PAGE_SIZE) as usize];
+            debug_assert!(*r > 0, "frame {pa:#x} held while free");
+            *r += 1;
+        }
+    }
+
+    /// How many address spaces hold frame `pa`.
+    pub fn holders(&self, pa: u64) -> u32 {
+        self.state().refs[(pa / PAGE_SIZE) as usize]
+    }
+
     /// Frames held by anyone (for tests and diagnostics).
     pub fn frames_held(&self) -> u64 {
         let s = self.state();
@@ -538,6 +557,62 @@ impl PageTable {
         Some(table)
     }
 
+    /// The level-3 entry for `va`, if the page is mapped: where it is, and
+    /// the descriptor.
+    pub fn entry_of(&self, phys: &PhysMem, va: u64) -> Option<(u64, u64)> {
+        let mut table = self.root;
+        for level in 0..3 {
+            let desc = phys.read_u64(table + index(va, level) * 8);
+            if desc & DESC_VALID == 0 {
+                return None;
+            }
+            table = desc & DESC_ADDR;
+        }
+        let slot = table + index(va, 3) * 8;
+        let desc = phys.read_u64(slot);
+        (desc & DESC_VALID != 0).then_some((slot, desc))
+    }
+
+    /// A fork's copy of these tables, made in `child_phys` into `child` (a
+    /// new, empty table): the same pages, every pool frame shared copy on
+    /// write (read-only and [`DESC_COW`] in both) and held once more. Shared
+    /// windows' pages are mapped as they are. The caller flushes this
+    /// table's address space before it runs again: its pages became
+    /// read-only.
+    pub fn fork_into(&self, phys: &mut PhysMem, child: &PageTable, child_phys: &mut PhysMem) -> Result<(), OutOfMemory> {
+        fn copy(phys: &mut PhysMem, from: u64, child_phys: &mut PhysMem, to: u64, level: u32, held: &mut Vec<u64>) -> Result<(), OutOfMemory> {
+            for i in 0..512 {
+                let slot = from + i * 8;
+                let desc = phys.read_u64(slot);
+                if desc & DESC_VALID == 0 {
+                    continue;
+                }
+                if level < 3 {
+                    let next = child_phys.alloc()?;
+                    child_phys.write_u64(to + i * 8, next | DESC_TABLE_OR_PAGE | DESC_VALID);
+                    copy(phys, desc & DESC_ADDR, child_phys, next, level + 1, held)?;
+                } else if desc & DESC_ADDR < POOL_SIZE {
+                    let shared = desc | DESC_COW | DESC_AP_RO;
+                    if shared != desc {
+                        phys.write_u64(slot, shared);
+                    }
+                    child_phys.write_u64(to + i * 8, shared);
+                    held.push(desc & DESC_ADDR);
+                } else {
+                    child_phys.write_u64(to + i * 8, desc);
+                }
+            }
+            Ok(())
+        }
+        let mut held = Vec::new();
+        let copied = copy(phys, self.root, child_phys, child.root, 0, &mut held);
+        // Even if it ran out of frames part way: the child's tables hold
+        // what they map, and give it back when they go.
+        phys.pool().hold(&held);
+        child_phys.in_use += held.len() as u64;
+        copied
+    }
+
     /// Map the page at `va` to frame `pa`. The page must not be mapped.
     pub fn map(&self, phys: &mut PhysMem, va: u64, pa: u64, attrs: u64) -> Result<(), OutOfMemory> {
         let slot = self.entry(phys, va)?;
@@ -612,12 +687,14 @@ impl PageTable {
     }
 
     /// Change the attributes of every mapped page in `[start, end)`. Returns
-    /// whether anything was mapped (and so the TLB needs flushing).
+    /// whether anything was mapped (and so the TLB needs flushing). Pages
+    /// shared copy on write stay read-only (and so marked).
     pub fn protect_range(&self, phys: &mut PhysMem, start: u64, end: u64, attrs: u64) -> bool {
         let mut any = false;
         self.for_each_mapped(phys, start, end, &mut |phys, _va, slot| {
-            let frame = phys.read_u64(slot) & DESC_ADDR;
-            phys.write_u64(slot, frame | attrs);
+            let desc = phys.read_u64(slot);
+            let cow = if desc & DESC_COW != 0 { DESC_COW | DESC_AP_RO } else { 0 };
+            phys.write_u64(slot, (desc & DESC_ADDR) | attrs | cow);
             any = true;
         });
         any

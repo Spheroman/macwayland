@@ -21,9 +21,10 @@
 //! (docs/processes.md, section 2).
 
 use std::{
+    collections::BTreeSet,
     os::fd::{OwnedFd, RawFd},
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Mutex, MutexGuard,
     },
 };
@@ -74,7 +75,8 @@ pub const FLUSH_ASID_PATH: u64 = VECTORS_VA + 0x800;
 const ASID_LIMIT: u64 = 1 << 16;
 
 /// What every address space of a VM shares: the frame pool, the kernel half
-/// (one `TTBR1_EL1` per VM: the vectors, global), and the ASIDs.
+/// (one `TTBR1_EL1` per VM: the vectors, global), the ASIDs, and the shared
+/// windows.
 pub struct Machine {
     pool: Arc<Pool>,
     kernel: PageTable,
@@ -82,6 +84,9 @@ pub struct Machine {
     _kernel_frames: Mutex<PhysMem>,
     asids: Mutex<Asids>,
     reclaim: Arc<Reclaim>,
+    /// Shared memory placed above the pool, counted by the address spaces
+    /// using each window.
+    windows: Mutex<SharedWindows>,
 }
 
 /// Address spaces whose ASID has been flushed, waiting for a thread of
@@ -183,7 +188,14 @@ impl Machine {
         let vectors = phys.alloc().map_err(oom)?;
         write_vectors(&mut phys, vectors);
         kernel.map(&mut phys, VECTORS_VA, vectors, paging::kernel_code_attrs()).map_err(oom)?;
-        Ok(Arc::new(Machine { pool, kernel, _kernel_frames: Mutex::new(phys), asids: Mutex::default(), reclaim: Arc::default() }))
+        Ok(Arc::new(Machine {
+            pool,
+            kernel,
+            _kernel_frames: Mutex::new(phys),
+            asids: Mutex::default(),
+            reclaim: Arc::default(),
+            windows: Mutex::default(),
+        }))
     }
 
     /// A forked child's, from the parent's snapshot (see
@@ -193,7 +205,14 @@ impl Machine {
         let pool = Pool::restore(entries, d)?;
         let kernel = PageTable { root: d.u64()? };
         let phys = PhysMem::new(&pool);
-        Ok(Arc::new(Machine { pool, kernel, _kernel_frames: Mutex::new(phys), asids: Mutex::default(), reclaim: Arc::default() }))
+        Ok(Arc::new(Machine {
+            pool,
+            kernel,
+            _kernel_frames: Mutex::new(phys),
+            asids: Mutex::default(),
+            reclaim: Arc::default(),
+            windows: Mutex::default(),
+        }))
     }
 
     pub fn pool(&self) -> &Arc<Pool> {
@@ -202,6 +221,24 @@ impl Machine {
 
     fn asids(&self) -> MutexGuard<'_, Asids> {
         self.asids.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn windows(&self) -> MutexGuard<'_, SharedWindows> {
+        self.windows.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The ASIDs of address spaces that ran and have gone, still to be
+    /// flushed (by any vCPU: `tlbi aside1is` reaches them all), after which
+    /// [`Machine::asid_flushed`] gives them and their frames back. With many
+    /// processes in one VM, CPUs look here between tasks.
+    pub fn unflushed_asids(&self) -> Vec<u64> {
+        self.asids().retired.iter().map(|r| r.asid).collect()
+    }
+
+    /// Whether any address space waits for its ASID's flush (cheap enough
+    /// to ask between tasks).
+    pub fn any_unflushed(&self) -> bool {
+        !self.asids().retired.is_empty()
     }
 
     fn alloc_asid(&self) -> Result<u64, OutOfMemory> {
@@ -301,12 +338,19 @@ fn page_up(a: u64) -> Option<u64> {
     a.checked_next_multiple_of(PAGE_SIZE)
 }
 
+/// Address spaces made so far: each gets the next number, which vCPUs keep
+/// to know which one they're set up for (an ASID or a page-table root can
+/// come back, once its address space has gone; this never does).
+static SERIAL: AtomicU64 = AtomicU64::new(1);
+
 pub struct AddressSpace {
     machine: Arc<Machine>,
     phys: PhysMem,
-    shared: SharedWindows,
+    /// The machine's shared windows it uses (by start).
+    windows: BTreeSet<u64>,
     user: PageTable,
     asid: u64,
+    serial: u64,
     /// A vCPU has run with it, so the TLB may hold its entries: when it
     /// goes, its ASID must be flushed before its frames are reused.
     ran: bool,
@@ -327,9 +371,10 @@ impl AddressSpace {
         let mut space = AddressSpace {
             machine: machine.clone(),
             phys,
-            shared: SharedWindows::default(),
+            windows: BTreeSet::new(),
             user,
             asid,
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             ran: false,
             vmas: Vmas::default(),
             brk_start: MIN_ADDR,
@@ -351,6 +396,66 @@ impl AddressSpace {
 
     pub fn asid(&self) -> u64 {
         self.asid
+    }
+
+    /// Its number: unique for the life of the host process.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// A copy-on-write fork of this address space in the same pool (one VM
+    /// for both processes): the same regions, break and windows; its own
+    /// page tables and ASID; every private frame shared until one side
+    /// writes it. This one's pages become read-only, so its TLB entries
+    /// must be flushed before it runs again ([`AddressSpace::needs_flush`]
+    /// says so).
+    pub fn fork(&mut self) -> Result<AddressSpace, OutOfMemory> {
+        let mut phys = PhysMem::new(self.machine.pool());
+        let user = PageTable::new(&mut phys)?;
+        let asid = self.machine.alloc_asid()?;
+        {
+            let mut windows = self.machine.windows();
+            for &w in &self.windows {
+                windows.add_user(w);
+            }
+        }
+        let mut child = AddressSpace {
+            machine: self.machine.clone(),
+            phys,
+            windows: self.windows.clone(),
+            user,
+            asid,
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            ran: false,
+            vmas: self.vmas.clone(),
+            brk_start: self.brk_start,
+            brk: self.brk,
+            tlb_stale: false,
+        };
+        self.tlb_stale = true;
+        self.user.fork_into(&mut self.phys, &child.user, &mut child.phys)?;
+        Ok(child)
+    }
+
+    /// A write to a page of `vma` (mapped by the entry at `slot`, `desc`)
+    /// that's shared copy on write: the page becomes this address space's
+    /// own, a copy unless no one else holds the frame any more. Returns its
+    /// frame.
+    fn break_cow(&mut self, slot: u64, desc: u64, vma: Vma) -> Result<u64, OutOfMemory> {
+        let frame = desc & paging::DESC_ADDR;
+        let pa = if self.phys.pool().holders(frame) == 1 {
+            frame
+        } else {
+            let copy = self.phys.alloc()?;
+            unsafe { std::ptr::copy_nonoverlapping(self.phys.ptr(frame), self.phys.ptr(copy), PAGE_SIZE as usize) };
+            // Its hold goes once this address space's TLB entries for it
+            // have.
+            self.phys.free(frame);
+            copy
+        };
+        self.phys.write_u64(slot, pa | page_attrs(vma));
+        self.tlb_stale = true;
+        Ok(pa)
     }
 
     /// Everything a forked child needs to rebuild this address space:
@@ -377,7 +482,7 @@ impl AddressSpace {
                 Backing::File { ipa } => e.u64(2).u64(ipa),
             };
         }
-        let fds = self.shared.encode(e);
+        let fds = self.machine.windows().encode(e, self.windows.iter());
         Ok((entries, fds))
     }
 
@@ -397,35 +502,33 @@ impl AddressSpace {
             };
             vmas.insert(start, end, prot, backing);
         }
-        let shared = SharedWindows::decode(d, fds)?;
+        let windows = machine.windows().decode(d, fds)?.into_iter().collect();
         let asid = machine.alloc_asid().map_err(|_| Truncated)?;
         let phys = PhysMem::new(machine.pool());
-        Ok(AddressSpace { machine, phys, shared, user, asid, ran: false, vmas, brk_start, brk, tlb_stale: false })
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        Ok(AddressSpace { machine, phys, windows, user, asid, serial, ran: false, vmas, brk_start, brk, tlb_stale: false })
     }
 
     /// Map guest physical memory into `vm`: the pool, and shared windows (now
     /// and as they're created).
     pub fn map_into(&mut self, vm: &Vm) -> Result<(), HvError> {
         self.machine.pool().map_into(vm)?;
-        self.shared.attach_vm()
+        self.machine.windows().attach_vm()
     }
 
     /// Take guest physical memory out of `vm`, before it goes.
     pub fn unmap_from(&mut self, _vm: &Vm) -> Result<(), HvError> {
         self.machine.pool().unmap_from_vm()?;
-        self.shared.detach_vm()
+        self.machine.windows().detach_vm()
     }
 
-    /// Map this address space's shared windows into the VM (the pool is
-    /// there already): it replaces another, for `execve`.
-    pub fn attach_windows(&mut self) -> Result<(), HvError> {
-        self.shared.attach_vm()
-    }
-
-    /// Take this address space's shared windows out of the VM, which
-    /// carries on with another (`execve`).
-    pub fn detach_windows(&mut self) -> Result<(), HvError> {
-        self.shared.detach_vm()
+    /// Point a vCPU set up for another address space of the same VM (by
+    /// [`AddressSpace::configure_vcpu`]) at this one: only `TTBR0_EL1`
+    /// differs, and with ASIDs neither's TLB entries need flushing.
+    pub fn switch_vcpu(&mut self, vcpu: &mut Vcpu) -> Result<(), HvError> {
+        vcpu.set_sys_reg(hv::sys_reg::TTBR0_EL1, self.user.root | self.asid << 48)?;
+        self.ran = true;
+        Ok(())
     }
 
     /// Point the vCPU at our page tables (with our ASID) and the VM's
@@ -556,7 +659,12 @@ impl AddressSpace {
             self.privatize(page, page + PAGE_SIZE).map_err(|_| OutOfMemory)?;
             return Ok(true);
         }
-        if self.user.lookup(&self.phys, page).is_some() {
+        if let Some((slot, desc)) = self.user.entry_of(&self.phys, page) {
+            // A write to a page shared with a fork: now it's ours.
+            if access == Access::Write && desc & paging::DESC_COW != 0 {
+                self.break_cow(slot, desc, vma)?;
+                return Ok(true);
+            }
             // Mapped and allowed, so the guest saw a stale TLB entry.
             self.tlb_stale = true;
             return Ok(true);
@@ -583,12 +691,13 @@ impl AddressSpace {
         Ok(pa)
     }
 
-    /// Host pointer to guest physical address `pa`.
+    /// Host pointer to guest physical address `pa`. (A window's stays valid
+    /// while this address space uses the window.)
     fn ptr(&self, pa: u64) -> *mut u8 {
         if pa < POOL_SIZE {
             self.phys.ptr(pa)
         } else {
-            self.shared.ptr(pa).expect("physical address outside any window")
+            self.machine.windows().ptr(pa).expect("physical address outside any window")
         }
     }
 
@@ -608,8 +717,11 @@ impl AddressSpace {
                 self.privatize(page, page + PAGE_SIZE)?;
                 continue;
             }
-            let pa = match (vma.shared_pa(start, page), self.user.lookup(&self.phys, page)) {
-                (Some(pa), _) | (None, Some(pa)) => pa,
+            let pa = match (vma.shared_pa(start, page), self.user.entry_of(&self.phys, page)) {
+                (Some(pa), _) => pa,
+                // Shared with a fork: written, it becomes ours.
+                (None, Some((slot, desc))) if desc & paging::DESC_COW != 0 => self.break_cow(slot, desc, vma).map_err(|_| Fault { addr: va })?,
+                (None, Some((_, desc))) => desc & paging::DESC_ADDR,
                 (None, None) => self.populate(page, start, vma).map_err(|_| Fault { addr: va })?,
             };
             let off = va - page;
@@ -652,15 +764,26 @@ impl AddressSpace {
     }
 
     fn release_unused_windows(&mut self) {
-        for (ws, we) in self.shared.ranges() {
+        let ranges: Vec<(u64, u64)> = {
+            let windows = self.machine.windows();
+            self.windows.iter().filter_map(|&w| windows.find(w)).collect()
+        };
+        for (ws, we) in ranges {
             let used = self.vmas.iter().any(|(s, v)| match v.backing {
                 Backing::Shared { ipa } | Backing::File { ipa } => ipa < we && ipa + (v.end - s) > ws,
                 Backing::Private => false,
             });
             if !used {
-                self.shared.release(ws);
+                self.windows.remove(&ws);
+                self.machine.windows().release(ws);
             }
         }
+    }
+
+    /// The shared windows it uses, as (start, end).
+    pub fn window_ranges(&self) -> Vec<(u64, u64)> {
+        let windows = self.machine.windows();
+        self.windows.iter().filter_map(|&w| windows.find(w)).collect()
     }
 
     /// Choose where a new `len`-byte mapping goes (for MAP_FIXED, clearing
@@ -769,8 +892,10 @@ impl AddressSpace {
             Ok(addr) => addr,
             Err(e) => return e,
         };
-        match self.shared.create(host_fd, offset, len, writable) {
-            Ok(ipa) => {
+        let created = self.machine.windows().create(host_fd, offset, len, writable);
+        match created {
+            Ok((window, ipa)) => {
+                self.windows.insert(window);
                 self.vmas.insert(addr, addr + len, p, Backing::Shared { ipa });
                 addr as i64
             }
@@ -793,8 +918,10 @@ impl AddressSpace {
             Ok(addr) => addr,
             Err(e) => return e,
         };
-        match self.shared.create(Some(host_fd), offset, len, false) {
-            Ok(ipa) => {
+        let created = self.machine.windows().create(Some(host_fd), offset, len, false);
+        match created {
+            Ok((window, ipa)) => {
+                self.windows.insert(window);
                 self.vmas.insert(addr, addr + len, p, Backing::File { ipa });
                 addr as i64
             }
@@ -860,7 +987,7 @@ impl AddressSpace {
             // Shared mappings of read-only files can't become writable.
             for (s, v) in self.vmas.overlapping(addr, end) {
                 if let Backing::Shared { ipa } = v.backing
-                    && !self.shared.writable(ipa + (s.max(addr) - s))
+                    && !self.machine.windows().writable(ipa + (s.max(addr) - s))
                 {
                     return -errno::EACCES;
                 }
@@ -951,6 +1078,13 @@ impl Drop for AddressSpace {
         // they go back to the pool once that's flushed.
         let retired = Retired { asid: self.asid, user: PageTable { root: self.user.root }, quarantine: self.phys.take_quarantine() };
         self.machine.retire(retired, self.ran);
+        // Its shared windows go too, if no other address space uses them.
+        // (Their pages may still be in TLBs under its ASID, but nothing runs
+        // with that ASID again until it has been flushed.)
+        let mut windows = self.machine.windows();
+        for &w in &self.windows {
+            windows.release(w);
+        }
     }
 }
 
@@ -1142,6 +1276,84 @@ mod tests {
         assert_eq!(s.handle_fault(0x1234, Access::Read), Ok(false));
     }
 
+    /// A fork inside the pool: each side's writes are its own, whichever
+    /// writes first and however many forks share a frame; frames shared by
+    /// no one any more are made writable again without a copy; everything
+    /// goes back when the address spaces do.
+    #[test]
+    fn fork_copies_on_write() {
+        let machine = Machine::new().unwrap();
+        let pool = machine.pool().clone();
+        let base = pool.frames_held();
+        let mut parent = AddressSpace::new(&machine).unwrap();
+        let a = mmap(&mut parent, 0x8000, RW);
+        parent.write(a, &[1; 0x8000]).unwrap();
+        parent.flushed();
+        let held = pool.frames_held();
+
+        let mut child = parent.fork().unwrap();
+        assert!(parent.needs_flush(), "the parent's pages became read-only");
+        parent.flushed();
+        assert_ne!(child.asid(), parent.asid());
+        assert!(pool.frames_held() - held <= paging::CHUNK_FRAMES as u64, "only page tables are new (a chunk of frames for them)");
+        assert_eq!(read_byte(&child, a + 0x10).unwrap(), 1);
+        // A write fault in the child, and a system call's write in the parent.
+        assert_eq!(child.handle_fault(a, Access::Write), Ok(true));
+        child.write(a, &[2]).unwrap();
+        parent.write(a + 0x1000, &[3]).unwrap();
+        assert_eq!(read_byte(&parent, a).unwrap(), 1);
+        assert_eq!(read_byte(&child, a).unwrap(), 2);
+        assert_eq!(read_byte(&child, a + 0x1000).unwrap(), 1);
+        assert_eq!(read_byte(&parent, a + 0x1000).unwrap(), 3);
+
+        // A second fork shares what the first still does.
+        let mut second = parent.fork().unwrap();
+        parent.flushed();
+        second.write(a + 0x2000, &[4]).unwrap();
+        child.write(a + 0x3000, &[5]).unwrap();
+        for (s, want) in [(&parent, [1, 3, 1, 1]), (&child, [2, 1, 1, 5]), (&second, [1, 3, 4, 1])] {
+            for (page, &b) in want.iter().enumerate() {
+                assert_eq!(read_byte(s, a + page as u64 * 0x1000).unwrap(), b);
+            }
+        }
+
+        // Protection changes keep shared pages read-only.
+        assert_eq!(parent.mprotect(a, 0x8000, prot::READ), 0);
+        assert_eq!(parent.mprotect(a, 0x8000, RW), 0);
+        parent.flushed();
+        assert_eq!(parent.handle_fault(a + 0x4000, Access::Write), Ok(true));
+        parent.write(a + 0x4000, &[6]).unwrap();
+        assert_eq!(read_byte(&child, a + 0x4000).unwrap(), 1);
+        assert_eq!(read_byte(&second, a + 0x4000).unwrap(), 1);
+
+        // With the forks gone (they never ran, so their frames go at once),
+        // the parent's pages are its own again: written in place.
+        drop(child);
+        drop(second);
+        parent.flushed();
+        let before = parent.frames_in_use();
+        parent.write(a + 0x5000, &[7]).unwrap();
+        parent.flushed();
+        assert_eq!(parent.frames_in_use(), before, "no copy");
+        let (_, desc) = parent.user.entry_of(&parent.phys, a + 0x5000).unwrap();
+        assert_eq!(desc & paging::DESC_COW, 0);
+        drop(parent);
+        assert_eq!(pool.frames_held(), base, "every frame of the address spaces back");
+    }
+
+    #[test]
+    fn fork_shares_shared_memory() {
+        let mut parent = space();
+        let a = parent.mmap_shared(0, 0x2000, RW, mm::MAP_SHARED | mm::MAP_ANONYMOUS, None, 0) as u64;
+        parent.write(a, &[1]).unwrap();
+        let mut child = parent.fork().unwrap();
+        child.write(a, &[2]).unwrap();
+        assert_eq!(read_byte(&parent, a).unwrap(), 2, "MAP_SHARED stays shared");
+        drop(parent);
+        assert_eq!(child.window_ranges().len(), 1, "the window stays while the child uses it");
+        assert_eq!(read_byte(&child, a).unwrap(), 2);
+    }
+
     mod shared {
         use std::{
             fs::File,
@@ -1237,19 +1449,19 @@ mod tests {
             let file = f.reopen().unwrap();
             let mut s = space();
             let a = map(&mut s, &file, 0x4000, RW, 0) as u64;
-            assert_eq!(s.shared.ranges().len(), 1);
+            assert_eq!(s.window_ranges().len(), 1);
             assert_eq!(s.munmap(a + 0x1000, 0x2000), 0);
-            assert_eq!(s.shared.ranges().len(), 1, "both ends still mapped");
+            assert_eq!(s.window_ranges().len(), 1, "both ends still mapped");
             assert_eq!(read_byte(&s, a + 0x3000).unwrap(), b'd', "the tail keeps its offset");
             assert_eq!(s.munmap(a, 0x1000), 0);
-            assert_eq!(s.shared.ranges().len(), 1);
+            assert_eq!(s.window_ranges().len(), 1);
             assert_eq!(s.munmap(a + 0x3000, 0x1000), 0);
-            assert!(s.shared.ranges().is_empty());
+            assert!(s.window_ranges().is_empty());
             // MAP_FIXED over a shared mapping releases it too.
             let b = map(&mut s, &file, 0x1000, RW, 0) as u64;
             let flags = mm::MAP_PRIVATE | mm::MAP_ANONYMOUS | mm::MAP_FIXED;
             assert_eq!(s.mmap_anonymous(b, 0x1000, RW, flags), b as i64);
-            assert!(s.shared.ranges().is_empty());
+            assert!(s.window_ranges().is_empty());
         }
 
         #[test]
@@ -1278,9 +1490,9 @@ mod tests {
             file.read_exact_at(&mut buf, 0x2000).unwrap();
             assert_eq!(&buf, b"cccc");
             assert_eq!(read_byte(&s, a).unwrap(), b'b');
-            assert_eq!(s.shared.ranges().len(), 1);
+            assert_eq!(s.window_ranges().len(), 1);
             s.write(a, b"also").unwrap();
-            assert!(s.shared.ranges().is_empty(), "no longer read through");
+            assert!(s.window_ranges().is_empty(), "no longer read through");
             let b = s.mmap_file(0, 0x1000, RW, flags, file.as_raw_fd(), 0);
             assert!(b > 0, "a private mapping may be writable on a read-only fd");
         }

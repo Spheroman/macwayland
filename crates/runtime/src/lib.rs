@@ -519,10 +519,8 @@ fn run_task<'scope, 'env>(
                 stop_other_threads(sh);
                 let old = {
                     let mut s = sh.space.lock();
-                    s.detach_windows()?;
                     let old = std::mem::replace(&mut *s, program.space);
                     s.take_tlb_stale();
-                    s.attach_windows()?;
                     s.configure_vcpu(vcpu)?;
                     let generation = sh.generation.fetch_add(1, Ordering::AcqRel) + 1;
                     *configured = Some(generation);
