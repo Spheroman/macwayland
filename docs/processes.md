@@ -1,7 +1,7 @@
 # Processes in one VM: a host per session
 
 Status: design (2026-11-02), open questions decided (2026-11-02, see
-"Decisions"). ROADMAP items 6 and 13; extends the thread
+"Decisions"); steps 1 and 2 done (2026-11-02). ROADMAP items 6 and 13; extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
 
@@ -730,6 +730,45 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    takes a new ASID instead of remapping the pool. Tests: the memory unit
    tests, the runtime's tests, `switch_cost` (cross-process rows), exec
    cost (`forkbench exec`) no slower.
+   (Done, 2026-11-02.) `paging::Pool` (frames, reference counts, 64 KiB
+   chunks, host pages back to macOS in runs), `paging::PhysMem` now an
+   address space's view of it (a chunk cache and its quarantine),
+   `memory::Machine` (the pool, the kernel half, ASIDs) shared by the
+   address spaces of a VM; VMs are made with a 40-bit IPA, shared windows
+   at `[512 GiB, 1 TiB)`. `TCR_EL1.AS`, the ASID in `TTBR0_EL1`, nG on user
+   pages; the vector's flush path is `tlbi aside1is` on `TTBR0_EL1`'s ASID
+   (x0 borrowed through `TPIDR_EL1`, which `UserContext::save` knows), and
+   a second path after the table flushes a given ASID. `execve` swaps
+   address spaces in the same pool, flushes the old ASID and frees it.
+   Three things the design didn't settle, decided by the rule (2026-11-02):
+   - **The pool is reserved and mapped in segments that double** (8 GiB,
+     then 8, 16, ... up to 512 GiB), each when frames are first handed out
+     from it. Reserving 512 GiB of host address space at once costs 0.3 ms
+     and giving it back 0.45 ms (8 GiB: 10–20 µs), which every process
+     would pay while each has a VM; so the whole 512 GiB stays available
+     (a guest past 8 GiB now works, which the 8 GiB pool refused) at no cost
+     until used. A fork sends one memory entry per segment in use.
+   - **Chunk caches are per address space**, not per CPU: while one process
+     has a VM, its page faults already hold its address space's lock; per
+     CPU comes with step 3, when CPUs run several processes.
+   - **A gone address space's frames are given back by a thread of their
+     own**, after its ASID's flush: walking 200 MB of page tables and
+     giving the frames back took 0.3 ms on the `execve` path (the walk
+     mostly the host faulting in table pages a forked child never touched).
+     A fork waits for it, so its snapshot of the free list is whole.
+   Measured (M5 Pro, `forkbench`, 50 rounds, mean after the first, three
+   runs each, interleaved with the old build): no change within noise:
+   fork 0 MB 2.19–2.28 ms (was 2.23–2.34), 200 MB 2.60–2.65 (2.65–2.69);
+   fork + exec 0 MB 2.19–2.22 (2.24–2.26), 200 MB 2.87–2.91 (2.83–2.84);
+   `posix_spawn` 0 MB 2.22–2.26 (2.25–2.27), 200 MB 2.86–2.95
+   (2.88–3.12). The `execve` itself in a 200 MB fork child (`MACWL_PROFILE`,
+   loaded to exec'd) 23 µs, was 100 µs (no pool unmapped and mapped again).
+   `switch_cost` on the 40-bit VM: thread 1.36–1.54, ASID 1.37–1.62 µs a
+   round up to 256 pages. The foot latency benchmark (`MACWL_AUTO_KEYS=40`)
+   before: key→commit p50 2.24–2.28 ms, key→glass p50 10.2–11.1 ms; not
+   repeated after (later that day the shell's window wouldn't go full
+   screen with either build, so it took no samples): still to do. Tests: runtime 32 unit (2 new) and 23
+   integration, linux-abi 59; a guest with 8.8 GB touched forks and execs.
 3. **Processes in the host, behind `MACWL_ONE_VM=1`.** The process table,
    pids from the `PidAllocator` (ranges from the per-user pids file, so
    unique across hosts from the start), init, `/proc/<pid>` from the table

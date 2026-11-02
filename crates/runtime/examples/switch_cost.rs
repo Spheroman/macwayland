@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use macwl_runtime::{
     hv::{self, reg, sys_reg, UserContext, Vcpu, Vm},
-    paging::{self, prot, PageTable, PhysMem, PAGE_SIZE},
+    paging::{self, prot, PageTable, PhysMem, Pool, PAGE_SIZE},
 };
 
 fn main() {
@@ -198,7 +198,8 @@ mod processes {
     }
 
     pub fn run(vm: &Vm) {
-        let mut phys = PhysMem::new().unwrap();
+        let pool = Pool::new().unwrap();
+        let mut phys = PhysMem::new(&pool);
         let kernel = PageTable::new(&mut phys).unwrap();
         let vectors = phys.alloc().unwrap();
         // hvc #0 at each vector; at EL0 sync, eret and a flush path too.
@@ -220,7 +221,7 @@ mod processes {
             Process { root: user.root, asid, ctx: blank() }
         };
         let mut procs = [make(1, 1), make(2, 2)];
-        phys.map_into(vm).unwrap();
+        pool.map_into(vm).unwrap();
         let mut vcpu = Vcpu::new(vm).unwrap();
         configure(&mut vcpu, kernel.root);
 
@@ -244,6 +245,6 @@ mod processes {
             println!("{:>6} {:>8.2} {:>8.2} {:>8.2} {:>8.2}", pages, row[0], row[1], row[2], row[3]);
         }
         drop(vcpu);
-        hv::unmap(0, paging::PHYS_SIZE as usize).unwrap();
+        pool.unmap_from_vm().unwrap();
     }
 }

@@ -7,7 +7,7 @@
 
 use std::{ffi::c_void, ptr, time::Instant};
 
-use macwl_runtime::paging::{self, prot, PageTable, PhysMem, PAGE_SIZE};
+use macwl_runtime::paging::{self, prot, PageTable, PhysMem, Pool, PAGE_SIZE};
 
 type HvReturn = i32;
 
@@ -121,7 +121,8 @@ fn main() {
     println!("fork in the VM (page tables copied, private pages made copy-on-write):");
     for mb in [4u64, 32, 200, 1024] {
         let pages = (mb << 20) / PAGE_SIZE;
-        let mut phys = PhysMem::new().unwrap();
+        let pool = Pool::new().unwrap();
+        let mut phys = PhysMem::new(&pool);
         let parent = PageTable::new(&mut phys).unwrap();
         let rw = paging::user_attrs(prot::READ | prot::WRITE);
         // As a heap and libraries would be: a few regions.

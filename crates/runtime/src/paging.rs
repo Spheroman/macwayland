@@ -1,13 +1,22 @@
 //! Guest physical memory (a pool of 4 KiB frames) and the stage-1 page tables
 //! we keep in it.
 //!
-//! Guest physical memory is one host allocation mapped into the VM once, at
-//! IPA 0. The host only commits its pages when they're touched, so making it
-//! large costs nothing up front. Linux's 4 KiB pages are a stage-1 concern —
-//! our page tables use a 4 KiB granule — so the host's 16 KiB page size only
-//! matters for that single stage-2 mapping.
+//! Guest physical memory is one host allocation, reserved but not committed
+//! ([`POOL_SIZE`], 512 GiB), from which every address space of a VM takes
+//! frames ([`Pool`]): so `execve` gets a new address space without a new
+//! pool, and (docs/processes.md) many processes can share one VM. The host
+//! only commits pages when they're touched, so the size costs nothing up
+//! front. Linux's 4 KiB pages are a stage-1 concern — our page tables use a
+//! 4 KiB granule — so the host's 16 KiB page size only matters for the
+//! stage-2 mapping of the pool.
 
-use std::{io, ptr::NonNull};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+};
 
 use linux_abi::wire::{Decoder, Encoder, Truncated};
 
@@ -18,8 +27,13 @@ use crate::{
 
 /// Linux's page size on arm64, which the guest sees.
 pub const PAGE_SIZE: u64 = 4096;
-/// Guest physical memory size. Must fit the VM's IPA size (36 bits by default).
-pub const PHYS_SIZE: u64 = 8 << 30;
+/// The frame pool's size: guest physical `[0, POOL_SIZE)`. Shared windows
+/// live above it, up to the VM's 40-bit IPA limit.
+pub const POOL_SIZE: u64 = 512 << 30;
+/// Frames go to an address space this many at a time (64 KiB: four host
+/// pages, and the fault-around size), so its memory fills whole host pages,
+/// which go back to macOS whole when it unmaps or exits.
+pub const CHUNK_FRAMES: usize = 16;
 
 // Descriptor bits (4 KiB granule, 4 levels, 48-bit VAs).
 const DESC_VALID: u64 = 1 << 0;
@@ -29,6 +43,8 @@ const DESC_AP_EL0: u64 = 1 << 6; // AP[1]: EL0 can access
 const DESC_AP_RO: u64 = 1 << 7; // AP[2]: read-only
 const DESC_SH_INNER: u64 = 3 << 8;
 const DESC_AF: u64 = 1 << 10;
+/// Not global: the TLB tags the entry with the ASID it was used under.
+const DESC_NG: u64 = 1 << 11;
 const DESC_PXN: u64 = 1 << 53;
 const DESC_UXN: u64 = 1 << 54;
 const DESC_ADDR: u64 = 0x0000_ffff_ffff_f000;
@@ -44,8 +60,11 @@ pub mod prot {
 /// express write-only or execute-only for EL0, so (like Linux) write implies
 /// read and exec implies read. PROT_NONE pages stay mapped (so mprotect can
 /// restore them) but EL1-only, so any EL0 access is a permission fault.
+/// User pages are not global: each address space's TLB entries carry its
+/// ASID, so switching address spaces (or reusing a VA in a new one) needs
+/// no flush of the others'.
 pub fn user_attrs(p: u64) -> u64 {
-    let mut a = DESC_VALID | DESC_TABLE_OR_PAGE | DESC_AF | DESC_SH_INNER | DESC_PXN;
+    let mut a = DESC_VALID | DESC_TABLE_OR_PAGE | DESC_AF | DESC_SH_INNER | DESC_PXN | DESC_NG;
     if p & (prot::READ | prot::WRITE | prot::EXEC) != 0 {
         a |= DESC_AP_EL0;
         if p & prot::WRITE == 0 {
@@ -58,7 +77,8 @@ pub fn user_attrs(p: u64) -> u64 {
     a
 }
 
-/// Page attributes for kernel code: EL1 read-only and executable.
+/// Page attributes for kernel code: EL1 read-only and executable, global
+/// (the same in every address space).
 pub fn kernel_code_attrs() -> u64 {
     DESC_VALID | DESC_TABLE_OR_PAGE | DESC_AF | DESC_SH_INNER | DESC_AP_RO | DESC_UXN
 }
@@ -66,37 +86,87 @@ pub fn kernel_code_attrs() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutOfMemory;
 
-/// Guest physical memory and its frame allocator.
-///
-/// A frame that's unmapped isn't reusable at once: a vCPU may still hold a
-/// stale TLB entry for it. It waits in quarantine until the TLB has been
-/// flushed ([`PhysMem::release_quarantine`]). Host pages (16 KiB) whose four
-/// frames are all free are handed back to macOS, so a guest's memory use can
-/// shrink again.
-pub struct PhysMem {
-    host: NonNull<u8>,
-    /// Frames at or above this have never been handed out, so they're zero.
-    next_fresh: u64,
-    /// Free frames; they're zeroed again on reuse.
-    free: Vec<u64>,
-    /// Unmapped frames waiting for a TLB flush.
-    quarantine: Vec<u64>,
-    /// Per host page: how many of its frames are free, and (bit 7) whether
-    /// it has been handed back to macOS.
-    host_pages: Vec<u8>,
-}
-
 /// Frames per host page.
 const FRAMES_PER_HOST_PAGE: u64 = HOST_PAGE / PAGE_SIZE;
 const HOST_PAGE: u64 = 16 << 10;
 const RELEASED: u8 = 0x80;
 
-impl PhysMem {
-    pub fn new() -> io::Result<Self> {
+/// The pool comes in segments that double: guest physical `[0, 8 GiB)`,
+/// then `[8, 16)`, `[16, 32)` GiB, and so on up to 512 GiB. Each segment is a
+/// host reservation of its own, made and mapped into the VM's stage 2 when
+/// frames are first handed out from it, because both cost by size:
+/// reserving 512 GiB of host address space at once takes 0.3 ms and giving
+/// it back 0.45 ms (against 10–20 µs for 8 GiB), and `hv_vm_map` of it 1.2 ms
+/// (33 µs for 8 GiB), which every process would pay while each is a VM of
+/// its own. A VM costs what it did with an 8 GiB pool until a process needs
+/// more.
+const FIRST_SEGMENT: u64 = 8 << 30;
+const SEGMENTS: usize = 7;
+
+/// The segment holding guest physical address `pa`.
+fn segment_of(pa: u64) -> usize {
+    if pa < FIRST_SEGMENT { 0 } else { (64 - (pa / FIRST_SEGMENT).leading_zeros()) as usize }
+}
+
+/// Where segment `k` starts, and its length.
+fn segment(k: usize) -> (u64, u64) {
+    if k == 0 { (0, FIRST_SEGMENT) } else { (FIRST_SEGMENT << (k - 1), FIRST_SEGMENT << (k - 1)) }
+}
+
+/// The frames of a VM's guest physical memory, for all its address spaces.
+///
+/// Each frame has a reference count: how many address spaces hold it (one,
+/// until copy-on-write fork shares them). Bookkeeping grows with the frames
+/// handed out, not with the pool's size. A frame whose count drops to zero
+/// is free again; the address space that dropped it has had its TLB entries
+/// flushed first (see [`PhysMem`]). Host pages (16 KiB) whose four frames
+/// are all free are handed back to macOS, so a guest's memory use can
+/// shrink again.
+pub struct Pool {
+    /// Each segment's host memory, once reserved.
+    hosts: [AtomicPtr<u8>; SEGMENTS],
+    state: Mutex<PoolState>,
+}
+
+struct PoolState {
+    /// Frames at or above this have never been handed out, so they're zero.
+    next_fresh: u64,
+    /// Free frames; they're zeroed again on reuse.
+    free: Vec<u64>,
+    /// Per frame below `next_fresh`: how many address spaces hold it.
+    refs: Vec<u32>,
+    /// Per host page below `next_fresh`: how many of its frames are free,
+    /// and (bit 7) whether it has been handed back to macOS.
+    host_pages: Vec<u8>,
+    /// Segments `[0, reserved)` have host memory.
+    reserved: usize,
+    /// Segments `[0, mapped)` are in the VM's stage 2.
+    mapped: usize,
+    /// A VM is attached: segments reserved from now on are mapped into it.
+    vm_live: bool,
+}
+
+impl Pool {
+    pub fn new() -> io::Result<Arc<Pool>> {
+        let state = PoolState { next_fresh: 0, free: Vec::new(), refs: Vec::new(), host_pages: Vec::new(), reserved: 0, mapped: 0, vm_live: false };
+        let pool = Pool { hosts: Default::default(), state: Mutex::new(state) };
+        pool.reserve(&mut pool.state())?;
+        Ok(Arc::new(pool))
+    }
+
+    fn state(&self) -> MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reserve the next segment's host memory (and map it into the VM, if
+    /// one is attached).
+    fn reserve(&self, s: &mut PoolState) -> io::Result<()> {
+        let k = s.reserved;
+        let (start, len) = segment(k);
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                PHYS_SIZE as usize,
+                len as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 -1,
@@ -106,84 +176,267 @@ impl PhysMem {
         if p == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        Ok(PhysMem {
-            host: NonNull::new(p.cast()).unwrap(),
-            next_fresh: 0,
-            free: Vec::new(),
-            quarantine: Vec::new(),
-            host_pages: vec![0; (PHYS_SIZE / HOST_PAGE) as usize],
-        })
-    }
-
-    /// A copy-on-write snapshot of all of guest physical memory, for a forked
-    /// child. The VM can keep running (other threads may be): macOS write-
-    /// protects the pages for the VM too, so its later writes take copies
-    /// (checked: a guest writing through HVF after the snapshot doesn't
-    /// change it).
-    pub fn snapshot(&self) -> io::Result<MemoryEntry> {
-        MemoryEntry::snapshot(self.host.as_ptr(), PHYS_SIZE)
-    }
-
-    /// The allocator's state, which goes with a snapshot.
-    pub fn encode(&self, e: &mut Encoder) {
-        // A child's fresh vCPU has no stale TLB entries: quarantined frames
-        // are simply free there.
-        e.u64(self.next_fresh).u64((self.free.len() + self.quarantine.len()) as u64);
-        for &f in self.free.iter().chain(&self.quarantine) {
-            e.u64(f);
+        self.hosts[k].store(p.cast(), Ordering::Release);
+        s.reserved += 1;
+        if s.vm_live {
+            self.map_segment(s).map_err(io::Error::other)?;
         }
+        debug_assert_eq!(start + len, segment(k + 1).0);
+        Ok(())
     }
 
-    /// Guest physical memory from a parent's snapshot and allocator state.
-    pub fn restore(entry: &MemoryEntry, d: &mut Decoder) -> Result<Self, Truncated> {
-        let mut p = PhysMem::new().map_err(|_| Truncated)?;
-        entry.map_at(p.host.as_ptr(), PHYS_SIZE).map_err(|_| Truncated)?;
-        p.next_fresh = d.u64()?;
-        let n = d.count(8)?;
-        p.quarantine = (0..n).map(|_| d.u64()).collect::<Result<_, _>>()?;
-        p.release_quarantine();
-        Ok(p)
-    }
-
-    /// Map all of guest physical memory into `vm` at IPA 0.
-    pub fn map_into(&self, vm: &Vm) -> Result<(), HvError> {
-        // Safety: the host memory lives as long as `self`, which `crate::run`
-        // keeps alive until after the VM is destroyed.
-        unsafe {
-            vm.map(
-                self.host.as_ptr(),
-                0,
-                PHYS_SIZE as usize,
-                hv::MEMORY_READ | hv::MEMORY_WRITE | hv::MEMORY_EXEC,
-            )
-        }
+    /// Map the next reserved segment into the VM.
+    fn map_segment(&self, s: &mut PoolState) -> Result<(), HvError> {
+        let k = s.mapped;
+        let (start, len) = segment(k);
+        // Safety: the host memory lives as long as the pool, which the
+        // runtime keeps until after the VM is destroyed.
+        unsafe { hv::map(self.ptr(start), start, len as usize, hv::MEMORY_READ | hv::MEMORY_WRITE | hv::MEMORY_EXEC)? };
+        s.mapped += 1;
+        Ok(())
     }
 
     /// Host pointer to guest physical address `pa`.
     pub fn ptr(&self, pa: u64) -> *mut u8 {
-        assert!(pa < PHYS_SIZE, "physical address {pa:#x} out of range");
-        unsafe { self.host.as_ptr().add(pa as usize) }
+        assert!(pa < POOL_SIZE, "physical address {pa:#x} out of range");
+        let k = segment_of(pa);
+        let host = self.hosts[k].load(Ordering::Acquire);
+        debug_assert!(!host.is_null(), "physical address {pa:#x} in a segment not reserved");
+        unsafe { host.add((pa - segment(k).0) as usize) }
+    }
+
+    /// A chunk of zeroed frames, each held once, into `out`: free frames if
+    /// there are enough, else a fresh 64 KiB.
+    fn take(&self, out: &mut Vec<u64>) -> Result<(), OutOfMemory> {
+        let mut s = self.state();
+        if s.free.len() >= CHUNK_FRAMES {
+            for _ in 0..CHUNK_FRAMES {
+                let pa = s.free.pop().unwrap();
+                let page = &mut s.host_pages[(pa / HOST_PAGE) as usize];
+                if *page & RELEASED != 0 {
+                    let host = self.ptr(pa & !(HOST_PAGE - 1));
+                    unsafe { libc::madvise(host.cast(), HOST_PAGE as usize, libc::MADV_FREE_REUSE) };
+                    *page &= !RELEASED;
+                }
+                *page -= 1;
+                s.refs[(pa / PAGE_SIZE) as usize] = 1;
+                unsafe { std::ptr::write_bytes(self.ptr(pa), 0, PAGE_SIZE as usize) };
+                out.push(pa);
+            }
+            return Ok(());
+        }
+        let start = s.next_fresh;
+        let end = start + CHUNK_FRAMES as u64 * PAGE_SIZE;
+        if end > POOL_SIZE {
+            return Err(OutOfMemory);
+        }
+        while s.reserved <= segment_of(end - 1) {
+            self.reserve(&mut s).map_err(|e| {
+                eprintln!("macwl-runtime: growing guest memory: {e}");
+                OutOfMemory
+            })?;
+        }
+        s.next_fresh = end;
+        s.refs.resize((end / PAGE_SIZE) as usize, 0);
+        s.host_pages.resize((end / HOST_PAGE) as usize, 0);
+        // Highest first: the cache hands them out from the end, lowest first.
+        for i in (start / PAGE_SIZE..end / PAGE_SIZE).rev() {
+            s.refs[i as usize] = 1;
+            out.push(i * PAGE_SIZE);
+        }
+        Ok(())
+    }
+
+    /// Drop a hold on each of `frames` (whose TLB entries are gone): those
+    /// no one holds any more are free, and host pages left entirely free go
+    /// back to macOS.
+    pub fn release(&self, frames: &[u64]) {
+        let mut s = self.state();
+        let mut emptied = Vec::new();
+        for &pa in frames {
+            let r = &mut s.refs[(pa / PAGE_SIZE) as usize];
+            assert!(*r > 0, "frame {pa:#x} released twice");
+            *r -= 1;
+            if *r > 0 {
+                continue;
+            }
+            s.free.push(pa);
+            let i = (pa / HOST_PAGE) as usize;
+            s.host_pages[i] += 1;
+            if s.host_pages[i] == FRAMES_PER_HOST_PAGE as u8 {
+                s.host_pages[i] |= RELEASED;
+                emptied.push(i as u64);
+            }
+        }
+        // Their contents can go (they're zeroed again before reuse): one
+        // call per run of neighbouring host pages in a segment, as a whole
+        // address space goes at once when a process execs.
+        emptied.sort_unstable();
+        let mut i = 0;
+        while i < emptied.len() {
+            let first = emptied[i] * HOST_PAGE;
+            let mut j = i + 1;
+            while j < emptied.len() && emptied[j] == emptied[j - 1] + 1 && segment_of(emptied[j] * HOST_PAGE) == segment_of(first) {
+                j += 1;
+            }
+            unsafe { libc::madvise(self.ptr(first).cast(), (j - i) * HOST_PAGE as usize, libc::MADV_FREE_REUSABLE) };
+            i = j;
+        }
+    }
+
+    /// Map the pool into `vm` (the segments reserved so far, and later ones
+    /// as they are).
+    pub fn map_into(&self, _vm: &Vm) -> Result<(), HvError> {
+        let mut s = self.state();
+        while s.mapped < s.reserved {
+            self.map_segment(&mut s)?;
+        }
+        s.vm_live = true;
+        Ok(())
+    }
+
+    /// Take the pool out of the VM (before the VM goes).
+    pub fn unmap_from_vm(&self) -> Result<(), HvError> {
+        let mut s = self.state();
+        s.vm_live = false;
+        while s.mapped > 0 {
+            let (start, len) = segment(s.mapped - 1);
+            hv::unmap(start, len as usize)?;
+            s.mapped -= 1;
+        }
+        Ok(())
+    }
+
+    /// Copy-on-write snapshots of the frames handed out so far, one per
+    /// segment, for a forked child. The VM can keep running (other threads
+    /// may be): macOS write-protects the pages for the VM too, so its later
+    /// writes take copies (checked: a guest writing through HVF after the
+    /// snapshot doesn't change it).
+    pub fn snapshot(&self) -> io::Result<Vec<MemoryEntry>> {
+        let next_fresh = self.state().next_fresh.max(HOST_PAGE);
+        let mut entries = Vec::new();
+        for k in 0..SEGMENTS {
+            let (start, len) = segment(k);
+            if start >= next_fresh {
+                break;
+            }
+            entries.push(MemoryEntry::snapshot(self.ptr(start), len.min(next_fresh - start))?);
+        }
+        Ok(entries)
+    }
+
+    /// The allocator's state, which goes with a snapshot. `also_free` are
+    /// frames held but not mapped anywhere a child would see (unused,
+    /// quarantined, or of an address space being retired): a child's fresh
+    /// vCPUs have no stale TLB entries, so they're simply free there.
+    pub fn encode(&self, e: &mut Encoder, also_free: &[u64]) {
+        let s = self.state();
+        e.u64(s.next_fresh).u64((s.free.len() + also_free.len()) as u64);
+        for &f in s.free.iter().chain(also_free) {
+            e.u64(f);
+        }
+    }
+
+    /// Guest physical memory from a parent's snapshots and allocator state.
+    /// Every frame handed out and not free is held once (by the child's one
+    /// address space, or its kernel half).
+    pub fn restore(entries: &[MemoryEntry], d: &mut Decoder) -> Result<Arc<Pool>, Truncated> {
+        let pool = Pool::new().map_err(|_| Truncated)?;
+        let next_fresh = d.u64()?;
+        if next_fresh > POOL_SIZE || !next_fresh.is_multiple_of(CHUNK_FRAMES as u64 * PAGE_SIZE) {
+            return Err(Truncated);
+        }
+        {
+            let mut s = pool.state();
+            let covered = next_fresh.max(HOST_PAGE);
+            for (k, entry) in entries.iter().enumerate() {
+                let (start, len) = segment(k);
+                if start >= covered {
+                    return Err(Truncated);
+                }
+                while s.reserved <= k {
+                    pool.reserve(&mut s).map_err(|_| Truncated)?;
+                }
+                entry.map_at(pool.ptr(start), len.min(covered - start)).map_err(|_| Truncated)?;
+            }
+            if entries.len() <= segment_of(covered - 1) {
+                return Err(Truncated);
+            }
+            let n = d.count(8)?;
+            s.next_fresh = next_fresh;
+            s.refs = vec![1; (next_fresh / PAGE_SIZE) as usize];
+            s.host_pages = vec![0; (next_fresh / HOST_PAGE) as usize];
+            for _ in 0..n {
+                let pa = d.u64()?;
+                if pa >= next_fresh || !pa.is_multiple_of(PAGE_SIZE) {
+                    return Err(Truncated);
+                }
+                s.refs[(pa / PAGE_SIZE) as usize] = 0;
+                s.free.push(pa);
+                s.host_pages[(pa / HOST_PAGE) as usize] += 1;
+            }
+        }
+        Ok(pool)
+    }
+
+    /// Frames held by anyone (for tests and diagnostics).
+    pub fn frames_held(&self) -> u64 {
+        let s = self.state();
+        s.next_fresh / PAGE_SIZE - s.free.len() as u64
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        for (k, host) in self.hosts.iter().enumerate() {
+            let host = host.load(Ordering::Acquire);
+            if !host.is_null() {
+                unsafe { libc::munmap(host.cast(), segment(k).1 as usize) };
+            }
+        }
+    }
+}
+
+
+/// An address space's frames: what it takes from the [`Pool`] and gives
+/// back.
+///
+/// Frames come a chunk at a time and wait in a small cache, so a page fault
+/// rarely takes the pool's lock. A frame that's unmapped isn't reusable at
+/// once: a vCPU may still hold a stale TLB entry for it. It waits in
+/// quarantine until the address space's TLB entries have been flushed
+/// ([`PhysMem::release_quarantine`]), and then goes back to the pool.
+pub struct PhysMem {
+    pool: Arc<Pool>,
+    /// Zeroed frames taken from the pool, not used yet.
+    cache: Vec<u64>,
+    /// Unmapped frames waiting for a TLB flush.
+    quarantine: Vec<u64>,
+    /// Frames in use: mapped (or page tables), or quarantined.
+    in_use: u64,
+}
+
+impl PhysMem {
+    pub fn new(pool: &Arc<Pool>) -> Self {
+        PhysMem { pool: pool.clone(), cache: Vec::new(), quarantine: Vec::new(), in_use: 0 }
+    }
+
+    pub fn pool(&self) -> &Arc<Pool> {
+        &self.pool
+    }
+
+    /// Host pointer to guest physical address `pa`.
+    pub fn ptr(&self, pa: u64) -> *mut u8 {
+        self.pool.ptr(pa)
     }
 
     /// A zeroed frame.
     pub fn alloc(&mut self) -> Result<u64, OutOfMemory> {
-        if let Some(pa) = self.free.pop() {
-            let page = &mut self.host_pages[(pa / HOST_PAGE) as usize];
-            if *page & RELEASED != 0 {
-                let host = unsafe { self.host.as_ptr().add((pa & !(HOST_PAGE - 1)) as usize) };
-                unsafe { libc::madvise(host.cast(), HOST_PAGE as usize, libc::MADV_FREE_REUSE) };
-                *page &= !RELEASED;
-            }
-            *page -= 1;
-            unsafe { std::ptr::write_bytes(self.ptr(pa), 0, PAGE_SIZE as usize) };
-            return Ok(pa);
+        if self.cache.is_empty() {
+            self.pool.take(&mut self.cache)?;
         }
-        if self.next_fresh >= PHYS_SIZE {
-            return Err(OutOfMemory);
-        }
-        let pa = self.next_fresh;
-        self.next_fresh += PAGE_SIZE;
-        Ok(pa)
+        self.in_use += 1;
+        Ok(self.cache.pop().unwrap())
     }
 
     /// An unmapped frame: free once the TLB has been flushed.
@@ -196,20 +449,27 @@ impl PhysMem {
         !self.quarantine.is_empty()
     }
 
-    /// The TLB has been flushed everywhere: quarantined frames are free, and
-    /// host pages left entirely free go back to macOS.
+    /// The address space's TLB entries have been flushed everywhere:
+    /// quarantined frames go back to the pool.
     pub fn release_quarantine(&mut self) {
-        for pa in std::mem::take(&mut self.quarantine) {
-            self.free.push(pa);
-            let i = (pa / HOST_PAGE) as usize;
-            self.host_pages[i] += 1;
-            if self.host_pages[i] == FRAMES_PER_HOST_PAGE as u8 {
-                let host = unsafe { self.host.as_ptr().add(i * HOST_PAGE as usize) };
-                // Its contents can go; it's zeroed again before reuse.
-                unsafe { libc::madvise(host.cast(), HOST_PAGE as usize, libc::MADV_FREE_REUSABLE) };
-                self.host_pages[i] |= RELEASED;
-            }
+        if self.quarantine.is_empty() {
+            return;
         }
+        self.pool.release(&self.quarantine);
+        self.in_use -= self.quarantine.len() as u64;
+        self.quarantine.clear();
+    }
+
+    /// The quarantined frames, taken out (an address space being retired:
+    /// they go back once its ASID is flushed).
+    pub fn take_quarantine(&mut self) -> Vec<u64> {
+        self.in_use -= self.quarantine.len() as u64;
+        std::mem::take(&mut self.quarantine)
+    }
+
+    /// Frames held but mapped nowhere: the cache and the quarantine.
+    pub fn unmapped(&self) -> impl Iterator<Item = u64> + '_ {
+        self.cache.iter().chain(&self.quarantine).copied()
     }
 
     pub fn read_u64(&self, pa: u64) -> u64 {
@@ -222,13 +482,14 @@ impl PhysMem {
 
     /// Frames in use, quarantined ones included (for tests and diagnostics).
     pub fn frames_in_use(&self) -> u64 {
-        self.next_fresh / PAGE_SIZE - self.free.len() as u64
+        self.in_use
     }
 }
 
 impl Drop for PhysMem {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.host.as_ptr().cast(), PHYS_SIZE as usize) };
+        // Never mapped: no TLB holds them.
+        self.pool.release(&self.cache);
     }
 }
 
@@ -311,6 +572,29 @@ impl PageTable {
         walk(phys, self.root, 0, 0, start & ((1 << 48) - 1), end.min(1 << 48), f);
     }
 
+    /// Every pool frame the table holds: the pages it maps (not those in
+    /// shared windows, which belong to the window) and its own tables.
+    pub fn frames(&self, pool: &Pool) -> Vec<u64> {
+        fn walk(pool: &Pool, table: u64, level: u32, out: &mut Vec<u64>) {
+            out.push(table);
+            for i in 0..512 {
+                let desc = unsafe { pool.ptr(table + i * 8).cast::<u64>().read() };
+                if desc & DESC_VALID == 0 {
+                    continue;
+                }
+                let next = desc & DESC_ADDR;
+                if level < 3 {
+                    walk(pool, next, level + 1, out);
+                } else if next < POOL_SIZE {
+                    out.push(next);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(pool, self.root, 0, &mut out);
+        out
+    }
+
     /// Unmap every page in `[start, end)`, returning pool frames to `phys`
     /// (pages in shared windows belong to the window). Returns whether
     /// anything was mapped (and so the TLB needs flushing).
@@ -319,7 +603,7 @@ impl PageTable {
         self.for_each_mapped(phys, start, end, &mut |phys, _va, slot| {
             let frame = phys.read_u64(slot) & DESC_ADDR;
             phys.write_u64(slot, 0);
-            if frame < PHYS_SIZE {
+            if frame < POOL_SIZE {
                 phys.free(frame);
             }
             any = true;
@@ -344,9 +628,13 @@ impl PageTable {
 mod tests {
     use super::*;
 
+    fn phys() -> PhysMem {
+        PhysMem::new(&Pool::new().unwrap())
+    }
+
     #[test]
     fn map_lookup_unmap() {
-        let mut phys = PhysMem::new().unwrap();
+        let mut phys = phys();
         let pt = PageTable::new(&mut phys).unwrap();
         let va = 0x7fff_1234_5000;
         assert_eq!(pt.lookup(&phys, va), None);
@@ -354,6 +642,11 @@ mod tests {
         pt.map(&mut phys, va, frame, user_attrs(prot::READ)).unwrap();
         assert_eq!(pt.lookup(&phys, va), Some(frame));
         assert_eq!(pt.lookup(&phys, va + PAGE_SIZE), None);
+        // The root, three intermediate tables and the page.
+        let mut frames = pt.frames(phys.pool());
+        frames.sort();
+        assert_eq!(frames.len(), 5);
+        assert!(frames.contains(&frame) && frames.contains(&pt.root));
         assert!(pt.unmap_range(&mut phys, va, va + PAGE_SIZE));
         assert_eq!(pt.lookup(&phys, va), None);
         assert!(!pt.unmap_range(&mut phys, va, va + PAGE_SIZE));
@@ -361,15 +654,40 @@ mod tests {
 
     #[test]
     fn recycled_frames_are_zeroed() {
-        let mut phys = PhysMem::new().unwrap();
-        let a = phys.alloc().unwrap();
-        unsafe { phys.ptr(a).write_bytes(0xaa, PAGE_SIZE as usize) };
-        phys.free(a);
-        assert_ne!(phys.alloc().unwrap(), a, "not reused while quarantined");
+        let pool = Pool::new().unwrap();
+        let mut phys = PhysMem::new(&pool);
+        // A whole chunk, so that it can come back as one.
+        let frames: Vec<u64> = (0..CHUNK_FRAMES).map(|_| phys.alloc().unwrap()).collect();
+        for &f in &frames {
+            unsafe { phys.ptr(f).write_bytes(0xaa, PAGE_SIZE as usize) };
+            phys.free(f);
+        }
+        let mut other = PhysMem::new(&pool);
+        assert!(!frames.contains(&other.alloc().unwrap()), "not reused while quarantined");
         phys.release_quarantine();
-        let b = phys.alloc().unwrap();
-        assert_eq!(a, b);
-        assert!(unsafe { std::slice::from_raw_parts(phys.ptr(b), PAGE_SIZE as usize) }.iter().all(|&x| x == 0));
+        let mut third = PhysMem::new(&pool);
+        let b = third.alloc().unwrap();
+        assert!(frames.contains(&b), "reused once released");
+        assert!(unsafe { std::slice::from_raw_parts(third.ptr(b), PAGE_SIZE as usize) }.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn address_spaces_take_whole_chunks_and_give_them_back() {
+        let pool = Pool::new().unwrap();
+        let (mut a, mut b) = (PhysMem::new(&pool), PhysMem::new(&pool));
+        let fa = a.alloc().unwrap();
+        let fb = b.alloc().unwrap();
+        let chunk = CHUNK_FRAMES as u64 * PAGE_SIZE;
+        assert_ne!(fa / chunk, fb / chunk, "each takes a chunk of its own");
+        assert_eq!(pool.frames_held(), 2 * CHUNK_FRAMES as u64);
+        a.free(fa);
+        a.release_quarantine();
+        assert_eq!(a.frames_in_use(), 0);
+        b.free(fb);
+        b.release_quarantine();
+        drop(a);
+        drop(b);
+        assert_eq!(pool.frames_held(), 0, "every frame back");
     }
 
     /// A host page whose frames are all free goes back to macOS, and comes
@@ -382,7 +700,8 @@ mod tests {
             unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, (&mut ri as *mut libc::rusage_info_v4).cast()) };
             ri.ri_phys_footprint
         }
-        let mut phys = PhysMem::new().unwrap();
+        let pool = Pool::new().unwrap();
+        let mut phys = PhysMem::new(&pool);
         // 64 MiB of frames, touched.
         let frames: Vec<u64> = (0..(64 << 20) / PAGE_SIZE).map(|_| phys.alloc().unwrap()).collect();
         for &f in &frames {
@@ -412,5 +731,7 @@ mod tests {
         assert_eq!(rw & DESC_AP_RO, 0);
         assert_ne!(rw & DESC_UXN, 0);
         assert_ne!(rw & DESC_PXN, 0);
+        assert_ne!(rw & DESC_NG, 0, "user pages are per ASID");
+        assert_eq!(kernel_code_attrs() & DESC_NG, 0, "the kernel half is global");
     }
 }

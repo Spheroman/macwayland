@@ -234,8 +234,8 @@ impl MemoryEntry {
     }
 
     /// Send (a copy of) this entry to `to`.
-    pub fn send_to(&self, to: &SendPort) -> io::Result<()> {
-        to.send(self.0, 0)
+    pub fn send_to(&self, to: &SendPort, value: u64) -> io::Result<()> {
+        to.send(self.0, value)
     }
 }
 
@@ -274,7 +274,7 @@ mod tests {
         unsafe { *src = 9 };
         let inbox = ReceivePort::new().unwrap();
         let to = inbox.sender().unwrap();
-        MemoryEntry::snapshot(src, LEN as u64).unwrap().send_to(&to).unwrap();
+        MemoryEntry::snapshot(src, LEN as u64).unwrap().send_to(&to, 0).unwrap();
         let (got, value) = inbox.receive(1000).unwrap().unwrap();
         assert_eq!(value, 0);
         got.into_memory_entry().map_at(dst, LEN as u64).unwrap();

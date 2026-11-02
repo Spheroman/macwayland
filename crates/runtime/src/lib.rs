@@ -25,7 +25,7 @@ use std::{
     fmt,
     os::unix::ffi::OsStrExt,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -37,7 +37,7 @@ use linux_abi::{
 };
 
 use hv::{reg, sys_reg, Vcpu, Vm};
-use memory::{Access, AddressSpace, Space};
+use memory::{Access, AddressSpace, Machine, Space};
 use sched::{Cpu, Job, Offloaded, Placed, Sched, Start, Task};
 
 /// Exception classes (ESR bits 31:26) we care about.
@@ -148,7 +148,8 @@ fn read_guest_file(process: &Process, path: &[u8]) -> Result<Vec<u8>, loader::Lo
 /// flight per host process.
 pub fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: &Process) -> Result<Exit, Error> {
     profile::mark("load start");
-    let program = load(elf, argv, envp, process)?;
+    let machine = Machine::new()?;
+    let program = load(&machine, elf, argv, envp, process)?;
     profile::mark("loaded");
     let thread = Thread::main(process);
     execute(program.space, Start::Fresh { entry: program.entry, sp: program.sp }, process, thread)
@@ -161,8 +162,9 @@ struct Loaded {
     sp: u64,
 }
 
-fn load(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: &Process) -> Result<Loaded, Error> {
-    let mut space = AddressSpace::new()?;
+/// Load a program into a new address space of `machine`.
+fn load(machine: &Arc<Machine>, elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: &Process) -> Result<Loaded, Error> {
+    let mut space = AddressSpace::new(machine)?;
     let image = loader::load(&mut space, elf)?;
     space.set_brk_start(image.end);
     let interp = match &image.interp {
@@ -199,6 +201,8 @@ enum Next {
 /// What a process's threads share.
 struct Shared<'a> {
     vm: &'a Vm,
+    /// The VM's memory: the frame pool every address space takes from.
+    machine: &'a Arc<Machine>,
     space: &'a Space,
     process: &'a Process,
     /// How the process ended, once it has.
@@ -243,7 +247,9 @@ fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread)
     // side are its.
     process.receive_host_signals();
     // Teardown order matters: vCPUs, then the VM, then the memory mapped into
-    // it — so `space` is declared first (dropped last).
+    // it — so the machine (its frame pool) and `space` are declared first
+    // (dropped last).
+    let machine = space.machine().clone();
     let space = Space::new(space);
     let vm = Vm::new()?;
     {
@@ -253,6 +259,7 @@ fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread)
     }
     let shared = Shared {
         vm: &vm,
+        machine: &machine,
         space: &space,
         process,
         exit: Mutex::new(None),
@@ -278,6 +285,7 @@ fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread)
         // Never replace the process with the VM still alive: fail instead.
         vm.destroy()?;
         drop(space);
+        drop(machine);
         // It won't fork again.
         fork::discard_spare();
         process.tell_parent(&[ctl::EXEC]);
@@ -503,23 +511,29 @@ fn run_task<'scope, 'env>(
                 }
                 return outcome;
             }
-            // The same VM and vCPU run the new program: only the memory
-            // changes, once the other threads have gone (as Linux). Other
+            // The same VM and vCPU run the new program: only the address
+            // space changes (its own page tables and ASID, frames from the
+            // same pool), once the other threads have gone (as Linux). Other
             // CPUs set up for it when they next run a task.
             Next::Exec(program) => {
                 stop_other_threads(sh);
                 let old = {
                     let mut s = sh.space.lock();
-                    s.unmap_from(sh.vm)?;
+                    s.detach_windows()?;
                     let old = std::mem::replace(&mut *s, program.space);
                     s.take_tlb_stale();
-                    s.map_into(sh.vm)?;
+                    s.attach_windows()?;
                     s.configure_vcpu(vcpu)?;
                     let generation = sh.generation.fetch_add(1, Ordering::AcqRel) + 1;
                     *configured = Some(generation);
                     old
                 };
+                // The old address space's entries go from every TLB, and
+                // then its frames and ASID can be used again.
+                let old_asid = old.asid();
                 drop(old);
+                flush_asid_now(vcpu, old_asid)?;
+                sh.machine.asid_flushed(old_asid);
                 // The thread that execs carries on as the main one.
                 process.unregister_thread(thread.tid);
                 thread.tid = process.pid;
@@ -700,26 +714,44 @@ fn start_fresh_on(vcpu: &mut Vcpu, entry: u64, sp: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// Flush the TLB (on all vCPUs) now, from a vCPU stopped in our vector after
-/// a system call: run the vector's flush path, returning not to EL0 but to an
-/// `hvc` at EL1, then put the vCPU back as it was.
+/// Flush the running address space's TLB entries (on all vCPUs) now, from a
+/// vCPU stopped in our vector after a system call: run the vector's flush
+/// path, returning not to EL0 but to an `hvc` at EL1, then put the vCPU back
+/// as it was.
 fn flush_tlb_now(vcpu: &mut Vcpu) -> Result<(), Error> {
+    run_at_el1(vcpu, memory::VECTOR_FLUSH_PATH, None)
+}
+
+/// Flush ASID `asid`'s TLB entries (on all vCPUs) now, from this vCPU,
+/// whatever it runs: an address space that has gone.
+fn flush_asid_now(vcpu: &mut Vcpu, asid: u64) -> Result<(), Error> {
+    run_at_el1(vcpu, memory::FLUSH_ASID_PATH, Some(asid << 48))
+}
+
+/// Run one of the vectors page's paths at EL1 (with x0 = `x0`, if given),
+/// returning to the `hvc #0` of vector 0, and put the vCPU back as it was.
+fn run_at_el1(vcpu: &mut Vcpu, path: u64, x0: Option<u64>) -> Result<(), Error> {
     let (pc, cpsr) = (vcpu.reg(reg::PC)?, vcpu.reg(reg::CPSR)?);
     let (elr, spsr) = (vcpu.sys_reg(sys_reg::ELR_EL1)?, vcpu.sys_reg(sys_reg::SPSR_EL1)?);
+    let saved_x0 = vcpu.reg(reg::X0)?;
     vcpu.set_sys_reg(sys_reg::ELR_EL1, memory::VECTORS_VA)?; // vector 0: `hvc #0`
     vcpu.set_sys_reg(sys_reg::SPSR_EL1, 0x3c5)?; // EL1h, masked
     vcpu.set_reg(reg::CPSR, 0x3c5)?;
-    vcpu.set_reg(reg::PC, memory::VECTOR_FLUSH_PATH)?;
+    vcpu.set_reg(reg::PC, path)?;
+    if let Some(v) = x0 {
+        vcpu.set_reg(reg::X0, v)?;
+    }
     let exit = vcpu.run()?;
     let ok = exit.reason == hv::EXIT_REASON_EXCEPTION && exit.exception.syndrome >> 26 == EC_HVC64 && exit.exception.syndrome & 0xffff == 0;
     vcpu.set_sys_reg(sys_reg::ELR_EL1, elr)?;
     vcpu.set_sys_reg(sys_reg::SPSR_EL1, spsr)?;
     vcpu.set_reg(reg::CPSR, cpsr)?;
     vcpu.set_reg(reg::PC, pc)?;
+    vcpu.set_reg(reg::X0, saved_x0)?;
     if !ok {
         // A cancel (host signal kick) can land first; try again.
         if exit.reason == hv::EXIT_REASON_CANCELED {
-            return flush_tlb_now(vcpu);
+            return run_at_el1(vcpu, path, x0);
         }
         return Err(Error::Unexpected(format!("TLB flush: exit {} syndrome {:#x}", exit.reason, exit.exception.syndrome)));
     }
@@ -923,7 +955,7 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
                     profile::mark("exec: loading");
                     let argv: Vec<&[u8]> = exec.argv.iter().map(Vec::as_slice).collect();
                     let envp: Vec<&[u8]> = exec.envp.iter().map(Vec::as_slice).collect();
-                    match load(&exec.elf, &argv, &envp, process) {
+                    match load(sh.machine, &exec.elf, &argv, &envp, process) {
                         Ok(program) => {
                             profile::mark("exec: loaded");
                             process.exec_done(thread, exec.exe);

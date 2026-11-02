@@ -5,7 +5,8 @@
 //! separate `macwl-run --fork-child` process that the parent hands the
 //! process to:
 //!
-//! - guest memory as a copy-on-write Mach memory entry ([`crate::mach`]) —
+//! - guest memory as copy-on-write Mach memory entries ([`crate::mach`]),
+//!   one per segment of the frame pool in use —
 //!   in RAM, never a file (macOS writes dirty file pages to disk);
 //! - over a Unix socket: the CPU state, the address-space layout, the fd
 //!   table and the rest of [`Process`], with host fds (guest files, shared
@@ -128,7 +129,7 @@ pub fn fork(space: &Space, process: &Process, thread: &Thread, ctx: &UserContext
     let mut e = Encoder::default();
     ctx.encode(&mut e);
     f.encode(&mut e);
-    let (entry, window_fds) = space.lock().encode_for_fork(&mut e).map_err(|err| {
+    let (entries, window_fds) = space.lock().encode_for_fork(&mut e).map_err(|err| {
         eprintln!("macwl-run: fork: {err}");
         errno::ENOMEM
     })?;
@@ -155,7 +156,7 @@ pub fn fork(space: &Space, process: &Process, thread: &Thread, ctx: &UserContext
             errno::EAGAIN
         })?;
         mark("fork: handing over");
-        match hand_over(&spare, &entry, &fds, &e.0) {
+        match hand_over(&spare, &entries, &fds, &e.0) {
             Ok(()) => break (spare.pid, spare.sock),
             Err(err) => {
                 discard(spare);
@@ -171,7 +172,7 @@ pub fn fork(space: &Space, process: &Process, thread: &Thread, ctx: &UserContext
     if let Err(err) = broker.launch() {
         eprintln!("macwl-run: fork: launching a spare: {err}");
     }
-    drop(entry);
+    drop(entries);
 
     // vfork: the parent waits until the child execs or exits.
     let mut seen = Vec::new();
@@ -194,9 +195,14 @@ pub fn fork(space: &Space, process: &Process, thread: &Thread, ctx: &UserContext
 }
 
 /// Give `spare` the process and wait until it has taken it.
-fn hand_over(spare: &Spare, entry: &MemoryEntry, fds: &[RawFd], state: &[u8]) -> io::Result<()> {
-    entry.send_to(spare.port.as_ref().unwrap())?;
+fn hand_over(spare: &Spare, entries: &[MemoryEntry], fds: &[RawFd], state: &[u8]) -> io::Result<()> {
     send_state(&spare.sock, fds, state)?;
+    // Then the memory, one entry per pool segment in use, each saying how
+    // many more follow. (After the state, which the child takes first: a
+    // port's queue holds only a few messages.)
+    for (i, entry) in entries.iter().enumerate() {
+        entry.send_to(spare.port.as_ref().unwrap(), (entries.len() - 1 - i) as u64)?;
+    }
     let mut b = [0u8];
     match read_some(&spare.sock, &mut b)? {
         1 if b[0] == ctl::READY => Ok(()),
@@ -222,7 +228,14 @@ pub fn run_child() -> Result<Exit, Error> {
         Err(e) => return Err(e.into()),
     };
     mark("child: state received");
-    let entry = inbox.receive(SPARE_TIMEOUT_MS)?.ok_or_else(|| bad("no memory"))?.0.into_memory_entry();
+    let mut entries = Vec::new();
+    loop {
+        let (port, more) = inbox.receive(SPARE_TIMEOUT_MS)?.ok_or_else(|| bad("no memory"))?;
+        entries.push(port.into_memory_entry());
+        if more == 0 {
+            break;
+        }
+    }
     set_signals(libc::SIG_DFL);
 
     let mut d = Decoder(&state);
@@ -232,8 +245,8 @@ pub fn run_child() -> Result<Exit, Error> {
     let stderr = fds.next().ok_or_else(|| bad("no stderr"))?;
     unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) };
     drop(stderr);
-    let space = AddressSpace::decode_forked(&mut d, &entry, &mut fds).map_err(|_| bad("address space"))?;
-    drop(entry);
+    let space = AddressSpace::decode_forked(&mut d, &entries, &mut fds).map_err(|_| bad("address space"))?;
+    drop(entries);
     // Requests from the parent (to change our process group) come on the
     // control socket; a thread answers them while the guest runs.
     let requests = ctl_sock.try_clone()?;

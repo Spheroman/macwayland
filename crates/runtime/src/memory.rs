@@ -1,6 +1,7 @@
 //! A Linux process's address space: mapped regions ([`Vmas`]), the page
-//! tables that implement them, and the program break — plus the kernel half,
-//! which holds only the exception vectors.
+//! tables that implement them, its ASID, and the program break — plus what
+//! every address space of a VM shares ([`Machine`]): the frame pool, and the
+//! kernel half, which holds only the exception vectors.
 //!
 //! ```text
 //! 0   64 KiB          brk ↑        ↓ mmap   ↓ stack   2^48       kernel half (TTBR1)
@@ -12,10 +13,19 @@
 //! see [`AddressSpace::handle_fault`]), a few pages at a time. Private regions
 //! get frames from the pool; shared ones (`MAP_SHARED`) point into a host
 //! shared mapping placed in guest physical memory ([`crate::shared`]).
+//!
+//! Each address space has its own ASID (`TTBR0_EL1[63:48]`, with
+//! `TCR_EL1.AS`), and user pages are not global, so the TLB keeps every
+//! address space's entries apart: a vCPU can move between address spaces by
+//! writing `TTBR0_EL1`, and flushes after a change are by ASID
+//! (docs/processes.md, section 2).
 
 use std::{
     os::fd::{OwnedFd, RawFd},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
 };
 
 use linux_abi::{
@@ -28,7 +38,7 @@ use linux_abi::{
 use crate::{
     hv::{self, HvError, Vcpu, Vm},
     mach::MemoryEntry,
-    paging::{self, prot, OutOfMemory, PageTable, PhysMem, PAGE_SIZE, PHYS_SIZE},
+    paging::{self, prot, OutOfMemory, PageTable, PhysMem, Pool, PAGE_SIZE, POOL_SIZE},
     shared::SharedWindows,
     vma::{Backing, Vma, Vmas},
 };
@@ -48,15 +58,224 @@ const FAULT_AROUND: u64 = 16 * PAGE_SIZE;
 
 /// The exception vectors, mapped EL1-only in the kernel half.
 pub const VECTORS_VA: u64 = 0xffff_ffff_fff0_0000;
-/// Where the vectors are in guest physical memory: the frame after the two
-/// root tables.
-const VECTORS_FRAME: u64 = 2 * PAGE_SIZE;
 /// The vector table index for a synchronous exception from EL0 (AArch64).
 pub const VECTOR_EL0_SYNC: u64 = 8;
-/// In that vector, the path that flushes the TLB before returning to EL0. The
-/// host resumes the guest here instead of at the plain `eret` after changing
+/// In that vector, the path that flushes the running address space's TLB
+/// entries (its ASID's, on every vCPU) before returning to EL0. The host
+/// resumes the guest here instead of at the plain `eret` after changing
 /// page-table entries the guest may have cached.
 pub const VECTOR_FLUSH_PATH: u64 = VECTORS_VA + VECTOR_EL0_SYNC * 0x80 + 8;
+/// After the vector table (16 entries of 0x80 bytes), in the same page: flush
+/// the TLB entries of the ASID in x0 (bits 63:48, as `TLBI ASIDE1IS` takes
+/// it) on every vCPU, then `eret`. Run from EL1, for an address space that's
+/// gone.
+pub const FLUSH_ASID_PATH: u64 = VECTORS_VA + 0x800;
+/// ASIDs are 16 bits (`TCR_EL1.AS`); 0 is never an address space's.
+const ASID_LIMIT: u64 = 1 << 16;
+
+/// What every address space of a VM shares: the frame pool, the kernel half
+/// (one `TTBR1_EL1` per VM: the vectors, global), and the ASIDs.
+pub struct Machine {
+    pool: Arc<Pool>,
+    kernel: PageTable,
+    /// Holds the kernel half's frames, for as long as the VM.
+    _kernel_frames: Mutex<PhysMem>,
+    asids: Mutex<Asids>,
+    reclaim: Arc<Reclaim>,
+}
+
+/// Address spaces whose ASID has been flushed, waiting for a thread of
+/// their own to give their frames back. Finding the frames means walking
+/// the page tables (0.14 ms for 200 MB, most of it the host faulting in
+/// table pages a forked child never touched) and giving them back as much
+/// again: on the `execve` path, that would make an exec from a big forked
+/// process (a shell's `posix_spawn`) 0.3 ms slower than when the old address
+/// space was a host mapping dropped whole.
+#[derive(Default)]
+struct Reclaim {
+    state: Mutex<ReclaimState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct ReclaimState {
+    queue: Vec<Retired>,
+    /// The thread is giving some back now.
+    busy: bool,
+    /// It has been started.
+    running: bool,
+    /// The machine has gone: the thread ends.
+    closed: bool,
+}
+
+impl Reclaim {
+    fn state(&self) -> MutexGuard<'_, ReclaimState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The thread: give back what's queued, until the machine goes.
+    fn run(&self, pool: &Pool) {
+        let mut s = self.state();
+        loop {
+            if let Some(retired) = s.queue.pop() {
+                s.busy = true;
+                drop(s);
+                pool.release(&retired.frames(pool));
+                s = self.state();
+                s.busy = false;
+                self.changed.notify_all();
+            } else if s.closed {
+                return;
+            } else {
+                s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        self.reclaim.state().closed = true;
+        self.reclaim.changed.notify_all();
+    }
+}
+
+struct Asids {
+    /// ASIDs at or above this have never been handed out.
+    next: u64,
+    /// Free ASIDs, flushed from every TLB.
+    free: Vec<u64>,
+    /// Address spaces gone whose ASID hasn't been flushed yet: neither it
+    /// nor their frames can be reused until it has.
+    retired: Vec<Retired>,
+}
+
+impl Default for Asids {
+    fn default() -> Self {
+        Asids { next: 1, free: Vec::new(), retired: Vec::new() }
+    }
+}
+
+/// An address space that has gone, waiting for its ASID to be flushed.
+struct Retired {
+    asid: u64,
+    /// Its page tables, as they were: walked for its frames only when they
+    /// can go back (not at all if the VM goes first, as when a process
+    /// exits).
+    user: PageTable,
+    quarantine: Vec<u64>,
+}
+
+impl Retired {
+    fn frames(&self, pool: &Pool) -> Vec<u64> {
+        let mut frames = self.user.frames(pool);
+        frames.extend_from_slice(&self.quarantine);
+        frames
+    }
+}
+
+impl Machine {
+    pub fn new() -> std::io::Result<Arc<Machine>> {
+        let pool = Pool::new()?;
+        let oom = |_| std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        let mut phys = PhysMem::new(&pool);
+        let kernel = PageTable::new(&mut phys).map_err(oom)?;
+        let vectors = phys.alloc().map_err(oom)?;
+        write_vectors(&mut phys, vectors);
+        kernel.map(&mut phys, VECTORS_VA, vectors, paging::kernel_code_attrs()).map_err(oom)?;
+        Ok(Arc::new(Machine { pool, kernel, _kernel_frames: Mutex::new(phys), asids: Mutex::default(), reclaim: Arc::default() }))
+    }
+
+    /// A forked child's, from the parent's snapshot (see
+    /// [`AddressSpace::encode_for_fork`]): the same pool contents and kernel
+    /// half, and no ASIDs in use.
+    fn restore(entries: &[MemoryEntry], d: &mut Decoder) -> Result<Arc<Machine>, Truncated> {
+        let pool = Pool::restore(entries, d)?;
+        let kernel = PageTable { root: d.u64()? };
+        let phys = PhysMem::new(&pool);
+        Ok(Arc::new(Machine { pool, kernel, _kernel_frames: Mutex::new(phys), asids: Mutex::default(), reclaim: Arc::default() }))
+    }
+
+    pub fn pool(&self) -> &Arc<Pool> {
+        &self.pool
+    }
+
+    fn asids(&self) -> MutexGuard<'_, Asids> {
+        self.asids.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn alloc_asid(&self) -> Result<u64, OutOfMemory> {
+        let mut a = self.asids();
+        if let Some(asid) = a.free.pop() {
+            return Ok(asid);
+        }
+        // 65535 address spaces alive at once, before Linux's way past that
+        // (a new generation, every TLB flushed, ASIDs handed out again) is
+        // needed.
+        if a.next >= ASID_LIMIT {
+            return Err(OutOfMemory);
+        }
+        a.next += 1;
+        Ok(a.next - 1)
+    }
+
+    /// An address space has gone: its ASID and frames wait until the ASID
+    /// is flushed ([`Machine::asid_flushed`]), or are free at once if it
+    /// never ran.
+    fn retire(&self, retired: Retired, ran: bool) {
+        let mut a = self.asids();
+        if ran {
+            a.retired.push(retired);
+        } else {
+            self.pool.release(&retired.frames(&self.pool));
+            a.free.push(retired.asid);
+        }
+    }
+
+    /// The ASID `asid` has been flushed from every TLB (`tlbi aside1is`): it
+    /// can be used again at once, and the frames of the address space that
+    /// had it go back to the pool on the reclaiming thread.
+    pub fn asid_flushed(&self, asid: u64) {
+        let retired = {
+            let mut a = self.asids();
+            let Some(i) = a.retired.iter().position(|r| r.asid == asid) else { return };
+            a.free.push(asid);
+            a.retired.swap_remove(i)
+        };
+        let mut s = self.reclaim.state();
+        s.queue.push(retired);
+        if !s.running {
+            s.running = true;
+            let (reclaim, pool) = (self.reclaim.clone(), self.pool.clone());
+            std::thread::spawn(move || reclaim.run(&pool));
+        }
+        self.reclaim.changed.notify_all();
+    }
+
+    /// Wait until the reclaiming thread has given back everything queued,
+    /// so the pool's free list is whole (a fork's snapshot of it).
+    fn reclaimed(&self) {
+        let mut s = self.reclaim.state();
+        while !s.queue.is_empty() || s.busy {
+            s = self.reclaim.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Frames of address spaces gone whose ASIDs haven't been flushed.
+    fn retired_frames(&self) -> Vec<u64> {
+        self.asids().retired.iter().flat_map(|r| r.frames(&self.pool)).collect()
+    }
+}
+
+/// Whether a vCPU about to execute `pc` is inside the flush path's stretch
+/// that keeps the guest's x0 in `TPIDR_EL1` (from after the `msr` that saves
+/// it to the `mrs` that restores it, see [`write_vectors`]).
+pub fn flush_path_borrows_x0(pc: u64) -> bool {
+    (VECTOR_FLUSH_PATH + 2 * 4..=VECTOR_FLUSH_PATH + 8 * 4).contains(&pc)
+}
+
+/// The ASID size this CPU supports, in bits, once a vCPU has said: 8 or 16.
+static ASID_BITS: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -83,10 +302,14 @@ fn page_up(a: u64) -> Option<u64> {
 }
 
 pub struct AddressSpace {
+    machine: Arc<Machine>,
     phys: PhysMem,
     shared: SharedWindows,
     user: PageTable,
-    kernel: PageTable,
+    asid: u64,
+    /// A vCPU has run with it, so the TLB may hold its entries: when it
+    /// goes, its ASID must be flushed before its frames are reused.
+    ran: bool,
     vmas: Vmas,
     brk_start: u64,
     brk: u64,
@@ -96,23 +319,18 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    pub fn new() -> std::io::Result<Self> {
-        let mut phys = PhysMem::new()?;
+    pub fn new(machine: &Arc<Machine>) -> std::io::Result<Self> {
         let oom = |_| std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        let mut phys = PhysMem::new(machine.pool());
         let user = PageTable::new(&mut phys).map_err(oom)?;
-        let kernel = PageTable::new(&mut phys).map_err(oom)?;
-        let vectors = phys.alloc().map_err(oom)?;
-        // Every address space puts its vectors in the same frame, so a vCPU
-        // that moves to a new one (execve) can't fetch anything else there
-        // from a stale TLB entry before flushing it.
-        assert_eq!(vectors, VECTORS_FRAME);
-        write_vectors(&mut phys, vectors);
-        kernel.map(&mut phys, VECTORS_VA, vectors, paging::kernel_code_attrs()).map_err(oom)?;
+        let asid = machine.alloc_asid().map_err(oom)?;
         let mut space = AddressSpace {
+            machine: machine.clone(),
             phys,
             shared: SharedWindows::default(),
             user,
-            kernel,
+            asid,
+            ran: false,
             vmas: Vmas::default(),
             brk_start: MIN_ADDR,
             brk: MIN_ADDR,
@@ -126,14 +344,29 @@ impl AddressSpace {
         Ok(space)
     }
 
-    /// Everything a forked child needs to rebuild this address space: a
-    /// copy-on-write snapshot of the private pool, the layout (encoded into
-    /// `e`), and the shared windows' fds, to map the same memory. Other
-    /// threads may keep running.
-    pub fn encode_for_fork(&self, e: &mut Encoder) -> std::io::Result<(MemoryEntry, Vec<RawFd>)> {
-        let entry = self.phys.snapshot()?;
-        self.phys.encode(e);
-        e.u64(self.user.root).u64(self.kernel.root).u64(self.brk_start).u64(self.brk);
+    /// The VM-wide memory this address space is part of.
+    pub fn machine(&self) -> &Arc<Machine> {
+        &self.machine
+    }
+
+    pub fn asid(&self) -> u64 {
+        self.asid
+    }
+
+    /// Everything a forked child needs to rebuild this address space:
+    /// copy-on-write snapshots of the pool (one per segment in use), the
+    /// layout (encoded into `e`), and the shared windows' fds, to map the
+    /// same memory. Other threads may keep running.
+    pub fn encode_for_fork(&self, e: &mut Encoder) -> std::io::Result<(Vec<MemoryEntry>, Vec<RawFd>)> {
+        let pool = self.machine.pool();
+        // Frames an exec left behind are free in the child only once they're
+        // on the free list.
+        self.machine.reclaimed();
+        let entries = pool.snapshot()?;
+        let also_free: Vec<u64> = self.phys.unmapped().chain(self.machine.retired_frames()).collect();
+        pool.encode(e, &also_free);
+        e.u64(self.machine.kernel.root);
+        e.u64(self.user.root).u64(self.brk_start).u64(self.brk);
         let vmas: Vec<_> = self.vmas.iter().collect();
         e.u64(vmas.len() as u64);
         for (start, v) in vmas {
@@ -145,13 +378,13 @@ impl AddressSpace {
             };
         }
         let fds = self.shared.encode(e);
-        Ok((entry, fds))
+        Ok((entries, fds))
     }
 
     /// The child's side of [`AddressSpace::encode_for_fork`].
-    pub fn decode_forked(d: &mut Decoder, entry: &MemoryEntry, fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Self, Truncated> {
-        let phys = PhysMem::restore(entry, d)?;
-        let (user, kernel) = (PageTable { root: d.u64()? }, PageTable { root: d.u64()? });
+    pub fn decode_forked(d: &mut Decoder, entries: &[MemoryEntry], fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Self, Truncated> {
+        let machine = Machine::restore(entries, d)?;
+        let user = PageTable { root: d.u64()? };
         let (brk_start, brk) = (d.u64()?, d.u64()?);
         let mut vmas = Vmas::default();
         for _ in 0..d.count(32)? {
@@ -165,26 +398,46 @@ impl AddressSpace {
             vmas.insert(start, end, prot, backing);
         }
         let shared = SharedWindows::decode(d, fds)?;
-        Ok(AddressSpace { phys, shared, user, kernel, vmas, brk_start, brk, tlb_stale: false })
+        let asid = machine.alloc_asid().map_err(|_| Truncated)?;
+        let phys = PhysMem::new(machine.pool());
+        Ok(AddressSpace { machine, phys, shared, user, asid, ran: false, vmas, brk_start, brk, tlb_stale: false })
     }
 
-    /// Map guest physical memory into `vm`: the private pool, and shared
-    /// windows (now and as they're created).
+    /// Map guest physical memory into `vm`: the pool, and shared windows (now
+    /// and as they're created).
     pub fn map_into(&mut self, vm: &Vm) -> Result<(), HvError> {
-        self.phys.map_into(vm)?;
+        self.machine.pool().map_into(vm)?;
         self.shared.attach_vm()
     }
 
-    /// Take this address space out of `vm` (which carries on with another),
-    /// for `execve`.
+    /// Take guest physical memory out of `vm`, before it goes.
     pub fn unmap_from(&mut self, _vm: &Vm) -> Result<(), HvError> {
-        hv::unmap(0, PHYS_SIZE as usize)?;
+        self.machine.pool().unmap_from_vm()?;
         self.shared.detach_vm()
     }
 
-    /// Point the vCPU at our page tables and vectors and turn the MMU on.
-    pub fn configure_vcpu(&self, vcpu: &mut Vcpu) -> Result<(), HvError> {
+    /// Map this address space's shared windows into the VM (the pool is
+    /// there already): it replaces another, for `execve`.
+    pub fn attach_windows(&mut self) -> Result<(), HvError> {
+        self.shared.attach_vm()
+    }
+
+    /// Take this address space's shared windows out of the VM, which
+    /// carries on with another (`execve`).
+    pub fn detach_windows(&mut self) -> Result<(), HvError> {
+        self.shared.detach_vm()
+    }
+
+    /// Point the vCPU at our page tables (with our ASID) and the VM's
+    /// vectors, and turn the MMU on.
+    pub fn configure_vcpu(&mut self, vcpu: &mut Vcpu) -> Result<(), HvError> {
         use hv::sys_reg::*;
+        if ASID_BITS.load(Ordering::Relaxed) == 0 {
+            // ID_AA64MMFR0_EL1.ASIDBits: 0b0010 for 16 bits.
+            let bits = if (vcpu.sys_reg(ID_AA64MMFR0_EL1)? >> 4) & 0xf == 0b0010 { 16 } else { 8 };
+            ASID_BITS.store(bits, Ordering::Relaxed);
+        }
+        assert!(self.asid < 1 << ASID_BITS.load(Ordering::Relaxed), "ASID {} too big for this CPU", self.asid);
         // Attr0: normal memory, write-back read/write-allocate.
         vcpu.set_sys_reg(MAIR_EL1, 0xff)?;
         let tcr = 16           // T0SZ: 48-bit user VAs
@@ -196,11 +449,12 @@ impl AddressSpace {
             | (0b01 << 26)     // ORGN1
             | (0b11 << 28)     // SH1
             | (0b10 << 30)     // TG1: 4 KiB granule
-            | (0b001 << 32)    // IPS: 36-bit physical addresses
+            | (0b010 << 32)    // IPS: 40-bit physical addresses (the VM's IPA size)
+            | (1 << 36)        // AS: 16-bit ASIDs (A1 = 0: TTBR0_EL1's)
             | (1 << 37);       // TBI0: top byte ignored for user pointers, as on Linux
         vcpu.set_sys_reg(TCR_EL1, tcr)?;
-        vcpu.set_sys_reg(TTBR0_EL1, self.user.root)?;
-        vcpu.set_sys_reg(TTBR1_EL1, self.kernel.root)?;
+        vcpu.set_sys_reg(TTBR0_EL1, self.user.root | self.asid << 48)?;
+        vcpu.set_sys_reg(TTBR1_EL1, self.machine.kernel.root)?;
         // FPEN = 0b11: FP/SIMD usable at EL0 (musl's memcpy uses NEON).
         vcpu.set_sys_reg(CPACR_EL1, 0b11 << 20)?;
         vcpu.set_sys_reg(VBAR_EL1, VECTORS_VA)?;
@@ -215,7 +469,9 @@ impl AddressSpace {
             | (1 << 14)  // DZE: EL0 may use DC ZVA
             | (1 << 15)  // UCT: EL0 may read CTR_EL0
             | (1 << 26); // UCI: EL0 cache maintenance
-        vcpu.set_sys_reg(SCTLR_EL1, sctlr)
+        vcpu.set_sys_reg(SCTLR_EL1, sctlr)?;
+        self.ran = true;
+        Ok(())
     }
 
     /// Whether the TLB must be flushed before the guest runs again (and clear
@@ -224,14 +480,15 @@ impl AddressSpace {
         std::mem::take(&mut self.tlb_stale)
     }
 
-    /// Whether a system call changed mappings such that every vCPU's TLB
-    /// must be flushed before it returns (and unmapped frames can be reused).
+    /// Whether a system call changed mappings such that this address
+    /// space's TLB entries must be flushed (on every vCPU) before it
+    /// returns (and unmapped frames can be reused).
     pub fn needs_flush(&self) -> bool {
         self.tlb_stale || self.phys.has_quarantine()
     }
 
-    /// The TLB has been flushed (on every vCPU: `tlbi vmalle1is` reaches
-    /// them all).
+    /// The address space's TLB entries have been flushed (on every vCPU:
+    /// `tlbi aside1is` reaches them all).
     pub fn flushed(&mut self) {
         self.tlb_stale = false;
         self.phys.release_quarantine();
@@ -240,7 +497,6 @@ impl AddressSpace {
     pub fn frames_in_use(&self) -> u64 {
         self.phys.frames_in_use()
     }
-
     /// Map an ELF segment's pages, `[start, end)` page-aligned. A first page
     /// shared with the previous segment gets both segments' permissions.
     pub fn map_segment(&mut self, start: u64, end: u64, p: u64) -> Result<(), u64> {
@@ -329,7 +585,7 @@ impl AddressSpace {
 
     /// Host pointer to guest physical address `pa`.
     fn ptr(&self, pa: u64) -> *mut u8 {
-        if pa < PHYS_SIZE {
+        if pa < POOL_SIZE {
             self.phys.ptr(pa)
         } else {
             self.shared.ptr(pa).expect("physical address outside any window")
@@ -689,26 +945,58 @@ impl GuestMemory for Space {
     }
 }
 
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        // Its frames (and page tables) may still be in TLBs under its ASID:
+        // they go back to the pool once that's flushed.
+        let retired = Retired { asid: self.asid, user: PageTable { root: self.user.root }, quarantine: self.phys.take_quarantine() };
+        self.machine.retire(retired, self.ran);
+    }
+}
+
 /// The vector table: every entry is `hvc #<index>; eret`. The hvc exits to the
 /// host, which handles the exception (for a system call: puts the result in
 /// x0) and resumes at the eret, returning to EL0. The EL0-synchronous entry
-/// also has a TLB-flushing return path at [`VECTOR_FLUSH_PATH`].
+/// also has a return path at [`VECTOR_FLUSH_PATH`] that flushes the running
+/// address space's TLB entries first: by the ASID in `TTBR0_EL1`, which it
+/// reads into x0 (saved meanwhile in `TPIDR_EL1`, which nothing else uses).
+/// After the table, [`FLUSH_ASID_PATH`] flushes a given ASID.
 fn write_vectors(phys: &mut PhysMem, frame: u64) {
     const ERET: u32 = 0xd69f_03e0;
     const DSB_ISHST: u32 = 0xd503_3a9f;
-    const TLBI_VMALLE1IS: u32 = 0xd508_831f;
     const DSB_ISH: u32 = 0xd503_3b9f;
     const ISB: u32 = 0xd503_3fdf;
+    const MSR_TPIDR_EL1_X0: u32 = 0xd518_d080;
+    const MRS_X0_TPIDR_EL1: u32 = 0xd538_d080;
+    const MRS_X0_TTBR0_EL1: u32 = 0xd538_2000;
+    const LSR_X0_48: u32 = 0xd370_fc00; // the ASID, alone
+    const LSL_X0_48: u32 = 0xd350_3c00; // back in bits 63:48
+    const TLBI_ASIDE1IS_X0: u32 = 0xd508_8340;
+    let write = |phys: &mut PhysMem, at: u64, code: &[u32]| {
+        for (j, insn) in code.iter().enumerate() {
+            unsafe { phys.ptr(frame + at + j as u64 * 4).cast::<u32>().write(*insn) };
+        }
+    };
     for i in 0..16u64 {
         let hvc = 0xd400_0002 | ((i as u32) << 5);
         let mut code = vec![hvc, ERET];
         if i == VECTOR_EL0_SYNC {
-            code.extend([DSB_ISHST, TLBI_VMALLE1IS, DSB_ISH, ISB, ERET]);
+            code.extend([
+                DSB_ISHST,
+                MSR_TPIDR_EL1_X0,
+                MRS_X0_TTBR0_EL1,
+                LSR_X0_48,
+                LSL_X0_48,
+                TLBI_ASIDE1IS_X0,
+                DSB_ISH,
+                ISB,
+                MRS_X0_TPIDR_EL1,
+                ERET,
+            ]);
         }
-        for (j, insn) in code.into_iter().enumerate() {
-            unsafe { phys.ptr(frame + i * 0x80 + j as u64 * 4).cast::<u32>().write(insn) };
-        }
+        write(phys, i * 0x80, &code);
     }
+    write(phys, FLUSH_ASID_PATH - VECTORS_VA, &[DSB_ISHST, TLBI_ASIDE1IS_X0, DSB_ISH, ISB, ERET]);
 }
 
 #[cfg(test)]
@@ -718,7 +1006,7 @@ mod tests {
     const RW: u64 = prot::READ | prot::WRITE;
 
     fn space() -> AddressSpace {
-        AddressSpace::new().unwrap()
+        AddressSpace::new(&Machine::new().unwrap()).unwrap()
     }
 
     fn mmap(s: &mut AddressSpace, len: u64, p: u64) -> u64 {
@@ -921,7 +1209,7 @@ mod tests {
             let before = s.frames_in_use();
             assert_eq!(s.handle_fault(a + 8, Access::Write), Ok(true));
             let pa = s.user.lookup(&s.phys, a).unwrap();
-            assert!(pa >= PHYS_SIZE, "maps into the window");
+            assert!(pa >= POOL_SIZE, "maps into the window");
             assert_eq!(unsafe { *s.ptr(pa) }, b'a');
             // Only page-table pages were allocated, not a data frame.
             let tables = s.frames_in_use() - before;

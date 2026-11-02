@@ -26,6 +26,7 @@ pub mod reg {
 
 /// System registers (`hv_sys_reg_t`), encoded op0:op1:CRn:CRm:op2.
 pub mod sys_reg {
+    pub const ID_AA64MMFR0_EL1: u16 = 0xc038;
     pub const SCTLR_EL1: u16 = 0xc080;
     pub const CPACR_EL1: u16 = 0xc082;
     pub const TTBR0_EL1: u16 = 0xc100;
@@ -40,6 +41,7 @@ pub mod sys_reg {
     pub const VBAR_EL1: u16 = 0xc600;
     pub const CNTKCTL_EL1: u16 = 0xc708;
     pub const SP_EL1: u16 = 0xe208;
+    pub const TPIDR_EL1: u16 = 0xc684;
     pub const TPIDR_EL0: u16 = 0xde82;
     pub const TPIDRRO_EL0: u16 = 0xde83;
 }
@@ -63,6 +65,8 @@ pub struct Exit {
 #[link(name = "Hypervisor", kind = "framework")]
 unsafe extern "C" {
     fn hv_vm_create(config: *mut c_void) -> HvReturn;
+    fn hv_vm_config_create() -> *mut c_void;
+    fn hv_vm_config_set_ipa_size(config: *mut c_void, ipa_bit_length: u32) -> HvReturn;
     fn hv_vm_destroy() -> HvReturn;
     fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> HvReturn;
     fn hv_vm_unmap(ipa: u64, size: usize) -> HvReturn;
@@ -107,9 +111,25 @@ fn check(call: &'static str, code: HvReturn) -> Result<(), HvError> {
 /// The process's VM. Hypervisor.framework allows one per process.
 pub struct Vm(());
 
+unsafe extern "C" {
+    fn os_release(object: *mut c_void);
+}
+
+/// The guest physical address space's size, in bits: the largest
+/// Hypervisor.framework allows here (its default is 36), for one frame pool
+/// below 512 GiB and shared windows above it (see `paging::POOL_SIZE`).
+pub const IPA_BITS: u32 = 40;
+
 impl Vm {
     pub fn new() -> Result<Self, HvError> {
-        check("hv_vm_create", unsafe { hv_vm_create(ptr::null_mut()) })?;
+        let config = unsafe { hv_vm_config_create() };
+        if config.is_null() {
+            return Err(HvError { call: "hv_vm_config_create", code: -1 });
+        }
+        let created = check("hv_vm_config_set_ipa_size", unsafe { hv_vm_config_set_ipa_size(config, IPA_BITS) })
+            .and_then(|()| check("hv_vm_create", unsafe { hv_vm_create(config) }));
+        unsafe { os_release(config) };
+        created?;
         Ok(Vm(()))
     }
 
@@ -282,6 +302,11 @@ impl UserContext {
         let mut x = [0; 31];
         for (i, r) in x.iter_mut().enumerate() {
             *r = vcpu.reg(reg::X0 + i as u32)?;
+        }
+        // Stopped part-way through the vector's flush path, which borrows
+        // x0 for the ASID: the guest's x0 is in TPIDR_EL1 meanwhile.
+        if in_vector && crate::memory::flush_path_borrows_x0(vcpu.reg(reg::PC)?) {
+            x[0] = vcpu.sys_reg(sys_reg::TPIDR_EL1)?;
         }
         let mut v = [0; 32];
         for (i, r) in v.iter_mut().enumerate() {

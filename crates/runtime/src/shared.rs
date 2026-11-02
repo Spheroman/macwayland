@@ -17,15 +17,15 @@ use linux_abi::{
 
 use crate::{
     hv::{self, HvError},
-    paging::PHYS_SIZE,
+    paging::POOL_SIZE,
 };
 
 /// macOS's page size: host mappings (and so windows) are aligned to it.
 pub const HOST_PAGE: u64 = 16 << 10;
-/// Windows live between the private pool and the end of the VM's default
-/// 36-bit IPA space.
-const IPA_BASE: u64 = PHYS_SIZE;
-const IPA_LIMIT: u64 = 1 << 36;
+/// Windows live between the frame pool and the end of the VM's 40-bit IPA
+/// space: `[512 GiB, 1 TiB)`.
+const IPA_BASE: u64 = POOL_SIZE;
+const IPA_LIMIT: u64 = 1 << hv::IPA_BITS;
 
 struct Window {
     host: NonNull<u8>,

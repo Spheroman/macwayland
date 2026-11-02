@@ -119,7 +119,9 @@ from a static Linux binary.
    `src/sys` and `src/mm` show the semantics (watch for x86-64 vs arm64
    differences: arm64 has `openat` but no `open`, and some layouts differ).
 3. **Memory management.** Done for private memory: 4-level page tables with
-   4 KiB pages over an 8 GiB pool of guest-physical frames (so the host's 16 KiB
+   4 KiB pages over a 512 GiB pool of guest-physical frames (40-bit IPA,
+   reserved and mapped in doubling segments as used; each address space has
+   its own ASID, `docs/processes.md` step 2, done 2026-11-02) (so the host's 16 KiB
    pages only matter for the one stage-2 mapping), VMAs as the source of truth,
    pages filled on first touch (64 KiB fault-around, ~5 µs per fault), TLB
    flushed via a return path in the vector page when mapped entries change.
