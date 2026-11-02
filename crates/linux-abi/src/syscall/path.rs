@@ -108,8 +108,15 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
     let fd = p.fds.insert(entry.cloexec(flags & o::CLOEXEC != 0));
     if tty
         && let Ok(file) = p.fds.get(fd as u64)
-        && file.tty().is_some()
+        && let Some(id) = file.tty()
     {
+        // A new pty is 0x0 on Linux; macOS keeps the size the last pty of
+        // that number had. Its slave gets 0x0 as it opens, unless the
+        // master is sized first.
+        if id.master {
+            let zero = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+            super::tty::park_winsize(p, file.host.as_raw_fd(), &zero);
+        }
         p.kernel.tty_opened(p, &file, flags & o::NOCTTY != 0);
     }
     Ok(fd)
