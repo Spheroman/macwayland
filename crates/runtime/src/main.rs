@@ -246,5 +246,5 @@ fn main() -> ExitCode {
     }
     let envp: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
 
-    finish(macwl_runtime::run(&elf, &argv, &envp, &process))
+    finish(macwl_runtime::run(&elf, &argv, &envp, process))
 }

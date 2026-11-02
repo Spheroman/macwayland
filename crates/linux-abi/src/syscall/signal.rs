@@ -548,7 +548,7 @@ impl Process {
                         // (Not holding its signals: stopping tells the
                         // parent, whose signals the kernel may take.)
                         drop(s);
-                        self.kernel.stop(self);
+                        self.kernel.stop(self, sig);
                         s = self.signals();
                     }
                     continue;
@@ -570,7 +570,27 @@ impl Process {
         let pending = self.signals().pending.bits
             | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits
             | self.inbox.host_pending.load(Ordering::Acquire);
-        pending & !t.signals.blocked != 0
+        pending & !t.signals.blocked & !self.ignoring() != 0
+    }
+
+    /// Signals that would be ignored now, which (on Linux, where they're
+    /// dropped as they're sent unless blocked) wake and interrupt nothing.
+    /// With many processes in a host, where signals from others arrive in
+    /// memory: a child's SIGCHLD at its default action mustn't end its
+    /// parent's `wait4` with EINTR. (In 1:1 mode the host's own dispositions
+    /// do that already.)
+    fn ignoring(&self) -> u64 {
+        if self.inbox.mirror_host.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let s = self.signals();
+        (1..=NSIG)
+            .filter(|&sig| match s.actions[sig as usize - 1].handler {
+                SIG_IGN => true,
+                SIG_DFL => !terminates_by_default(sig) && !stops_by_default(sig),
+                _ => false,
+            })
+            .fold(0, |m, sig| m | bit(sig))
     }
 
     /// A fault thread `t` can't continue past (SIGSEGV, SIGBUS, SIGILL...): its
@@ -894,10 +914,11 @@ pub(super) fn rt_sigsuspend<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread
     ts.suspend_saved = Some(ts.blocked);
     ts.blocked = new & !UNBLOCKABLE;
     loop {
+        let ignoring = p.ignoring();
         let ready = {
             let mut s = p.signals();
             p.take_external(&mut s, ts, tid);
-            (s.pending.bits | ts.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !ts.blocked
+            (s.pending.bits | ts.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !ts.blocked & !ignoring
         };
         if ready != 0 {
             return Err(errno::EINTR);

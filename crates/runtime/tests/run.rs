@@ -78,8 +78,9 @@ fn run_with(elf: &[u8], argv: &[&[u8]], process: Process) -> (Exit, Vec<u8>) {
     let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut reader, writer) = std::io::pipe().unwrap();
     process.fds.insert_at(1, FdEntry::new(OwnedFd::from(writer)));
-    let exit = macwl_runtime::run(elf, argv, &[], &process).unwrap();
-    drop(process); // close the write end so the read below ends
+    // The process (and the write end) goes when the run ends, so the read
+    // below ends.
+    let exit = macwl_runtime::run(elf, argv, &[], process).unwrap();
     let mut out = Vec::new();
     reader.read_to_end(&mut out).unwrap();
     (exit, out)
@@ -188,7 +189,7 @@ fn dynamic_musl_hello_in_a_guest_root() {
     // Without the loader in the root, loading fails cleanly.
     std::fs::remove_file(root.path().join("lib/ld-musl-aarch64.so.1")).unwrap();
     let _vm = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let err = macwl_runtime::run(&guest("hello-distro"), &[b"test"], &[], &Process::new(root.path())).unwrap_err();
+    let err = macwl_runtime::run(&guest("hello-distro"), &[b"test"], &[], Process::new(root.path())).unwrap_err();
     assert!(err.to_string().contains("/lib/ld-musl-aarch64.so.1"), "{err}");
 }
 
@@ -356,8 +357,7 @@ fn b2_linux_wayland_client_draws_on_the_mac_compositor() {
     let (mut reader, writer) = std::io::pipe().unwrap();
     let process = Process::new("/");
     process.fds.insert_at(1, FdEntry::new(OwnedFd::from(writer)));
-    let exit = macwl_runtime::run(&elf, &[b"hello-client", b"3"], &envp, &process).unwrap();
-    drop(process);
+    let exit = macwl_runtime::run(&elf, &[b"hello-client", b"3"], &envp, process).unwrap();
     let mut out = String::new();
     reader.read_to_string(&mut out).unwrap();
     assert_eq!(out, "configured, drawing first frame\nrendered 3 frames, exiting\n");

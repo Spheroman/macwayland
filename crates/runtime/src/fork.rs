@@ -265,7 +265,7 @@ pub fn run_child() -> Result<Exit, Error> {
     if let Some(tls) = f.tls {
         ctx.tpidr = tls;
     }
-    crate::execute(space, crate::Start::Resume(Box::new(ctx)), &process, thread)
+    crate::execute(space, crate::Start::Resume(Box::new(ctx)), process, thread)
 }
 
 /// Answer the parent's requests until it goes away: `setpgid` on ourselves

@@ -2,8 +2,10 @@
 //!
 //! A [`Cpu`] is a vCPU and the host thread that owns it (Hypervisor.framework
 //! ties a vCPU to the thread that made it); a [`Task`] is a guest thread.
-//! A process has a CPU per physical core at most, made as its tasks need
-//! them and kept until it ends: each takes the next task from the run queue
+//! A host (a VM: one Linux process in 1:1 mode, many with `MACWL_ONE_VM`,
+//! docs/processes.md) has a CPU per physical core at most, shared by the
+//! tasks of all its processes, made as tasks need them and kept until it
+//! ends: each takes the next task from the run queue
 //! ([`Sched`]) when its own exits, is preempted, or blocks. Tasks beyond the
 //! CPUs wait their turn: a ticker preempts a task that has run a whole slice
 //! while others wait (round robin, for now).
@@ -28,7 +30,7 @@ use linux_abi::syscall::Thread;
 
 use crate::{
     hv::{UserContext, Vcpu, Vm},
-    signal,
+    signal, Proc,
 };
 
 /// How a task starts (or carries on) on a CPU.
@@ -103,7 +105,7 @@ thread_local! {
 
 /// For `linux_abi`'s blocking calls: whether this host thread's CPU is being
 /// taken back (so a call waiting in a loop of its own should give up).
-fn evicting() -> bool {
+pub(crate) fn evicting() -> bool {
     THIS_CPU.with(|cpu| cpu.get().is_some_and(|slot| EVICT[slot].load(Ordering::Acquire)))
 }
 
@@ -119,7 +121,7 @@ fn max_cpus() -> usize {
     std::env::var("MACWL_CPUS").ok().and_then(|n| n.parse().ok()).unwrap_or(cores).clamp(1, MAX_CPUS)
 }
 
-/// A process's run queue and CPUs.
+/// A host's run queue and CPUs, for the tasks of every process it runs.
 pub(crate) struct Sched {
     state: Mutex<State>,
     /// Idle CPUs wait on it for a task; the ticker, for work to watch.
@@ -308,12 +310,23 @@ impl Sched {
         tasks
     }
 
-    /// The waiting tasks, taken off the queue (`execve` ends them).
-    pub fn drain(&self) -> Vec<Task> {
+    /// The waiting tasks of process `pid`, taken off the queue (`execve`
+    /// and `exit_group` end them).
+    pub fn drain(&self, pid: i64) -> Vec<Task> {
         let mut s = self.lock();
-        self.waiting.store(0, Ordering::Release);
-        let mut tasks: Vec<Task> = s.ready.drain(..).map(|(t, _)| t).collect();
-        tasks.extend(s.jobs.drain(..).map(|j| j.task));
+        let (mut tasks, mut kept) = (Vec::new(), VecDeque::new());
+        for (task, start) in s.ready.drain(..) {
+            if task.proc.abi.pid == pid {
+                tasks.push(task);
+            } else {
+                kept.push_back((task, start));
+            }
+        }
+        s.ready = kept;
+        self.waiting.store(s.ready.len(), Ordering::SeqCst);
+        let (mine, others): (VecDeque<Job>, VecDeque<Job>) = s.jobs.drain(..).partition(|j| j.task.proc.abi.pid == pid);
+        s.jobs = others;
+        tasks.extend(mine.into_iter().map(|j| j.task));
         tasks
     }
 
@@ -453,9 +466,10 @@ impl Location {
     }
 }
 
-/// A guest thread, and where it is.
+/// A guest thread, its process, and where it is.
 pub(crate) struct Task {
     pub thread: Thread,
+    pub proc: Arc<Proc>,
     pub location: Arc<Location>,
     /// The CPU (signal slot) it last ran on: if that CPU hasn't run another
     /// task since, its vCPU still has this one's registers.
@@ -463,7 +477,7 @@ pub(crate) struct Task {
 }
 
 impl Task {
-    pub fn new(thread: Thread) -> Self {
-        Task { thread, location: Arc::new(Location(AtomicU64::new(NOWHERE))), last_cpu: None }
+    pub fn new(thread: Thread, proc: Arc<Proc>) -> Self {
+        Task { thread, proc, location: Arc::new(Location(AtomicU64::new(NOWHERE))), last_cpu: None }
     }
 }

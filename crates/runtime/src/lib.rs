@@ -11,6 +11,7 @@
 
 pub mod hv;
 mod fork;
+mod host;
 pub mod loader;
 pub mod mach;
 pub mod memory;
@@ -25,8 +26,8 @@ use std::{
     fmt,
     os::unix::ffi::OsStrExt,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -146,13 +147,28 @@ fn read_guest_file(process: &Process, path: &[u8]) -> Result<Vec<u8>, loader::Lo
 ///
 /// Creates (and destroys) the process's one VM, so only one call can be in
 /// flight per host process.
-pub fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: &Process) -> Result<Exit, Error> {
+///
+/// With `MACWL_ONE_VM=1`, the VM is a host for every Linux process this
+/// one starts, forks inside it included (docs/processes.md, step 3); the
+/// result is the first process's, once all of them have ended. Otherwise
+/// each Linux process is a Mac process with a VM of its own (1:1).
+pub fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: Process) -> Result<Exit, Error> {
+    if one_vm() {
+        return host::run(elf, argv, envp, process);
+    }
     profile::mark("load start");
     let machine = Machine::new()?;
-    let program = load(&machine, elf, argv, envp, process)?;
+    let program = load(&machine, elf, argv, envp, &process)?;
     profile::mark("loaded");
-    let thread = Thread::main(process);
+    let thread = Thread::main(&process);
     execute(program.space, Start::Fresh { entry: program.entry, sp: program.sp }, process, thread)
+}
+
+/// Whether Linux processes share one VM (`MACWL_ONE_VM=1`): a host per
+/// `macwl-run` and everything it starts. Off by default while it's built
+/// (docs/processes.md, steps 3 to 6); 1:1 is the fallback.
+pub fn one_vm() -> bool {
+    std::env::var_os("MACWL_ONE_VM").is_some_and(|v| v == "1")
 }
 
 /// A program loaded into a new address space, ready to start.
@@ -196,39 +212,140 @@ enum Next {
     /// it (or, for a futex wait begun here, sleeps it out), and the CPU goes
     /// to another task.
     Blocked(u64, [u64; 6], Option<FutexWait>),
+    /// Its process is stopped, or it vforked: set it aside (one VM).
+    Park(host::Why),
 }
 
-/// What a process's threads share.
-struct Shared<'a> {
+/// A Linux process the host runs (in 1:1 mode, the one): what the
+/// dispatcher keeps of it, its address space, and how it ended. Its tasks,
+/// and (with many processes in a VM) the process table, hold it.
+pub(crate) struct Proc {
+    pub abi: Process,
+    /// Its address space: shared with a vfork parent until it execs, and
+    /// gone (None) once the host process is to become a Mac program.
+    space: Mutex<Option<Arc<Space>>>,
+    /// How it ended, once it has.
+    exit: Mutex<Option<Result<Exit, Error>>>,
+    /// It has ended and its last thread has gone: the host is done with it.
+    finished: AtomicBool,
+    /// Stopped (SIGSTOP and the like, one VM): its tasks park rather than
+    /// run, until it's continued.
+    stopped: AtomicBool,
+    /// Tasks set aside while it's stopped, or while a vfork child runs.
+    parked: Mutex<Parked>,
+    /// CPU time its threads have used, in ns (one VM: getrusage, wait4).
+    cpu_ns: Arc<AtomicU64>,
+    /// A vfork child's parent, whose task waits until it execs or exits.
+    vfork_parent: Mutex<Option<Arc<Proc>>>,
+}
+
+/// A process's tasks that aren't to run for now.
+#[derive(Default)]
+struct Parked {
+    /// While the process is stopped.
+    stopped: Vec<(Task, Start)>,
+    /// vfork parents, by the child each waits for.
+    vfork: Vec<(i64, Task, Start)>,
+    /// vfork children that exec'd or exited before their parent's task
+    /// was parked.
+    released: Vec<i64>,
+}
+
+impl Proc {
+    fn new(abi: Process, space: Arc<Space>) -> Arc<Proc> {
+        Arc::new(Proc {
+            abi,
+            space: Mutex::new(Some(space)),
+            exit: Mutex::new(None),
+            finished: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            parked: Mutex::default(),
+            cpu_ns: Arc::default(),
+            vfork_parent: Mutex::new(None),
+        })
+    }
+
+    /// Its address space now.
+    fn space(&self) -> Arc<Space> {
+        self.space.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("a process with no address space")
+    }
+
+    /// A new address space (`execve`); the old one is returned.
+    fn set_space(&self, space: Arc<Space>) -> Option<Arc<Space>> {
+        self.space.lock().unwrap_or_else(|e| e.into_inner()).replace(space)
+    }
+
+    fn parked(&self) -> MutexGuard<'_, Parked> {
+        self.parked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How it ended, if it has.
+    fn exit(&self) -> MutexGuard<'_, Option<Result<Exit, Error>>> {
+        self.exit.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// What a VM's CPUs share: the run queue and the memory of every process
+/// in it, and (one VM) the process table.
+struct Host<'a> {
     vm: &'a Vm,
     /// The VM's memory: the frame pool every address space takes from.
     machine: &'a Arc<Machine>,
-    space: &'a Space,
-    process: &'a Process,
-    /// How the process ended, once it has.
-    exit: Mutex<Option<Result<Exit, Error>>>,
-    /// The Mac program it becomes instead of ending, with the signal mask
-    /// of the thread that exec'd it.
-    exec_host: Mutex<Option<(HostExec, u64)>>,
-    /// Its run queue and CPUs.
+    /// The run queue and CPUs.
     sched: Sched,
-    /// Bumped when `execve` replaces the address space: CPUs that were set
-    /// up for the old one set up again.
-    generation: AtomicU64,
+    /// Many processes in the VM: their table. None in 1:1 mode.
+    table: Option<Arc<host::Table>>,
+    /// 1:1: the Mac program the process becomes instead of ending, with the
+    /// signal mask of the thread that exec'd it.
+    exec_host: Mutex<Option<(HostExec, u64)>>,
 }
 
-impl Shared<'_> {
-    /// The process ends this way (unless it already ended another): every
-    /// thread is told to stop.
-    fn end(&self, how: Result<Exit, Error>) {
-        let mut exit = self.exit.lock().unwrap_or_else(|e| e.into_inner());
-        if exit.is_none() {
-            *exit = Some(how);
+impl Host<'_> {
+    /// Process `proc` ends this way (unless it already ended another): every
+    /// thread is told to stop, and those waiting for a CPU end at once.
+    fn end(&self, proc: &Arc<Proc>, how: Result<Exit, Error>) {
+        {
+            let mut exit = proc.exit();
+            if exit.is_none() {
+                *exit = Some(how);
+            }
         }
-        drop(exit);
-        self.process.set_exiting(true);
-        for task in self.sched.stop() {
-            self.process.unregister_thread(task.thread.tid);
+        proc.abi.set_exiting(true);
+        let ended = match &self.table {
+            // The host is the process: everything stops.
+            None => self.sched.stop(),
+            Some(_) => {
+                let mut tasks = self.sched.drain(proc.abi.pid);
+                let mut parked = proc.parked();
+                tasks.extend(parked.stopped.drain(..).map(|(t, _)| t));
+                tasks.extend(parked.vfork.drain(..).map(|(_, t, _)| t));
+                tasks
+            }
+        };
+        for task in ended {
+            proc.abi.unregister_thread(task.thread.tid);
+        }
+        self.check_finished(proc);
+    }
+
+    /// Thread `tid` of `proc` has ended (its task won't run again).
+    fn thread_gone(&self, proc: &Arc<Proc>, tid: i64) {
+        proc.abi.unregister_thread(tid);
+        if let Some(table) = &self.table {
+            table.thread_gone(proc.abi.pid, tid);
+        }
+        self.check_finished(proc);
+    }
+
+    /// Once a process has ended and its last thread gone, the host is done
+    /// with it: with many in the VM, it becomes a zombie for its parent, and
+    /// the host stops when no process is left.
+    fn check_finished(&self, proc: &Arc<Proc>) {
+        if proc.abi.thread_count() > 0 || proc.exit().is_none() || proc.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(table) = &self.table {
+            host::finished(self, table, proc);
         }
     }
 }
@@ -238,7 +355,7 @@ type Scope<'scope, 'env> = std::thread::Scope<'scope, 'env>;
 /// Run the guest in `space` until it exits: its first thread on a CPU on this
 /// host thread, the others on CPUs it starts as they're needed (each a host
 /// thread with a vCPU in the one VM).
-fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread) -> Result<Exit, Error> {
+fn execute(space: AddressSpace, start: Start, process: Process, thread: Thread) -> Result<Exit, Error> {
     // A guest writing to a closed pipe or socket gets EPIPE; the host
     // process must not be killed by SIGPIPE.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
@@ -247,40 +364,33 @@ fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread)
     // side are its.
     process.receive_host_signals();
     // Teardown order matters: vCPUs, then the VM, then the memory mapped into
-    // it — so the machine (its frame pool) and `space` are declared first
-    // (dropped last).
+    // it — so the machine (its frame pool) is declared first (dropped last),
+    // and the VM before the process (which holds the address space).
     let machine = space.machine().clone();
-    let space = Space::new(space);
     let vm = Vm::new()?;
+    let space = Arc::new(Space::new(space));
     {
         let mut s = space.lock();
         s.take_tlb_stale(); // fresh vCPUs have nothing cached
         s.map_into(&vm)?;
     }
-    let shared = Shared {
-        vm: &vm,
-        machine: &machine,
-        space: &space,
-        process,
-        exit: Mutex::new(None),
-        exec_host: Mutex::new(None),
-        sched: Sched::new(),
-        generation: AtomicU64::new(0),
-    };
+    let proc = Proc::new(process, space);
+    let host = Host { vm: &vm, machine: &machine, sched: Sched::new(), table: None, exec_host: Mutex::new(None) };
     std::thread::scope(|scope| {
-        scope.spawn(|| shared.sched.ticker());
-        let task = Task::new(thread);
-        process.register_thread(&task.thread, task.location.waker());
-        if let Err(e) = run_cpu(&shared, scope, (task, start), true) {
-            shared.end(Err(e));
+        scope.spawn(|| host.sched.ticker());
+        let task = Task::new(thread, proc.clone());
+        proc.abi.register_thread(&task.thread, task.location.waker());
+        if let Err(e) = run_cpu(&host, scope, (task, start), true) {
+            host.end(&proc, Err(e));
         }
     });
-    process.set_exiting(false);
-    let Shared { exit, exec_host, .. } = shared;
+    proc.abi.set_exiting(false);
+    let Host { exec_host, .. } = host;
     if let Some((exec, blocked)) = exec_host.into_inner().unwrap_or_else(|e| e.into_inner()) {
         // Every vCPU went with its thread. Now the VM and the memory it
         // mapped, so that none of the hypervisor is left when the process
         // is replaced.
+        let space = proc.space.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the process's address space");
         space.lock().unmap_from(&vm)?;
         // Never replace the process with the VM still alive: fail instead.
         vm.destroy()?;
@@ -288,18 +398,18 @@ fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread)
         drop(machine);
         // It won't fork again.
         fork::discard_spare();
-        process.tell_parent(&[ctl::EXEC]);
-        let e = linux_abi::syscall::exec_host(process, blocked, &exec);
+        proc.abi.tell_parent(&[ctl::EXEC]);
+        let e = linux_abi::syscall::exec_host(&proc.abi, blocked, &exec);
         // Past the point of no return, as for a Linux execve that fails
         // after the old program is gone.
         eprintln!("macwl-run: couldn't start {:?}: Linux errno {e}", exec.path);
         return Ok(Exit::Code(127));
     }
-    let exit = exit.into_inner().unwrap_or_else(|e| e.into_inner()).unwrap_or(Ok(Exit::Code(0)))?;
+    let exit = proc.exit().take().unwrap_or(Ok(Exit::Code(0)))?;
     if let Some(sig) = exit.signal() {
         // So the parent's wait() reports the signal (the host process exits
         // with 128 + sig rather than raising it).
-        process.tell_parent(&[ctl::KILLED, sig as u8]);
+        proc.abi.tell_parent(&[ctl::KILLED, sig as u8]);
     }
     Ok(exit)
 }
@@ -330,6 +440,18 @@ fn strace_args(space: &Space, nr: u64, args: &[u64; 6]) -> String {
     out
 }
 
+/// Who made a call, for a line of the system call log: with many processes
+/// in the VM their lines mix, so the time (in ms since the host started),
+/// pid and tid; in 1:1 mode, nothing.
+fn who(sh: &Host, process: &Process, thread: &Thread) -> String {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    if sh.table.is_none() {
+        return String::new();
+    }
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1e3;
+    format!("{ms:.1} {}/{} ", process.pid, thread.tid)
+}
+
 fn strace_line(line: std::fmt::Arguments) {
     use std::io::Write;
     static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
@@ -356,15 +478,17 @@ enum Outcome {
     Preempted,
     /// It gave up the CPU to make this call on a worker.
     Blocked(u64, [u64; 6], Option<FutexWait>),
+    /// It's set aside until something lets it run again (one VM).
+    Parked(host::Why),
     /// It's over: the thread ended, or the process is ending.
     Done,
 }
 
 /// Be a CPU: make a vCPU on this host thread and run tasks on it, `first`
-/// and then whatever the run queue has, until the process ends. A CPU that
+/// and then whatever the run queue has, until the host ends. A CPU that
 /// can't get a vCPU leaves its task to the others (unless it's the first).
 fn run_cpu<'scope, 'env>(
-    sh: &'scope Shared<'env>,
+    sh: &'scope Host<'env>,
     scope: &'scope Scope<'scope, 'env>,
     first: (Task, Start),
     first_cpu: bool,
@@ -385,8 +509,8 @@ fn run_cpu<'scope, 'env>(
         }
     };
     profile::mark("VM ready");
-    // The address space the vCPU is set up for, and the thread whose
-    // registers it holds (if that thread hasn't run elsewhere since).
+    // The address space the vCPU is set up for (its serial), and the thread
+    // whose registers it holds (if that thread hasn't run elsewhere since).
     let mut configured = None;
     let mut holds = None;
     sh.sched.running(cpu.slot);
@@ -395,13 +519,29 @@ fn run_cpu<'scope, 'env>(
         let Some((mut task, start)) = next.take().or_else(|| sh.sched.next(cpu.slot)) else { break Ok(()) };
         // Its registers are still in this vCPU only if this CPU ran it last
         // and it ran nowhere else since.
-        let warm = holds == Some(task.thread.tid) && task.last_cpu == Some(cpu.slot);
+        let warm = holds == Some((task.proc.abi.pid, task.thread.tid)) && task.last_cpu == Some(cpu.slot);
         let mut after = None;
+        let cpu_time = sh.table.is_some().then(thread_cpu_ns);
         let step = (|| {
-            let generation = sh.generation.load(Ordering::Acquire);
-            if configured != Some(generation) {
-                sh.space.lock().configure_vcpu(&mut cpu.vcpu)?;
-                configured = Some(generation);
+            let space = task.proc.space();
+            {
+                let mut s = space.lock();
+                match configured {
+                    None => s.configure_vcpu(&mut cpu.vcpu)?,
+                    // Another process's (or a new program's) address space:
+                    // only TTBR0_EL1 differs.
+                    Some(serial) if serial != s.serial() => s.switch_vcpu(&mut cpu.vcpu)?,
+                    Some(_) => {}
+                }
+                configured = Some(s.serial());
+            }
+            // Address spaces that have gone (processes that ended) are
+            // flushed from every TLB, so their frames and ASIDs come back.
+            if sh.table.is_some() && sh.machine.any_unflushed() {
+                for asid in sh.machine.unflushed_asids() {
+                    flush_asid_now(&mut cpu.vcpu, asid)?;
+                    sh.machine.asid_flushed(asid);
+                }
             }
             let vcpu = &mut cpu.vcpu;
             match start {
@@ -426,7 +566,10 @@ fn run_cpu<'scope, 'env>(
             run_task(&mut cpu, sh, scope, &mut task, &mut configured, after.take())
         })();
         sh.sched.done(cpu.slot);
-        holds = Some(task.thread.tid);
+        if let Some(t0) = cpu_time {
+            task.proc.cpu_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Ordering::Relaxed);
+        }
+        holds = Some((task.proc.abi.pid, task.thread.tid));
         match step {
             Ok(Outcome::Done) => {}
             Ok(Outcome::Preempted) => {
@@ -444,70 +587,106 @@ fn run_cpu<'scope, 'env>(
                     Offloaded::NewWorker(job) => {
                         scope.spawn(move || run_worker(sh, scope, job));
                     }
-                    Offloaded::Dropped(task) => sh.process.unregister_thread(task.thread.tid),
+                    Offloaded::Dropped(task) => sh.thread_gone(&task.proc, task.thread.tid),
                 }
             }
+            Ok(Outcome::Parked(why)) => {
+                task.location.set_nowhere();
+                let ctx = hv::UserContext::save(&cpu.vcpu)?;
+                host::park(sh, scope, task, Start::Resume(Box::new(ctx)), why);
+            }
+            // With many processes in the VM, a runtime error ends the
+            // process whose task met it, and this CPU (its vCPU may be what
+            // failed); the others carry on.
+            Err(e) if sh.table.is_some() => {
+                eprintln!("macwl-run: pid {}: {e}", task.proc.abi.pid);
+                task.location.set_nowhere();
+                let proc = task.proc.clone();
+                sh.end(&proc, Err(e));
+                sh.thread_gone(&proc, task.thread.tid);
+                break Ok(());
+            }
             Err(e) => {
-                sh.process.unregister_thread(task.thread.tid);
+                sh.thread_gone(&task.proc.clone(), task.thread.tid);
                 task.location.set_nowhere();
                 break Err(e);
             }
+        }
+        if let Some(table) = &sh.table {
+            host::place_ready(sh, scope, table);
         }
     };
     sh.sched.cpu_gone();
     result
 }
 
+/// The CPU time the calling host thread has used, in ns (a CPU's: what its
+/// tasks used, including the hypervisor's running of their guest code).
+fn thread_cpu_ns() -> u64 {
+    unsafe extern "C" {
+        fn clock_gettime_nsec_np(clock: libc::clockid_t) -> u64;
+    }
+    unsafe { clock_gettime_nsec_np(libc::CLOCK_THREAD_CPUTIME_ID) }
+}
+
 /// Run a task on a CPU until it ends, the process ends, or it gives the CPU
-/// up. `configured` is the address space generation the vCPU is set up for.
+/// up. `configured` is the serial of the address space the vCPU is set up
+/// for.
 fn run_task<'scope, 'env>(
     cpu: &mut Cpu,
-    sh: &'scope Shared<'env>,
+    sh: &'scope Host<'env>,
     scope: &'scope Scope<'scope, 'env>,
     task: &mut Task,
     configured: &mut Option<u64>,
     after: Option<(u64, u64, i64)>,
 ) -> Result<Outcome, Error> {
-    let process = sh.process;
-    let Task { thread, location, .. } = task;
+    let Task { thread, location, proc, .. } = task;
+    let proc = proc.clone();
+    let process = &proc.abi;
+    let mut space = proc.space();
     let (vcpu, slot) = (&mut cpu.vcpu, cpu.slot);
     let done = |thread: &Thread| {
-        process.unregister_thread(thread.tid);
+        sh.thread_gone(&proc, thread.tid);
         location.set_nowhere();
         Ok(Outcome::Done)
     };
     // Back from a call a worker made: it returns, as a call on the CPU does.
     let mut first = match after {
-        Some((nr, arg0, ret)) => finish_call(vcpu, sh.space, process, thread, nr, arg0, ret)?,
+        Some((nr, arg0, ret)) => finish_call(vcpu, &space, process, thread, nr, arg0, ret)?,
         None => None,
     };
     loop {
         let next = match first.take() {
             Some(next) => next,
-            None => run_loop(vcpu, slot, sh, scope, thread)?,
+            None => run_loop(vcpu, slot, sh, scope, &proc, &space, thread)?,
         };
         profile::mark("guest stopped");
         match next {
             Next::Preempted => return Ok(Outcome::Preempted),
             Next::Blocked(nr, args, wait) => return Ok(Outcome::Blocked(nr, args, wait)),
+            Next::Park(why) => return Ok(Outcome::Parked(why)),
             Next::Stop => return done(thread),
             Next::Exit(exit) => {
-                sh.end(Ok(exit));
+                sh.end(&proc, Ok(exit));
                 return done(thread);
             }
             // The VM can't go while any vCPU is left: the other threads end,
             // every CPU leaves its vCPU behind, and `execute` does the rest.
             Next::ExecHost(exec) => {
-                stop_other_threads(sh);
+                // Only the host process that is this Linux process alone
+                // becomes a Mac program: with others in its VM, never (the
+                // dispatcher refuses such an execve already).
+                assert!(sh.table.is_none(), "a Mac program's execve in a host of many processes");
+                stop_other_threads(sh, &proc);
                 *sh.exec_host.lock().unwrap_or_else(|e| e.into_inner()) = Some((exec, thread.blocked_signals()));
-                sh.end(Ok(Exit::Code(0)));
+                sh.end(&proc, Ok(Exit::Code(0)));
                 return done(thread);
             }
             Next::ExitThread(code) => {
-                end_thread(sh, thread);
+                end_thread(&proc, &space, thread);
                 let outcome = done(thread);
                 if process.thread_count() == 0 {
-                    sh.end(Ok(Exit::Code(code)));
+                    sh.end(&proc, Ok(Exit::Code(code)));
                 }
                 return outcome;
             }
@@ -516,27 +695,33 @@ fn run_task<'scope, 'env>(
             // same pool), once the other threads have gone (as Linux). Other
             // CPUs set up for it when they next run a task.
             Next::Exec(program) => {
-                stop_other_threads(sh);
-                let old = {
-                    let mut s = sh.space.lock();
-                    let old = std::mem::replace(&mut *s, program.space);
+                stop_other_threads(sh, &proc);
+                let new = Arc::new(Space::new(program.space));
+                {
+                    let mut s = new.lock();
                     s.take_tlb_stale();
                     s.configure_vcpu(vcpu)?;
-                    let generation = sh.generation.fetch_add(1, Ordering::AcqRel) + 1;
-                    *configured = Some(generation);
-                    old
-                };
+                    *configured = Some(s.serial());
+                }
+                let old = proc.set_space(new.clone()).expect("an address space to replace");
+                space = new;
                 // The old address space's entries go from every TLB, and
-                // then its frames and ASID can be used again.
-                let old_asid = old.asid();
+                // then its frames and ASID can be used again. (A vfork
+                // parent's stays: it's the parent's.)
+                let old_asid = old.lock().asid();
                 drop(old);
                 flush_asid_now(vcpu, old_asid)?;
                 sh.machine.asid_flushed(old_asid);
                 // The thread that execs carries on as the main one.
                 process.unregister_thread(thread.tid);
+                if let Some(table) = &sh.table {
+                    table.exec_done(&proc, thread.tid);
+                }
                 thread.tid = process.pid;
                 process.register_thread(thread, location.waker());
                 process.set_exiting(false);
+                // A vfork parent waiting for this child runs on.
+                host::vfork_done(sh, &proc);
                 start_fresh_on(vcpu, program.entry, program.sp)?;
                 profile::mark("exec'd");
             }
@@ -566,13 +751,15 @@ fn finish_call(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &mut T
 
 /// Be a worker: make system calls for tasks that gave up their CPU (`first`,
 /// then whatever comes), each task then waiting for a CPU again with the
-/// result, until the process ends.
-fn run_worker<'scope, 'env>(sh: &'scope Shared<'env>, scope: &'scope Scope<'scope, 'env>, first: Job) {
-    let process = sh.process;
+/// result, until the host ends.
+fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, first: Job) {
     let slot = signal::add_worker();
     let strace = strace_on();
     let mut next = Some(first);
     while let Some(Job { mut task, ctx, nr, args, mut wait }) = next.take().or_else(|| sh.sched.next_job()) {
+        let proc = task.proc.clone();
+        let (process, space) = (&proc.abi, proc.space());
+        let cpu_time = sh.table.is_some().then(thread_cpu_ns);
         let thread = &mut task.thread;
         // Reachable here first, then the check: a signal before it is seen
         // by the check, one after it interrupts the call.
@@ -589,7 +776,7 @@ fn run_worker<'scope, 'env>(sh: &'scope Shared<'env>, scope: &'scope Scope<'scop
             if (!sets_mask(nr, &args) && process.signal_ready(thread)) || process.exiting() {
                 break -linux_abi::errno::EINTR;
             }
-            let action = dispatch(process, thread, sh.space, nr, args);
+            let action = dispatch(process, thread, &*space, nr, args);
             let ret = match action {
                 Action::Return(ret) => ret,
                 // Only calls that return come here (see may_block).
@@ -605,11 +792,18 @@ fn run_worker<'scope, 'env>(sh: &'scope Shared<'env>, scope: &'scope Scope<'scop
             break ret;
         };
         if strace {
-            let a = strace_args(sh.space, nr, &args);
-            strace_line(format_args!("{}({a}) = Return({ret}) (worker)", linux_abi::nr::name(nr)));
+            let a = strace_args(&space, nr, &args);
+            strace_line(format_args!("{}{}({a}) = Return({ret}) (worker)", who(sh, process, thread), linux_abi::nr::name(nr)));
         }
+        if let Some(t0) = cpu_time {
+            proc.cpu_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Ordering::Relaxed);
+        }
+        drop(space);
         task.location.set_nowhere();
         place(sh, scope, task, Start::AfterCall { ctx, nr, arg0: args[0], ret });
+        if let Some(table) = &sh.table {
+            host::place_ready(sh, scope, table);
+        }
     }
     if let Some(slot) = slot {
         signal::remove_worker(slot);
@@ -674,22 +868,28 @@ fn would_block(process: &Process, space: &Space, nr: u64, args: &[u64; 6]) -> bo
 
 /// A thread is exiting: CLONE_CHILD_CLEARTID's word is zeroed and a waiter
 /// on it woken (`pthread_join`).
-fn end_thread(sh: &Shared, thread: &Thread) {
+fn end_thread(proc: &Proc, space: &Space, thread: &Thread) {
     let addr = thread.clear_child_tid;
-    if addr != 0 && linux_abi::GuestMemory::write(sh.space, addr, &0u32.to_le_bytes()).is_ok() {
-        sh.process.futex_wake(addr, 1);
+    if addr != 0 && linux_abi::GuestMemory::write(space, addr, &0u32.to_le_bytes()).is_ok() {
+        proc.abi.futex_wake(addr, 1);
     }
 }
 
 /// `execve` from a process with other threads: they end first (those
 /// waiting for a CPU without running again).
-fn stop_other_threads(sh: &Shared) {
-    let process = sh.process;
+fn stop_other_threads(sh: &Host, proc: &Arc<Proc>) {
+    let process = &proc.abi;
     process.set_exiting(true);
     loop {
         // Again each time: a preempted task may have gone back on the queue.
-        for task in sh.sched.drain() {
-            process.unregister_thread(task.thread.tid);
+        let mut gone = sh.sched.drain(process.pid);
+        {
+            let mut parked = proc.parked();
+            gone.extend(parked.stopped.drain(..).map(|(t, _)| t));
+            gone.extend(parked.vfork.drain(..).map(|(_, t, _)| t));
+        }
+        for task in gone {
+            sh.thread_gone(proc, task.thread.tid);
         }
         if process.thread_count() <= 1 {
             break;
@@ -765,8 +965,17 @@ fn exec_errno(e: &Error) -> i64 {
     }
 }
 
-fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>, scope: &'scope Scope<'scope, 'env>, thread: &mut Thread) -> Result<Next, Error> {
-    let (space, process) = (sh.space, sh.process);
+#[allow(clippy::too_many_arguments)]
+fn run_loop<'scope, 'env>(
+    vcpu: &mut Vcpu,
+    slot: usize,
+    sh: &'scope Host<'env>,
+    scope: &'scope Scope<'scope, 'env>,
+    proc: &Arc<Proc>,
+    space: &Space,
+    thread: &mut Thread,
+) -> Result<Next, Error> {
+    let process = &proc.abi;
     let mut last_fault = (u64::MAX, 0);
     let strace = strace_on();
     // MACWL_FAULTS=1 describes each fault that becomes a signal.
@@ -783,6 +992,14 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
             && let Some(exit) = deliver_signals(vcpu, space, process, thread, None)?
         {
             return Ok(Next::Exit(exit));
+        }
+        if let Some(table) = &sh.table {
+            // Tasks a call of this one let run again (a SIGCONT, say) get a
+            // CPU; and a stopped process's task goes no further.
+            host::place_ready(sh, scope, table);
+            if proc.stopped.load(Ordering::Acquire) {
+                return Ok(Next::Park(host::Why::Stopped));
+            }
         }
         if space.lock().take_tlb_stale() {
             // Return to EL0 through the vector's TLB-flushing path (which
@@ -807,7 +1024,14 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
             }
             // Nothing arms the timer yet; just resume.
             hv::EXIT_REASON_VTIMER_ACTIVATED => continue,
-            other => return Err(Error::Unexpected(format!("reason {other}"))),
+            other => {
+                let (pc, cpsr) = (vcpu.reg(reg::PC)?, vcpu.reg(reg::CPSR)?);
+                let (elr, esr) = (vcpu.sys_reg(sys_reg::ELR_EL1)?, vcpu.sys_reg(sys_reg::ESR_EL1)?);
+                return Err(Error::Unexpected(format!(
+                    "reason {other}, syndrome {:#x}, pc {pc:#x}, cpsr {cpsr:#x}, ELR_EL1 {elr:#x}, ESR_EL1 {esr:#x}",
+                    exit.exception.syndrome
+                )));
+            }
         }
         let syndrome = exit.exception.syndrome;
         // A stage-2 abort: the guest touched guest physical memory whose host
@@ -918,7 +1142,7 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
             }
             if strace {
                 let a = strace_args(space, nr, &args);
-                strace_line(format_args!("{}({a}) = {action:?}", linux_abi::nr::name(nr)));
+                strace_line(format_args!("{}{}({a}) = {action:?}", who(sh, process, thread), linux_abi::nr::name(nr)));
             }
             let ret = match action {
                 // Resuming runs the eret after the hvc, back to the
@@ -929,7 +1153,7 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
                     return Ok(Next::Exit(Exit::Code(code)));
                 }
                 Action::ExitThread(code) => return Ok(Next::ExitThread(code)),
-                Action::Spawn(spawn) => spawn_thread(vcpu, sh, scope, thread, &spawn)?,
+                Action::Spawn(spawn) => spawn_thread(vcpu, sh, scope, proc, space, thread, &spawn)?,
                 Action::SigReturn => match signal::sigreturn(vcpu, space) {
                     Ok(mask) => {
                         thread.sigreturn(mask);
@@ -944,10 +1168,29 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
                 Action::Fork(f) => {
                     profile::mark("fork");
                     let ctx = hv::UserContext::save(vcpu)?;
-                    let ret = fork::fork(space, process, thread, &ctx, &f).unwrap_or_else(|e| -e);
+                    let ret = match &sh.table {
+                        // In the VM: copy on write, the child queued.
+                        Some(table) => match host::fork(sh, scope, table, vcpu, proc, space, thread, ctx, &f)? {
+                            // vfork: the parent waits until its child execs
+                            // or exits, set aside, off its CPU.
+                            Ok(child) if f.vfork => {
+                                if let Some(next) = finish_call(vcpu, space, process, thread, nr, args[0], child)? {
+                                    return Ok(next);
+                                }
+                                return Ok(Next::Park(host::Why::Vfork(child)));
+                            }
+                            Ok(child) => child,
+                            Err(e) => -e,
+                        },
+                        None => fork::fork(space, process, thread, &ctx, &f).unwrap_or_else(|e| -e),
+                    };
                     profile::mark("fork done, parent resumes");
                     ret
                 }
+                // A Mac program replaces the host process: never with other
+                // processes in its VM (the dispatcher refuses already; this
+                // is the second lock on that door).
+                Action::ExecHost(_) if sh.table.is_some() => -linux_abi::errno::ENOEXEC,
                 Action::ExecHost(exec) => return Ok(Next::ExecHost(exec)),
                 Action::Exec(exec) => {
                     profile::mark("exec: loading");
@@ -1005,7 +1248,16 @@ fn run_loop<'scope, 'env>(vcpu: &mut Vcpu, slot: usize, sh: &'scope Shared<'env>
 /// `clone` with CLONE_THREAD: start a thread like the caller (x0 = 0, its own
 /// stack and TLS), on an idle CPU, a new one, or when one's free. Returns its
 /// tid, or -EAGAIN if the process is ending.
-fn spawn_thread<'scope, 'env>(vcpu: &Vcpu, sh: &'scope Shared<'env>, scope: &'scope Scope<'scope, 'env>, thread: &Thread, spawn: &Spawn) -> Result<i64, Error> {
+#[allow(clippy::too_many_arguments)]
+fn spawn_thread<'scope, 'env>(
+    vcpu: &Vcpu,
+    sh: &'scope Host<'env>,
+    scope: &'scope Scope<'scope, 'env>,
+    proc: &Arc<Proc>,
+    space: &Space,
+    thread: &Thread,
+    spawn: &Spawn,
+) -> Result<i64, Error> {
     let mut ctx = hv::UserContext::save(vcpu)?;
     ctx.x[0] = 0;
     if spawn.stack != 0 {
@@ -1014,15 +1266,22 @@ fn spawn_thread<'scope, 'env>(vcpu: &Vcpu, sh: &'scope Shared<'env>, scope: &'sc
     if let Some(tls) = spawn.tls {
         ctx.tpidr = tls;
     }
-    let tid = sh.process.new_tid();
+    let tid = match &sh.table {
+        // Linux's tids share the pid space: the host's.
+        Some(table) => match table.new_tid(proc.abi.pid) {
+            Some(tid) => tid,
+            None => return Ok(-linux_abi::errno::EAGAIN),
+        },
+        None => proc.abi.new_tid(),
+    };
     let mut child = thread.spawn(tid);
     child.clear_child_tid = spawn.child_cleartid.unwrap_or(0);
     // Both are in the memory the threads share.
     for addr in [spawn.parent_tid, spawn.child_settid].into_iter().flatten() {
-        let _ = linux_abi::GuestMemory::write(sh.space, addr, &(tid as i32).to_le_bytes());
+        let _ = linux_abi::GuestMemory::write(space, addr, &(tid as i32).to_le_bytes());
     }
-    let task = Task::new(child);
-    sh.process.register_thread(&task.thread, task.location.waker());
+    let task = Task::new(child, proc.clone());
+    proc.abi.register_thread(&task.thread, task.location.waker());
     // The process is ending: the thread never runs.
     if !place(sh, scope, task, Start::Resume(Box::new(ctx))) {
         return Ok(-linux_abi::errno::EAGAIN);
@@ -1031,20 +1290,24 @@ fn spawn_thread<'scope, 'env>(vcpu: &Vcpu, sh: &'scope Shared<'env>, scope: &'sc
 }
 
 /// A task wants a CPU: queued, or on a new CPU started for it. False if the
-/// process is ending instead (the thread ends without running again).
-fn place<'scope, 'env>(sh: &'scope Shared<'env>, scope: &'scope Scope<'scope, 'env>, task: Task, start: Start) -> bool {
+/// host is ending instead (the thread ends without running again).
+fn place<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, task: Task, start: Start) -> bool {
     match sh.sched.add(task, start) {
         Placed::Queued => true,
         Placed::NewCpu(task, start) => {
+            // (Not holding the process: the CPU outlives its first task.)
+            let proc = Arc::downgrade(&task.proc);
             scope.spawn(move || {
-                if let Err(e) = run_cpu(sh, scope, (task, start), false) {
-                    sh.end(Err(e));
+                if let Err(e) = run_cpu(sh, scope, (task, start), false)
+                    && let Some(proc) = proc.upgrade()
+                {
+                    sh.end(&proc, Err(e));
                 }
             });
             true
         }
         Placed::Dropped(task) => {
-            sh.process.unregister_thread(task.thread.tid);
+            sh.thread_gone(&task.proc.clone(), task.thread.tid);
             false
         }
     }

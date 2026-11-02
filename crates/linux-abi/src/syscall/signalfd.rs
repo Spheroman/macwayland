@@ -170,6 +170,11 @@ pub(crate) fn signalfd_read(p: &Process, file: &OpenFile, signalfd: &SignalFd, b
     let kq = file.host.as_raw_fd();
     loop {
         let mask = signalfd.mask();
+        // The wakeups so far are taken before the signals are: one made
+        // pending from here on wakes the kqueue again (taken after, it
+        // could take the wakeup of a signal that came in between, and leave
+        // the signal there with nothing to say so).
+        kfd::drain(kq);
         let mut n = 0;
         {
             let mut s = p.signals();
@@ -181,7 +186,6 @@ pub(crate) fn signalfd_read(p: &Process, file: &OpenFile, signalfd: &SignalFd, b
                 n += SIGINFO_SIZE;
             }
             if n > 0 {
-                kfd::drain(kq);
                 if s.pending.any(mask) {
                     kfd::change(kq, kfd::user_event(0, libc::NOTE_TRIGGER))?;
                 }
@@ -189,11 +193,10 @@ pub(crate) fn signalfd_read(p: &Process, file: &OpenFile, signalfd: &SignalFd, b
             }
         }
         if kfd::nonblocking(file) {
-            kfd::drain(kq);
             return Err(errno::EAGAIN);
         }
         match kfd::wait(kq) {
-            Ok(()) => kfd::drain(kq),
+            Ok(()) => {}
             // A host signal ran its handler on this thread: one of ours (go
             // round and read it), or another (for the guest to handle).
             Err(e) if e == errno::EINTR => {

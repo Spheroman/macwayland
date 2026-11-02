@@ -71,7 +71,7 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     /// Make `pgrp` the foreground group of the terminal open as `host_fd`.
     fn tcsetpgrp(&self, p: &Process, host_fd: RawFd, pgrp: i64) -> Result<i64, i64>;
     /// A stop signal's default action: the process stops until continued.
-    fn stop(&self, p: &Process);
+    fn stop(&self, p: &Process, sig: u64);
     /// `getrusage(who)`: RUSAGE_SELF (0), RUSAGE_CHILDREN (-1), RUSAGE_THREAD
     /// (1), as Linux's `struct rusage`.
     fn rusage(&self, p: &Process, who: i64) -> Result<[u8; RUSAGE_SIZE], i64>;
@@ -166,7 +166,7 @@ impl Kernel for HostKernel {
         ok(unsafe { libc::tcsetpgrp(host_fd, pgrp as i32) } as i64).map(|_| 0)
     }
 
-    fn stop(&self, _p: &Process) {
+    fn stop(&self, _p: &Process, _sig: u64) {
         unsafe { libc::raise(libc::SIGSTOP) };
     }
 
