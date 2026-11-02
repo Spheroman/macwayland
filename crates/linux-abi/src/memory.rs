@@ -61,10 +61,10 @@ pub trait GuestMemory {
     /// return value as [`GuestMemory::mmap_anonymous`].
     fn mmap_shared(&self, addr_hint: u64, len: u64, prot: u64, flags: u64, host_fd: Option<RawFd>, offset: u64) -> i64;
 
-    /// Map a read-only private view of regular file `host_fd` from `offset`
-    /// (`mmap` with MAP_PRIVATE, no PROT_WRITE) without copying it: pages
-    /// come from the file as they're read, and the mapping becomes a private
-    /// copy if `mprotect` makes it writable. Same return value as
+    /// Map a private view of regular file `host_fd` from `offset` (`mmap`
+    /// with MAP_PRIVATE) without copying it: pages come from the file as
+    /// they're read, show its later changes until written, and become a
+    /// private copy when written, as on Linux. Same return value as
     /// [`GuestMemory::mmap_anonymous`]; -ENODEV if the memory can't, and the
     /// caller copies the file in instead.
     fn mmap_file(&self, _addr_hint: u64, _len: u64, _prot: u64, _flags: u64, _host_fd: RawFd, _offset: u64) -> i64 {

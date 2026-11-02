@@ -455,6 +455,18 @@ fn passfd() {
     assert!(out.status.success());
 }
 
+/// A private file mapping follows the file's later changes in the pages it
+/// hasn't written, as Wine's session object needs: see guest/privmap.c.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn private_file_mapping_sees_changes() {
+    let path = format!("{}/../../target/guest/privmap", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let out = macwl_run().arg(&path).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "privmap ok\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success());
+}
+
 /// Threads: mutexes and condition variables (futex), joins (CLEARTID), TLS,
 /// thread ids, a signal to one thread blocked in read(), 48 threads at once,
 /// fork and exec from a threaded process, exit() from a thread: see

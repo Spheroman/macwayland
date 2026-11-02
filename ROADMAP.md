@@ -124,7 +124,11 @@ from a static Linux binary.
    pages filled on first touch (64 KiB fault-around, ~5 µs per fault), TLB
    flushed via a return path in the vector page when mapped entries change.
    `brk`, anonymous `mmap` (hints, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`),
-   `munmap`, `mprotect`, and private file mappings (copied in).
+   `munmap`, `mprotect`, and private file mappings: read-only ones, and
+   writable ones of files open for writing, read through a window onto the
+   file (pages copied on first write, so unwritten pages follow the file, as
+   Wine's clients need for wineserver's session object); other writable ones
+   copied in.
    Shared mappings (`MAP_SHARED`, file or anonymous) are host `mmap`s placed
    in guest physical memory above the private pool (`crates/runtime/src/shared.rs`),
    so a host process mapping the same file — the compositor reading a `wl_shm`

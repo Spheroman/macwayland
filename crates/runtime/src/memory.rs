@@ -294,6 +294,12 @@ impl AddressSpace {
             return Ok(false);
         }
         let page = page_down(va);
+        if access == Access::Write && matches!(vma.backing, Backing::File { .. }) {
+            // The first write to a page of a private file mapping: from now
+            // on the page is this process's own copy, as on Linux.
+            self.privatize(page, page + PAGE_SIZE).map_err(|_| OutOfMemory)?;
+            return Ok(true);
+        }
         if self.user.lookup(&self.phys, page).is_some() {
             // Mapped and allowed, so the guest saw a stale TLB entry.
             self.tlb_stale = true;
@@ -317,7 +323,7 @@ impl AddressSpace {
             Some(pa) => pa,
             None => self.phys.alloc()?,
         };
-        self.user.map(&mut self.phys, page, pa, paging::user_attrs(vma.prot))?;
+        self.user.map(&mut self.phys, page, pa, page_attrs(vma))?;
         Ok(pa)
     }
 
@@ -341,6 +347,11 @@ impl AddressSpace {
                 return Err(Fault { addr: va });
             }
             let page = page_down(va);
+            if matches!(vma.backing, Backing::File { .. }) {
+                // Never write through to the file: copy the page first.
+                self.privatize(page, page + PAGE_SIZE)?;
+                continue;
+            }
             let pa = match (vma.shared_pa(start, page), self.user.lookup(&self.phys, page)) {
                 (Some(pa), _) | (None, Some(pa)) => pa,
                 (None, None) => self.populate(page, start, vma).map_err(|_| Fault { addr: va })?,
@@ -511,13 +522,15 @@ impl AddressSpace {
         }
     }
 
-    /// A private mapping of (read-only) file `host_fd` from `offset`, read
-    /// through a window until something makes it writable: no copy of what
-    /// may never be read (the most of a library, a font).
+    /// A private mapping of file `host_fd` from `offset`, read through a
+    /// window: no copy of what may never be read (the most of a library, a
+    /// font), and pages nobody has written show the file's later changes, as
+    /// on Linux. A page becomes a private copy when the guest first writes
+    /// it.
     pub fn mmap_file(&mut self, hint: u64, len: u64, p: u64, flags: u64, host_fd: RawFd, offset: u64) -> i64 {
         let Some(len) = page_up(len).filter(|&l| l > 0 && l <= USER_TOP) else { return -errno::ENOMEM };
         let p = p & (prot::READ | prot::WRITE | prot::EXEC);
-        if p & prot::WRITE != 0 || unsafe { libc::fcntl(host_fd, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_WRONLY {
+        if unsafe { libc::fcntl(host_fd, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_WRONLY {
             return -errno::EACCES;
         }
         let addr = match self.place(hint, len, flags) {
@@ -533,8 +546,8 @@ impl AddressSpace {
         }
     }
 
-    /// Make `[start, end)`, inside a [`Backing::File`] region, private frames
-    /// holding what the window shows.
+    /// Make `[start, end)`, inside one [`Backing::File`] region, private
+    /// frames holding what the window shows.
     fn privatize(&mut self, start: u64, end: u64) -> Result<(), Fault> {
         let (s, v) = self.vmas.find(start).expect("privatize outside a region");
         let ipa = v.shared_pa(s, start).expect("privatize of a region with no window");
@@ -596,24 +609,27 @@ impl AddressSpace {
                     return -errno::EACCES;
                 }
             }
-            // Private ones can: what's read through a window becomes a copy.
-            let files: Vec<(u64, u64)> = self
-                .vmas
-                .overlapping(addr, end)
-                .filter(|(_, v)| matches!(v.backing, Backing::File { .. }))
-                .map(|(s, v)| (s.max(addr), v.end.min(end)))
-                .collect();
-            for (s, e) in files {
-                if self.privatize(s, e).is_err() {
-                    return -errno::ENOMEM;
-                }
-            }
         }
         self.vmas.protect(addr, end, p);
-        if self.user.protect_range(&mut self.phys, addr, end, paging::user_attrs(p)) {
-            self.tlb_stale = true;
+        // Private file pages stay read-only in the page tables whatever the
+        // protection, so the first write faults and makes a copy.
+        let parts: Vec<(u64, u64, u64)> =
+            self.vmas.overlapping(addr, end).map(|(s, v)| (s.max(addr), v.end.min(end), page_attrs(v))).collect();
+        for (s, e, attrs) in parts {
+            if self.user.protect_range(&mut self.phys, s, e, attrs) {
+                self.tlb_stale = true;
+            }
         }
         0
+    }
+}
+
+/// Page-table attributes for a page of `vma`: its protection, except that
+/// pages read through a private file mapping's window are never writable.
+fn page_attrs(vma: Vma) -> u64 {
+    match vma.backing {
+        Backing::File { .. } => paging::user_attrs(vma.prot & !prot::WRITE),
+        _ => paging::user_attrs(vma.prot),
     }
 }
 
@@ -949,22 +965,24 @@ mod tests {
         }
 
         #[test]
-        fn private_file_mappings_copy_only_when_made_writable() {
+        fn private_file_mappings_copy_only_pages_written() {
             let f = pages(3);
             let file = File::open(f.path()).unwrap();
             let mut s = space();
             let flags = mm::MAP_PRIVATE;
-            assert_eq!(s.mmap_file(0, 0x3000, RW, flags, file.as_raw_fd(), 0), -errno::EACCES);
             let a = s.mmap_file(0, 0x2000, prot::READ, flags, file.as_raw_fd(), 0x1000) as u64;
             assert_eq!(read_byte(&s, a).unwrap(), b'b');
             assert_eq!(read_byte(&s, a + 0x1000).unwrap(), b'c');
             assert!(s.write(a, &[1]).is_err());
             assert!(s.regions().iter().all(|r| !r.shared), "private, for /proc/self/maps");
 
-            // Writable: the second page becomes a private copy; the file and
-            // the first page (still the window) are as they were.
+            // Writable: nothing is copied until a page is written, and then
+            // only that page; the file and the other page (still the
+            // window) are as they were.
             let before = s.frames_in_use();
-            assert_eq!(s.mprotect(a + 0x1000, 0x1000, RW), 0);
+            assert_eq!(s.mprotect(a, 0x2000, RW), 0);
+            assert_eq!(s.frames_in_use(), before);
+            assert_eq!(s.handle_fault(a + 0x1000, Access::Write), Ok(true));
             assert!(s.frames_in_use() > before);
             assert_eq!(read_byte(&s, a + 0x1000).unwrap(), b'c');
             s.write(a + 0x1000, b"mine").unwrap();
@@ -973,8 +991,10 @@ mod tests {
             assert_eq!(&buf, b"cccc");
             assert_eq!(read_byte(&s, a).unwrap(), b'b');
             assert_eq!(s.shared.ranges().len(), 1);
-            assert_eq!(s.mprotect(a, 0x1000, RW), 0);
+            s.write(a, b"also").unwrap();
             assert!(s.shared.ranges().is_empty(), "no longer read through");
+            let b = s.mmap_file(0, 0x1000, RW, flags, file.as_raw_fd(), 0);
+            assert!(b > 0, "a private mapping may be writable on a read-only fd");
         }
 
         #[test]
