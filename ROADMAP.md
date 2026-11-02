@@ -228,7 +228,12 @@ from a static Linux binary.
    pids, groups, sessions, `wait`, signals and job control are the host's
    own; Mac programs (item 13) become separate processes standing in for the
    Linux process that exec'd them. The 128-VM cap then counts sessions, not
-   processes.
+   processes. Decided (2026-11-02): a program can have a host of its own
+   and still be an ordinary child in the session (federated hosts, through
+   a per-user coordinator), pids are unique across hosts, scheduling is
+   hierarchical (session, process, thread), blocked threads wait in
+   kqueues rather than a host thread each, and `/proc` is accurate per
+   process, with `macwl-run --ps` on the Mac side.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
@@ -457,6 +462,9 @@ from a static Linux binary.
     guest processes (macwl-run ones, with their Linux names and argv rather
     than `macwl-run --fork-child`) or every Mac process too; and keeping
     `readdir` on `/proc` cheap enough for `top` refreshing every second.
+    With many processes in one VM (`docs/processes.md`, "Visibility") the
+    host's process table becomes the source instead, macOS's list only
+    filling in for Mac programs: the open questions go with it.
 
 ## Compositor and shell: remaining work
 

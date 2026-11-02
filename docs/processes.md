@@ -1,8 +1,37 @@
 # Processes in one VM: a host per session
 
-Status: design (2026-11-02). ROADMAP items 6 and 13; extends the thread
+Status: design (2026-11-02), open questions decided (2026-11-02, see
+"Decisions"). ROADMAP items 6 and 13; extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
+
+## Decisions
+
+The open questions were settled with one rule: **when one answer is more
+powerful but takes longer to build, take it.** So:
+
+- **Isolation: federated hosts** (section 1, "Federated hosts", step 9). One
+  host per session stays the default, with per-system-call containment. Any
+  program can also get a host of its own (`--new-host`, or a per-program
+  setting) and still be an ordinary child in the same Linux pid space:
+  `wait`, signals, process groups and job control work across hosts through
+  a per-user coordinator.
+- **pids are unique across all hosts**: hosts take pids in ranges handed out
+  per user (section 5, "pids").
+- **Fairness: hierarchical weighted fair scheduling**: Linux session
+  (autogroup), then process, then thread, each level weighted, in the EEVDF
+  design of `mn-threads.md` step 5 (section 4).
+- **Blocked tasks wait in kqueues**, not a host thread each, which removes
+  the `kern.num_taskthreads` cap (12288): step 3a, after step 3.
+- **Visibility: an accurate per-process `/proc`** (`stat`, `status`,
+  `statm`, `maps`, `fd`, `cmdline`, `environ`, `task/`) so `ps`, `top` and
+  `htop` work inside the session, **plus a Mac-side view**: `macwl-run --ps`
+  lists a host's processes over its control socket. Activity Monitor shows
+  one process per host, which is fine given those (section "Visibility").
+- **A host lives while it has processes or clients**, and exits shortly
+  after the last goes (section 1).
+- **Tty agent or `posix_spawn` with a controlling terminal**: still open,
+  settled by experiment at step 6.
 
 ## The problem
 
@@ -166,25 +195,28 @@ Three shapes were weighed:
 - **Hybrid**: a host fills up and spills into a new one; cross-host
   processes through a coordinator.
 
-Recommended: **one host per session**, and a separate host when asked for
-(`--new-host`), for isolation, never automatically. Against the others:
+Decided: **one host per session**, and a separate host when asked for
+(`--new-host`, or a per-program setting), for isolation, never
+automatically. A separate host is still part of the session's Linux process
+model (federated hosts, below), so isolation doesn't cost `wait`, signals or
+job control. Against a pool or spilling:
 
 - **Caps.** The 128-VM limit then counts sessions (and isolated apps), not
   processes. A host uses 18 vCPUs of the 64 a VM may have. Its fds share
   `kern.maxfilesperproc` (184320): a large session uses a few thousand
   (in-VM fork shares a description instead of duplicating it, see 8). Its
   host threads share `kern.num_taskthreads` (12288): 18 CPUs plus a worker
-  per blocked task; a session with thousands of blocked threads gets close,
-  which is a reason to block in kqueues instead of workers later (open
-  questions), not to spill. 1 TiB of IPA space holds the memory of any
+  per blocked task, until blocked tasks wait in kqueues instead (step 3a),
+  after which only calls with no readiness to wait for (`flock`, a slow
+  disk read) take a thread. 1 TiB of IPA space holds the memory of any
   session the Mac's RAM can. Nothing forces a second host, so there is
   nothing to spill.
-- **Spilling costs everything a host saves.** The coordinator would carry
-  pids, `wait`, signals to groups, `setpgid`, the controlling terminal and
-  job control between hosts: a distributed kernel, the problem one VM
-  removes. A fork into another host is today's fork (2.6 ms, a memory
+- **Spilling costs everything a host saves.** Processes that land in
+  another host by chance pay for crossing it on every fork, `wait` and
+  signal; a fork into another host is today's fork (2.6 ms, a memory
   snapshot), and processes sharing memory across hosts get no shared
-  futexes.
+  futexes. Federation (below) pays that only for programs that asked for a
+  host of their own, at their `execve`, where nothing is shared but fds.
 - **Fault isolation** is the cost of one host. Guest faults are already
   contained (they become the faulting process's signal). A runtime error
   that unwinds in a system call (a failed assertion, an `unwrap`) is caught
@@ -194,7 +226,97 @@ Recommended: **one host per session**, and a separate host when asked for
   contained (an abort, memory corruption, a Hypervisor.framework error)
   ends the host and the session with it, as with any VM: clients report it (exit status 128 + 9, with a message), and
   `session.sh` can start a new one. An app that brings the runtime down,
-  or that shouldn't share it, runs in a host of its own (`--new-host`).
+  or that shouldn't share it, runs in a host of its own (`--new-host`, or
+  its per-program setting), federated with the session's.
+
+### Federated hosts (step 9)
+
+A program can run in a host of its own and still be an ordinary process of
+the session: its parent `wait`s for it, signals reach it by pid and by
+group, it can be in its shell's job, its terminal is the session's. The
+pieces that make that work:
+
+- **Which programs.** `macwl-run --new-host PROGRAM` for one started from
+  outside; for one exec'd from inside, a per-program setting
+  (`~/.config/macwl/hosts`: an executable path or name per line, matched at
+  `execve`), or `MACWL_NEW_HOST=1` in the environment of the `execve`.
+  Firefox's launcher, say, so a browser crash in the runtime ends the
+  browser and not the session.
+- **The coordinator**: one per user (`macwl-run --coordinator`, a Unix
+  socket in `$TMPDIR/macwl-$UID/`), started by the first host that needs
+  it, exiting when no host is connected. It knows which host owns which
+  pid range, and which hosts have members of a process group or session
+  that spans hosts. It forwards; it holds no process state of its own.
+- **pids.** Hosts allocate pids from ranges (4096 pids) handed out by the
+  coordinator (section 5, "pids"), so a pid names one process across every
+  host, and the owner of any pid is a lookup of its range.
+- **Moving at `execve`.** An `execve` of a program set to have its own host
+  is where it moves: the host starts one (a fresh `macwl-run --host`, ~3 ms,
+  as a fork's spare is today), and sends it the exec: argv, environment,
+  cwd, root and binds, credentials, rlimits, umask, signal dispositions and
+  mask, the pid, parent, group and session, and the fds (`SCM_RIGHTS`; one
+  open file description each, as for a Mac program). The new host gives
+  the process its pid and claims it at the coordinator. The old host keeps
+  a **remote stand-in** in its table, as for a Mac program (7): pid, parent,
+  group, session, state. Fork never crosses hosts: only `execve` does, so
+  nothing shares memory across hosts.
+- **`wait` and SIGCHLD.** The stand-in is what the parent waits on: the
+  child's host reports exit, stop and continue (with status and rusage) to
+  the parent's host through the coordinator, which makes the stand-in a
+  zombie, stopped or running, and sends SIGCHLD, as for a Mac program's
+  stand-in. `wait4`, `waitid` and `WNOWAIT` then work as for any child.
+- **Signals.** `kill(pid)` looks up the pid's range: local, delivered in
+  memory; a stand-in, forwarded to the owning host (with the sender's pid
+  and uid for `siginfo`). `kill(-pgid)` signals the local members and, if
+  the group spans hosts (the coordinator says so), sends it to the
+  coordinator, which fans it out to the hosts with members. `kill(-1)`
+  goes to every host of the session.
+- **Process groups and sessions across hosts.** A group or session is owned
+  by the host of its leader. A process moving to another host stays in its
+  group: the group gets registered with the coordinator as spanning both,
+  and stops being so when the last remote member exits. `setpgid` on a
+  child in another host is a request to that host (EACCES as Linux, since
+  it has exec'd). `setsid` in the new host makes a session owned there.
+- **Terminals and job control.** A pty belongs to the host that opened it
+  (or the client's relay). A process in another host holds the slave as an
+  fd it was passed; the pty's owner keeps the foreground group, so
+  `tcsetpgrp` and the background check (SIGTTIN/SIGTTOU, EIO) of a remote
+  reader or writer ask the owner (through the coordinator; the answer is
+  cached with a generation number the owner bumps on `tcsetpgrp`).
+  Keyboard signals to the foreground group fan out as `kill(-pgid)` does.
+  Stopping and continuing a remote member parks and unparks it in its own
+  host.
+- **Orphans.** A process whose parent exits is reparented to its own host's
+  init (or a subreaper in its host), which reaps it; a stand-in whose
+  parent exits goes with it and the remote process is told it's now
+  init's. Linux allows any reaper; programs only see `getppid` change.
+- **A host's failure.** If a federated host dies, its processes end: the
+  coordinator tells the hosts with their stand-ins, which make them exit
+  with SIGKILL (as clients of a host that died do, 1). If the
+  coordinator dies, hosts carry on with their local processes, and
+  cross-host operations fail with ESRCH until a new one has been told
+  each host's ranges and spanning groups (they re-register).
+
+Steps 3 to 8 keep the way open, so step 9 adds rather than reworks:
+
+- pids come from a `PidAllocator` (step 3): a local range at first, the
+  coordinator's ranges later;
+- the process table's entries are a kind: local, Mac stand-in (step 6),
+  remote stand-in (step 9); `wait`, signals, groups and job control go
+  through one routing function (`deliver(pid or group, signal, sender)`)
+  that already distinguishes local from stand-in members;
+- ptys and groups are found by id in the table, not by pointer, so a
+  remote member is an id with an owner;
+- the client protocol (step 5) is the same wire format as the exec hand-off
+  above, so a host accepting a client already accepts a moved process.
+
+### The host's lifetime
+
+A host lives while it has Linux processes (daemons included) or connected
+clients, and exits a short grace period (2 s) after the last goes, so that
+a quick sequence of `macwl-run` invocations, or a restarted `session.sh`,
+reuses it rather than starting a new one. `--serve` hosts have the same
+rule once their first client has come.
 
 ### How a `macwl-run` finds its host
 
@@ -205,9 +327,9 @@ Recommended: **one host per session**, and a separate host when asked for
   terminal that sources the session's environment) share it.
 - Otherwise (or with `--new-host`): the `macwl-run` process **is** a host,
   for the program it was given and everything that program starts: today's
-  behaviour, with in-VM fork for the descendants. It ends when its first
-  process does and the others have gone (or, if they outlive it, when the
-  last does).
+  behaviour, with in-VM fork for the descendants. It exits with its first
+  process's status once that has ended and the others have gone (or, if
+  they outlive it, when the last does), as "The host's lifetime" says.
 
 A client, like `docker exec`, sends the host its argv, environment, working
 directory, root and binds, and either its fds 0–2 (over `SCM_RIGHTS`) or a
@@ -320,12 +442,18 @@ dynamic program ~6x, and no parent stall that grows with its size.
   processes (`TCR`, `SCTLR`, `VBAR`, `TTBR1` are the host's), so each CPU
   configures its vCPU once. A switch between processes costs what a switch
   between threads does (1.4 µs a round either way, measured).
-- **Fairness: per task**, host-wide, as Linux schedules threads without
-  cgroups. Step 5 of `mn-threads.md` (classes, EEVDF, wakeup preemption,
-  host QoS by priority) lands on the host's run queue, not a process's: do
-  step 3 here first, or build step 5 on a run queue that's already the
-  host's. Whether a session should weigh processes (Linux's autogroup) is
-  an open question.
+- **Fairness: hierarchical weighted fair scheduling** (decided). Three
+  levels, each EEVDF over weighted entities, as Linux's group scheduling
+  nests `sched_entity`s: the **Linux sessions** of the host (autogroup:
+  each `setsid` makes one, so a terminal's build doesn't starve another
+  terminal's editor), then the **processes** of a session, then the
+  **threads** of a process. A level's weight is its nice value's (Linux's
+  table; a session's from its autogroup nice, `/proc/<pid>/autogroup`), and
+  a thread's slice of the CPU is its share of its process's share of its
+  session's. Real-time and idle classes stay flat and outside the
+  hierarchy, as on Linux. This is `mn-threads.md` step 5's EEVDF with
+  group entities: it lands on the host's run queue, not a process's, so
+  step 5 there is built after step 3 here.
 - **18 CPUs for the session**, not 18 for each process: a session can't
   oversubscribe the Mac's cores any more (today N busy processes run up to
   18 N host threads). A busy background app now shares the session's 18
@@ -346,7 +474,7 @@ it only as the stand-ins for clients' and Mac programs' Linux processes.
 
 | | Today | One VM |
 |---|---|---|
-| pid, tid | the host's pid; tids made up from it | from one allocator, from 100000 up (above macOS's 99999): a Linux pid handed to a Mac program can never name a Mac process |
+| pid, tid | the host's pid; tids made up from it | from the host's `PidAllocator`, 100000 and up (above macOS's 99999): a Linux pid handed to a Mac program can never name a Mac process; unique across hosts (below) |
 | pid 1 | the Mac's launchd | the host's init: orphans are reparented to it (or to a `PR_SET_CHILD_SUBREAPER`), it reaps them; it gets no signals |
 | `getppid` | host `getppid` | the table (1 for a client's process) |
 | `setpgid`, `setsid`, `getpgid`, `getsid` | host calls, a control-socket round trip for children (they have exec'd as far as macOS knows) | the table, Linux's rules: EACCES once a child has exec'd, EPERM across sessions |
@@ -355,6 +483,20 @@ it only as the stand-ins for clients' and Mac programs' Linux processes.
 | `kill`, `tgkill` to others | host `kill`, number translated | in memory, with sender pid and uid in `siginfo` (item 7's gap); `kill(-1)` now possible (every process of the session but init and the caller); to a Mac stand-in, host `kill` of its Mac process |
 | Default actions | the host's own (dispositions mirrored onto host `sigaction`) | emulated: terminate ends the process, stop parks it (4), continue resumes |
 | `SO_PEERCRED` | the peer Mac process's | the peer's Linux pid, recorded when the connection is made, if both ends are in the host |
+
+### pids
+
+Unique across every host of the user (decided), so a pid in a shared
+`/tmp` pidfile, a lock file or a D-Bus message names one process, and
+federated hosts (step 9) can route by pid. A host takes pids in **ranges of
+4096**, from 100000 up to Linux's `pid_max` (4194304; nothing seen so far
+minds pids that large, and Linux hands them out on big machines), and asks
+for another range when one runs out. Until the coordinator exists (step
+9), ranges are handed out through a per-user file (`$TMPDIR/macwl-$UID/pids`,
+under `flock`) that records each range's owner by Mac pid; a range whose
+owner is gone is free again. From step 9 the coordinator hands them out
+from the same file, and knows which host owns which pid. Within a range, a
+pid isn't reused until the range has wrapped, as Linux avoids quick reuse.
 
 Signals from the Mac reach the host as host signals for the host itself
 (SIGTERM: end the session; SIGCHLD: a Mac child changed state); none is
@@ -468,7 +610,7 @@ struct Host {
     asids: AsidAllocator,
     sched: Sched,                     // run queue, CPUs, workers (mn-threads.md), host-wide
     procs: Mutex<ProcessTable>,       // pid -> Arc<Proc>; groups; sessions; ttys
-    pids: PidAllocator,               // pids and tids, 100000 up
+    pids: PidAllocator,               // pids and tids: ranges unique across hosts
     reaper: MacChildren,              // Mac programs (stand-ins) and tty agents
     clients: Listener,                // MACWL_HOST socket
 }
@@ -523,7 +665,37 @@ state transfer is now; fds go with `SCM_RIGHTS`.
   process itself; the stand-in carries its Linux identity.
 - **Activity Monitor** shows the session as one process (its CPU and memory
   are the session's), instead of a `macwl-run` per Linux process; Linux
-  `ps` and `top` see every process (`/proc` from the table).
+  `ps` and `top` see every process (`/proc` from the table), and the Mac
+  side has `macwl-run --ps` (below).
+
+## Visibility
+
+Decided: accurate per-process `/proc` inside the session, and a Mac-side
+listing; Activity Monitor's one process per host is fine given those.
+
+- **`/proc/<pid>`** for every process of the host, from the table and the
+  scheduler, not from macOS: `stat` (state, parent, group, session, tty,
+  flags, utime/stime from the scheduler's accounting, nice and priority,
+  thread count, start time in clock ticks since the host's boot time,
+  vsize and RSS from the address space's accounting), `status` (the same,
+  named, plus `Umask`, signal masks, `Threads`, `VmRSS`, `VmSize`), `statm`,
+  `maps` (the VMAs, with files), `fd/` and `fdinfo/`, `cmdline`, `environ`
+  (read from the process's memory, as Linux does, at the addresses the
+  loader recorded), `comm`, `exe`, `cwd`, `task/<tid>/` for each thread,
+  and `autogroup`. The system-wide files `ps` and `top` need too:
+  `/proc/stat` (CPU time per CPU from the host's CPUs, boot time,
+  `processes`, `procs_running`), `/proc/loadavg`, `/proc/uptime`,
+  `/proc/meminfo`. Readdir of `/proc` lists the table's pids. Stand-ins
+  (Mac programs, remote ones) appear with what the table knows (state,
+  identity, `cmdline`) and their Mac process's CPU and memory where macOS
+  tells it (`proc_pidinfo`).
+- **`macwl-run --ps [--host PATH]`** on the Mac: asks a host over its
+  control socket (the client socket, step 5) for its processes and prints
+  pid, parent, group, session, tty, state, CPU time, RSS and command line,
+  as `ps -ef` would inside; `--ps --all` asks every host the coordinator
+  knows (step 9).
+- ROADMAP item 15 (`/proc` from the macOS process list) becomes this from
+  step 3: the table is the truth; macOS's list only fills in stand-ins.
 
 ## Steps
 
@@ -542,7 +714,9 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    tests, the runtime's tests, `switch_cost` (cross-process rows), exec
    cost (`forkbench exec`) no slower.
 3. **Processes in the host, behind `MACWL_ONE_VM=1`.** The process table,
-   pids from 100000, init; the host's run queue and CPUs with `TTBR0`
+   pids from the `PidAllocator` (ranges from the per-user pids file, so
+   unique across hosts from the start), init, `/proc/<pid>` from the table
+   (Visibility); the host's run queue and CPUs with `TTBR0`
    switches; fork as copy on write, vfork sharing the space; exit, zombies,
    `wait4`/`waitid`, SIGCHLD; `kill`, groups, sessions, stops, all in
    memory; Mac programs refused (ENOEXEC) and processes with a controlling
@@ -551,7 +725,28 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    `procstress` with 500 processes alive at once (more than 128), and Wine
    (wineserver and its clients, no terminal needed) in one VM. Tests:
    `processes`, `signals` (non-interactive parts), `procstress`,
-   `manythreads` and `threads` with several processes, under the flag.
+   `manythreads` and `threads` with several processes, under the flag;
+   `ps -ef`, `top -b -n 1` and `htop` (by hand) inside a session.
+
+   3a. **Blocked tasks wait in kqueues** (decided), so a host's blocked
+   threads cost no host thread each and `kern.num_taskthreads` no longer
+   caps them. A call that would block on readiness (`read`, `write`,
+   `recv*`, `send*`, `accept`, `connect`, `ppoll`, `pselect6`,
+   `epoll_wait`, eventfd/timerfd/signalfd/inotify reads) parks its task with
+   a one-shot registration on a host-wide kqueue (`EVFILT_READ`/`WRITE` on
+   its host fds, `EVFILT_TIMER` for its timeout, `EVFILT_USER` for a signal
+   or the process ending); a few waiter threads run `kevent` and make
+   parked tasks runnable, and the call is made again on a CPU, where it
+   now won't block (or times out, or returns EINTR). Futex waits, `wait4`,
+   `waitid`, `rt_sigsuspend`, `rt_sigtimedwait` and sleeps are in the host's
+   memory once step 3 has the process table: they park with no kqueue at
+   all, woken by the wake, the child's exit, the signal, or a timer.
+   Workers remain only for calls with nothing to wait on (`flock`,
+   `F_SETLKW`, `openat` of a FIFO, file I/O on a slow disk), bounded by a
+   pool. Tests: 20000 threads blocked in `read` on pipes and in futex waits
+   in one host (more than `kern.num_taskthreads`), woken in turn; the
+   latency benchmark no slower (a wakeup is a `kevent` return and a queue
+   push, against a worker's condvar hand-off).
 4. **Terminals and job control.** Ptys' sessions and foreground groups,
    keyboard signals on master writes, SIGTTIN/SIGTTOU, SIGHUP on hangup,
    stops parked; the relay for a host started in a Mac terminal. Tests: bash
@@ -562,14 +757,20 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    starts one host. Tests: a client's exit code and signal status; `kill
    -TERM`/`-INT` of a client from the Mac reaching its Linux process; a
    client killed with SIGKILL hanging its process up; two clients in one
-   host seeing each other's processes in `/proc`.
+   host seeing each other's processes in `/proc`; `macwl-run --ps`; the
+   host exiting 2 s after its last process and client go, and staying for
+   a daemon.
 6. **Mac programs as stand-ins.** Spawn first, the reaper, signals, tty
    agents, Mac groups following Linux ones. Tests: item 13's list
    (scripted where it was by hand: Mac `uname`, `false`, `env`, mixed
    pipes, exit codes and signals through `wait`, fds by number, cwd, Ctrl-Z
    on Mac `sleep`, a `sleep | tr` pipeline and `vim` in foot, `bg`/`fg`,
    Ctrl-C, `git log` through `less`, 20 `posix_spawn`s in a row, a Mac
-   binary that fails to exec now failing `execve` with its errno). Then
+   binary that fails to exec now failing `execve` with its errno). Whether
+   a tty agent is needed, or `posix_spawn` can give a Mac program its
+   controlling terminal itself (`POSIX_SPAWN_SETSID` and opening the slave
+   first in the child's file actions), is settled here by trying both
+   against that list (still open, see Open questions). Then
    **one VM becomes the default**; `MACWL_ONE_VM=0` keeps 1:1 for a release.
 7. **Shared windows and futexes across processes.** Windows deduplicated by
    object and range, private file windows shared, non-private futexes keyed
@@ -579,6 +780,18 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    a `macwl-run` without `MACWL_HOST`) is the isolated mode, so `fork.rs`'s
    spares, Mach memory entries and control sockets, and `exec_host`'s
    `SETEXEC` path, are deleted.
+9. **Federated hosts** (section 1). The coordinator (pid ranges moved into
+   it, the directory of ranges and spanning groups), `--new-host` and the
+   per-program setting, moving at `execve` with remote stand-ins, `wait`
+   and SIGCHLD across hosts, signals by pid and group, groups and sessions
+   spanning hosts, terminals and job control with remote members, orphans,
+   a host's failure. Tests: bash in foot running a program set to its own
+   host: `wait`, exit status and killed-by-signal status; Ctrl-C, Ctrl-Z,
+   `bg`, `fg` with it in the foreground job alongside local processes (a
+   pipeline across hosts); `kill -TERM -$pgid` reaching both hosts;
+   `ps -ef` in either host listing both (`/proc` asks the coordinator for
+   remote pids); a federated host killed with SIGKILL: its processes reaped
+   as killed in the session; `macwl-run --ps --all`.
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's
@@ -615,28 +828,16 @@ processes.
 
 ## Open questions
 
-- **Fault containment**: is `catch_unwind` per call enough, or should some
-  apps (a browser) get a host of their own by default (`--new-host` in their
-  launcher)?
-- **pids across hosts**: hosts are separate pid spaces. Should their pids
-  also be unique across hosts (a random starting point per host, or a
-  shared counter), so a pid in a shared `/tmp` pidfile can't name another
-  host's process? Do any programs choke on pids above 100000?
-- **Fairness between processes**: per task (Linux without cgroups), or
-  per session/process weights (autogroup)?
-- **Blocked tasks**: a worker host thread each, as now, caps a host at
-  ~12000 blocked threads (`kern.num_taskthreads`). Waiting for fds in a
-  kqueue instead of a thread would lift it; when does a real session need
-  that?
+Decided (see "Decisions"): fault containment (per-call containment, and
+federated hosts for apps that want their own), pids across hosts (unique,
+by ranges), fairness (hierarchical), blocked tasks (kqueues, step 3a),
+Activity Monitor (`/proc` and `macwl-run --ps`), the host's lifetime (while
+it has processes or clients). Still open:
+
 - **Mac programs and the controlling terminal**: can `posix_spawn` give one
   its terminal (`POSIX_SPAWN_SETSID` and opening the slave), or is the tty
   agent required? Its launch costs ~2–3 ms, once per terminal session that
-  runs a Mac program.
-- **Activity Monitor**: the session is one process there. Should the host
-  report per-Linux-process CPU and memory somewhere the Mac can show (a
-  `ps`-like tool, or the shell's UI)?
+  runs a Mac program. Settled by experiment at step 6.
 - **Memory pressure**: macOS's memory pressure handling sees one large
   process; the host's own out-of-memory policy (step 3) decides which Linux
   process goes.
-- **The host's lifetime**: should a session's host outlive its last client
-  (a daemon left running), and for how long?

@@ -340,6 +340,15 @@ signal) must reach workers too, so workers get a table of their own.
    ring; it and `threads` pass at 18, 2 and 1 CPUs, also run 8 at a time.
 5. **The scheduler proper**: classes, EEVDF, wakeup preemption, RT
    throttling, affinity; the priority system calls; host QoS by priority.
+   Built on the host's run queue once processes share one VM
+   (`docs/processes.md`, step 3), and **hierarchical** (decided there,
+   2026-11-02): the fair class is EEVDF over weighted group entities,
+   Linux session (autogroup) then process then thread, as Linux nests
+   `sched_entity`s for group scheduling, so that a busy process or terminal
+   gets its share and not one per thread. Real-time and idle tasks stay
+   flat. The tests below then also check shares between processes (two
+   processes, one with 8 spinning threads and one with 1: ~1:1, not 8:1)
+   and between sessions.
 6. **Firefox**, and whatever it hits next.
 
 ## Tests
