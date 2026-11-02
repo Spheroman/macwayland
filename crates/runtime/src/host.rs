@@ -1046,22 +1046,19 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
                 table.reap(&mut s, c);
             }
         }
-        if ppid == 1 {
+        let parent = if ppid == 1 { None } else { s.procs.get(&ppid).and_then(local_of) };
+        // Reaped at once by init, or by a parent that doesn't care (SIGCHLD
+        // ignored, SA_NOCLDWAIT): decided before the table is let go, or the
+        // parent's `wait` could find it a zombie in between and report it.
+        if parent.as_ref().is_none_or(|p| p.abi.child_policy().0) {
             table.reap(&mut s, pid);
-            (None, 0)
-        } else {
-            (s.procs.get(&ppid).and_then(local_of), exit_signal)
         }
+        (parent, exit_signal)
     };
     if let Some(parent) = parent {
-        let (reaps, _) = parent.abi.child_policy();
         let waiters = {
             let mut s = table.state();
-            let ppid = parent.abi.pid;
-            if reaps && s.procs.get(&pid).is_some_and(|e| e.ppid == ppid) {
-                table.reap(&mut s, pid);
-            }
-            s.procs.get_mut(&ppid).map(|p| std::mem::take(&mut p.waiters)).unwrap_or_default()
+            s.procs.get_mut(&parent.abi.pid).map(|p| std::mem::take(&mut p.waiters)).unwrap_or_default()
         };
         for w in waiters {
             w.wake();
