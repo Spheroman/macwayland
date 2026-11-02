@@ -25,7 +25,7 @@ use std::{
     os::fd::AsRawFd,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, Weak,
     },
 };
@@ -38,7 +38,7 @@ use linux_abi::{
 
 use crate::{
     cputime::Times,
-    flush_tlb_now, hv, load, memory::{Machine, Space}, place, run_cpu, sched::{self, Sched, Start, Task}, signal, Error, Exit, Host, Proc,
+    flush_tlb_now, hv, load, memory::{Machine, Space}, place, run_cpu, sched::{Sched, Start, Task}, signal, Error, Exit, Host, Proc,
     Scope,
 };
 
@@ -201,11 +201,10 @@ impl PidAllocator for RangePids {
 pub(crate) struct Table {
     state: Mutex<State>,
     pids: Box<dyn PidAllocator>,
-    /// Tasks let run again by a call that can't place them itself (a
-    /// SIGCONT, a vfork child's exec or exit), for the next CPU or worker
-    /// to put on the run queue ([`place_ready`]).
-    ready: Mutex<Vec<(Task, Start)>>,
-    any_ready: AtomicBool,
+    /// The host's parked tasks, and where tasks let run again by a call
+    /// that can't place them itself (a SIGCONT, a vfork child's exec or
+    /// exit) go, for the next CPU, worker or waiter to put on the run queue.
+    parking: Arc<crate::park::Parking>,
     /// The process `macwl-run` was given: the host's exit status is its.
     first: i64,
     first_exit: Mutex<Option<Result<Exit, Error>>>,
@@ -327,12 +326,11 @@ enum Which {
 }
 
 impl Table {
-    fn new(pids: Box<dyn PidAllocator>, first: i64) -> Table {
+    fn new(pids: Box<dyn PidAllocator>, first: i64, parking: Arc<crate::park::Parking>) -> Table {
         Table {
             state: Mutex::new(State { procs: BTreeMap::new(), tids: HashMap::new() }),
             pids,
-            ready: Mutex::default(),
-            any_ready: AtomicBool::new(false),
+            parking,
             first,
             first_exit: Mutex::new(None),
             live: AtomicUsize::new(0),
@@ -524,11 +522,7 @@ impl Table {
     }
 
     fn make_ready(&self, tasks: Vec<(Task, Start)>) {
-        if tasks.is_empty() {
-            return;
-        }
-        self.ready.lock().unwrap_or_else(|e| e.into_inner()).extend(tasks);
-        self.any_ready.store(true, Ordering::Release);
+        self.parking.make_ready(tasks);
     }
 
     /// Wait (thread `t` of `p`) for a child in `which` to change as `want`
@@ -592,12 +586,13 @@ impl Table {
                     me.waiters.push(t.waker.clone());
                 }
             }
-            // As any blocking call: a signal to act on, the process ending,
-            // or the CPU wanted for another task ends the wait.
-            if p.signal_ready(t) || p.exiting() || sched::evicting() {
+            // As any blocking call: a signal to act on, or the process
+            // ending, ends the wait; the CPU wanted for another task parks
+            // it (woken by the child's change, the call is made again).
+            if p.signal_ready(t) || p.exiting() {
                 return Err(errno::EINTR);
             }
-            t.waker.sleep(None);
+            linux_abi::syscall::wait_woken(t, None)?;
         }
     }
 
@@ -916,7 +911,9 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     signal::install_interrupt();
     let pids = RangePids::new()?;
     let pid = pids.alloc().ok_or_else(|| Error::Unexpected("no pid".into()))?;
-    let table = Arc::new(Table::new(Box::new(pids), pid));
+    let sched = Arc::new(Sched::new());
+    let parking = crate::park::Parking::new(sched.clone())?;
+    let table = Arc::new(Table::new(Box::new(pids), pid, parking.clone()));
     process.pid = pid;
     process.set_kernel(Arc::new(TableKernel(Arc::downgrade(&table))));
     // Each process's umask is applied as it creates files; the host's own
@@ -940,11 +937,12 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     // A process `macwl-run` starts is init's child, and leads a group and
     // session of its own.
     table.insert(pid, 1, pid, pid, proc.clone(), SIGCHLD);
-    let host = Host { vm: &vm, machine: &machine, sched: Sched::new(), table: Some(table.clone()), exec_host: Mutex::new(None) };
+    let host = Host { vm: &vm, machine: &machine, sched, parking, table: Some(table.clone()), exec_host: Mutex::new(None) };
     std::thread::scope(|scope| {
         scope.spawn(|| host.sched.ticker());
+        crate::park::run_waiters(&host, scope);
         let task = Task::new(thread, proc.clone());
-        proc.abi.register_thread(&task.thread, task.location.waker());
+        host.register(&task);
         // Only its tasks and the table hold it from now on, so that it goes
         // (and its files close) when it ends.
         drop(proc);
@@ -953,6 +951,7 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
             host.sched.stop();
         }
     });
+    drop(host.parking.take_all());
     let exit = table.first_exit.lock().unwrap_or_else(|e| e.into_inner()).take();
     unsafe { libc::umask(old_umask) };
     exit.unwrap_or(Ok(Exit::Code(0)))
@@ -1054,7 +1053,7 @@ pub(crate) fn fork<'scope, 'env>(
         ctx.tpidr = tls;
     }
     let task = Task::new(child_thread, child.clone());
-    child.abi.register_thread(&task.thread, task.location.waker());
+    sh.register(&task);
     drop(child);
     place(sh, scope, task, Start::Resume(Box::new(ctx)));
     Ok(Ok(pid))
@@ -1104,17 +1103,6 @@ pub(crate) fn vfork_done(sh: &Host, proc: &Proc) {
             table.make_ready(vec![(task, start)]);
         }
         None => parked.released.push(child),
-    }
-}
-
-/// Put the tasks let run again by kernel calls on the run queue.
-pub(crate) fn place_ready<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, table: &Table) {
-    if !table.any_ready.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    let ready = std::mem::take(&mut *table.ready.lock().unwrap_or_else(|e| e.into_inner()));
-    for (task, start) in ready {
-        place(sh, scope, task, start);
     }
 }
 

@@ -21,6 +21,7 @@ const MAX_FD: u64 = 1024;
 /// Read from `fd` into `data`, at `off` or (None) the file position.
 fn read_host(p: &Process, t: &Thread, fd: u64, data: &mut [u8], off: Option<u64>) -> Result<i64, i64> {
     let entry = p.fds.get(fd)?;
+    crate::fs::hold(&entry);
     match &entry.kind {
         FileKind::EventFd(state) => return kfd::eventfd_read(p, t, &entry, state, data),
         FileKind::TimerFd(timer) => return kfd::timerfd_read(p, t, &entry, timer, data),
@@ -475,7 +476,7 @@ pub(super) fn pselect6<M: GuestMemory + ?Sized>(p: &Process, t: &mut super::Thre
             fds.push(fd);
         }
     }
-    let deadline = poll_deadline(mem, timeout)?;
+    let deadline = t.deadline(poll_deadline(mem, timeout)?);
     if sigmask != 0 {
         let mask_ptr: u64 = mem.read_pod(sigmask)?;
         if mask_ptr != 0 {
@@ -563,7 +564,7 @@ pub(super) fn ppoll<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &
             libc::pollfd { fd, events: events & !POLLRDHUP, revents: 0 }
         })
         .collect();
-    let deadline = poll_deadline(mem, timeout)?;
+    let deadline = t.deadline(poll_deadline(mem, timeout)?);
     if sigmask != 0 {
         super::signal::wait_with_mask(t, mem.read_pod::<u64>(sigmask)?);
     }

@@ -267,9 +267,54 @@ pub(super) fn bind<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, addr:
     Ok(0)
 }
 
-pub(super) fn connect<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, addr: u64, len: u64) -> Result<i64, i64> {
-    let host = addr_to_host(p, mem, addr, len)?;
-    ok(unsafe { libc::connect(p.fds.host(fd)?, host.as_ptr().cast(), host.len() as u32) } as i64).map(|_| 0)
+/// `connect`. A connection that takes time (TCP) isn't waited for in the
+/// host's `connect`: the socket connects nonblocking, and the call waits for
+/// it to become writable as any wait does (`block`: where no wake is missed,
+/// or parked), then reads how it went. Made again after a parked wait, it
+/// carries on with the connection under way.
+pub(super) fn connect<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, addr: u64, len: u64) -> Result<i64, i64> {
+    let target = addr_to_host(p, mem, addr, len)?;
+    let file = p.fds.get(fd)?;
+    let host = p.fds.host(fd)?;
+    if !t.retrying() {
+        let flags = unsafe { libc::fcntl(host, libc::F_GETFL) };
+        let guest_nonblock = flags >= 0 && flags & libc::O_NONBLOCK != 0;
+        if !guest_nonblock {
+            unsafe { libc::fcntl(host, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        let r = unsafe { libc::connect(host, target.as_ptr().cast(), target.len() as u32) };
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if !guest_nonblock {
+            unsafe { libc::fcntl(host, libc::F_SETFL, flags) };
+        }
+        if r == 0 {
+            return Ok(0);
+        }
+        if e != libc::EINPROGRESS || guest_nonblock {
+            return Err(errno::from_darwin(e));
+        }
+    }
+    let mut waited = false;
+    loop {
+        // How it went, once it has: an error, or connected.
+        let mut err: libc::c_int = 0;
+        let mut elen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe { libc::getsockopt(host, libc::SOL_SOCKET, libc::SO_ERROR, (&raw mut err).cast(), &mut elen) } == 0 && err != 0 {
+            return Err(errno::from_darwin(err));
+        }
+        let mut peer = [0u8; SOCKADDR_MAX];
+        let mut plen = peer.len() as u32;
+        if unsafe { libc::getpeername(host, peer.as_mut_ptr().cast(), &mut plen) } == 0 {
+            return Ok(0);
+        }
+        if waited {
+            // Writable, yet neither connected nor failing: it was refused.
+            return Err(errno::ECONNREFUSED);
+        }
+        waited = true;
+        // Interrupted: EINTR, the connection carrying on, as on Linux.
+        block::ready(p, t, &file, libc::POLLOUT)?;
+    }
 }
 
 pub(super) fn accept4<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, addr: u64, len_ptr: u64, flags: u64) -> Result<i64, i64> {
@@ -278,7 +323,7 @@ pub(super) fn accept4<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M,
     }
     let mut buf = [0u8; SOCKADDR_MAX];
     let mut len = buf.len() as u32;
-    block::ready(p, t, &*p.fds.get(fd)?, libc::POLLIN)?;
+    block::ready(p, t, &p.fds.get(fd)?, libc::POLLIN)?;
     let host = ok(unsafe { libc::accept(p.fds.host(fd)?, buf.as_mut_ptr().cast(), &mut len) } as i64)? as i32;
     let n = install(p, unsafe { OwnedFd::from_raw_fd(host) }, flags)?;
     let guest = addr_to_guest(p, &buf[..len as usize]);
@@ -341,7 +386,7 @@ pub(super) fn sendto<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, 
     let (ap, al) = host_addr.as_ref().map_or((std::ptr::null(), 0), |a| (a.as_ptr(), a.len() as u32));
     let host = p.fds.host(fd)?;
     if flags & MSG_DONTWAIT == 0 {
-        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLOUT)?;
+        block::ready(p, t, &p.fds.get(fd)?, libc::POLLOUT)?;
     }
     send_waiting(host, flags & MSG_DONTWAIT != 0, || unsafe { libc::sendto(host, data.as_ptr().cast(), data.len(), msg_flags_to_host(flags), ap.cast(), al) })
 }
@@ -351,7 +396,7 @@ pub(super) fn recvfrom<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M
     let mut abuf = [0u8; SOCKADDR_MAX];
     let mut alen = abuf.len() as u32;
     if flags & MSG_DONTWAIT == 0 {
-        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLIN)?;
+        block::ready(p, t, &p.fds.get(fd)?, libc::POLLIN)?;
     }
     let n = ok(unsafe {
         libc::recvfrom(p.fds.host(fd)?, data.as_mut_ptr().cast(), data.len(), msg_flags_to_host(flags), abuf.as_mut_ptr().cast(), &mut alen)
@@ -561,7 +606,7 @@ pub(super) fn sendmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M,
     }
     let host = p.fds.host(fd)?;
     if flags & MSG_DONTWAIT == 0 {
-        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLOUT)?;
+        block::ready(p, t, &p.fds.get(fd)?, libc::POLLOUT)?;
     }
     let n = send_waiting(host, flags & MSG_DONTWAIT != 0, || unsafe { libc::sendmsg(host, &hdr, msg_flags_to_host(flags)) })?;
     if let Some(r) = receipt {
@@ -631,7 +676,7 @@ pub(super) fn recvmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M,
     hdr.msg_control = control.as_mut_ptr().cast();
     hdr.msg_controllen = host_space;
     if flags & MSG_DONTWAIT == 0 {
-        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLIN)?;
+        block::ready(p, t, &p.fds.get(fd)?, libc::POLLIN)?;
     }
     let n = ok(unsafe { libc::recvmsg(p.fds.host(fd)?, &mut hdr, msg_flags_to_host(flags)) } as i64)?;
 

@@ -199,8 +199,10 @@ pub(crate) fn remove_vcpu(slot: usize) {
 
 /// Called from host signal handlers: make every vCPU exit (if running, at
 /// once; if not, its next run returns straight away), so each thread looks
-/// at the signal.
+/// at the signal; and have the host's waiters wake the threads off their
+/// CPUs (parked, or blocked in a host call on another thread).
 fn kick() {
+    crate::park::host_signal_arrived();
     for slot in &VCPUS {
         let id = slot.load(Ordering::Acquire);
         if id != u64::MAX {

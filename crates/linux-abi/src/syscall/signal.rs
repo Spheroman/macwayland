@@ -114,11 +114,6 @@ impl Inbox {
         }
     }
 
-    /// Whether a timer's signal is waiting to be taken in.
-    pub(super) fn any_fired(&self) -> bool {
-        !self.fired.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
-    }
-
     /// Take the host signals caught for this inbox (bit n-1 for Linux
     /// signal n).
     pub fn take_host_pending(&self) -> u64 {
@@ -361,6 +356,14 @@ pub struct ThreadSignals {
 }
 
 impl ThreadSignals {
+    /// A wait with a mask of its own (`rt_sigsuspend`, `ppoll`...) parks
+    /// rather than end: the thread's own mask is back until it's made again.
+    pub(super) fn end_wait_mask(&mut self) {
+        if let Some(mask) = self.suspend_saved.take() {
+            self.blocked = mask;
+        }
+    }
+
     /// A new thread's: its creator's mask, no alternate stack, nothing pending.
     pub(super) fn spawned(&self) -> Self {
         ThreadSignals { blocked: self.blocked, ..Default::default() }
@@ -958,13 +961,15 @@ pub(super) fn rt_sigsuspend<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread
     loop {
         let ready = {
             let mut s = p.signals();
-            p.take_external(&mut s, ts, tid);
-            (s.pending.bits | ts.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !ts.blocked & !p.ignoring(&s)
+            p.take_external(&mut s, &t.signals, tid);
+            (s.pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !t.signals.blocked & !p.ignoring(&s)
         };
-        if ready != 0 {
+        if ready != 0 || p.exiting() {
             return Err(errno::EINTR);
         }
-        wait_for_host_signal(&p.inbox);
+        // Whoever sends the thread a signal wakes it (a host signal too:
+        // the core wakes the threads it's for).
+        super::block::wait_woken(t, None)?;
     }
 }
 
@@ -984,52 +989,6 @@ pub(super) fn rt_sigpending<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, me
     let bits = p.signals().pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits | p.inbox.host_pending.load(Ordering::Acquire);
     mem.write_pod(set, &bits)?;
     Ok(0)
-}
-
-/// Sleep until a host signal arrives (handled ones mark themselves in the
-/// process's `inbox`; others act on the host process directly). Returns at
-/// once if one already has.
-pub(super) fn wait_for_host_signal(inbox: &Inbox) {
-    wait_for_host_signal_until(inbox, None);
-}
-
-/// [`wait_for_host_signal`], giving up at `deadline`. An expired timer counts
-/// as a signal arriving (it interrupts the sleep).
-fn wait_for_host_signal_until(inbox: &Inbox, deadline: Option<std::time::Instant>) {
-    unsafe {
-        // Block everything first, so a signal arriving between the check and
-        // the sleep isn't lost: sigsuspend unblocks atomically.
-        let (mut all, mut old): (libc::sigset_t, libc::sigset_t) = (0, 0);
-        libc::sigfillset(&mut all);
-        libc::sigprocmask(libc::SIG_BLOCK, &all, &mut old);
-        if inbox.host_pending.load(Ordering::Acquire) == 0 && !inbox.any_fired() {
-            match deadline {
-                None => {
-                    libc::sigsuspend(&old);
-                }
-                // Where signals are in memory (many processes in a host),
-                // whoever sends one interrupts this thread itself: a timed
-                // sigsuspend, pselect with no files, sets the mask and
-                // sleeps in one step (Darwin's pselect is a system call),
-                // so one arriving between the look and the sleep ends it.
-                Some(d) if !inbox.mirror_host.load(Ordering::Relaxed) => {
-                    let left = d.saturating_duration_since(std::time::Instant::now());
-                    let ts = libc::timespec { tv_sec: left.as_secs().min(i32::MAX as u64) as i64, tv_nsec: left.subsec_nanos() as i64 };
-                    libc::pselect(0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &ts, &old);
-                }
-                // A host signal (1:1) lands on whichever thread of the
-                // process doesn't block it, likely another: look again every
-                // 10 ms.
-                Some(d) => {
-                    let step = d.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_millis(10));
-                    libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-                    let ts = libc::timespec { tv_sec: 0, tv_nsec: step.as_nanos() as i64 };
-                    libc::nanosleep(&ts, std::ptr::null_mut());
-                }
-            }
-        }
-        libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-    }
 }
 
 /// `rt_sigtimedwait`: take a pending signal in `set` (without running its
@@ -1067,9 +1026,8 @@ pub(super) fn rt_sigtimedwait<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thre
         if other != 0 || p.exiting() {
             return Err(errno::EINTR);
         }
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if !super::block::wait_woken(t, deadline)? {
             return Err(errno::EAGAIN);
         }
-        wait_for_host_signal_until(&p.inbox, deadline);
     }
 }

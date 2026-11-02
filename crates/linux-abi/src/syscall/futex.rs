@@ -26,58 +26,231 @@ use crate::{
     memory::{GuestMemory, GuestMemoryExt},
 };
 
-/// A thread's way of being woken from a blocking wait: a nonblocking pipe.
-#[derive(Debug)]
+/// A thread's way of being woken from a blocking wait: a kqueue of its own.
+///
+/// A user event in it (ident [`WAKE_EVENT`]) is the wake: whoever wakes the thread
+/// triggers it, and the kqueue reads as ready until the thread takes it. A
+/// thread sleeping in a host call sleeps on the kqueue's fd too (`poll`, see
+/// `block`), so a wake ends the sleep however it's timed. A thread whose
+/// task has left its CPU to wait (parked, by the core) has the files it waits
+/// for and its deadline registered in the kqueue as well, and the core
+/// watches the kqueue itself, in a kqueue of the host's: whatever comes, the
+/// task is made runnable. For waits with nothing to watch (a futex, a
+/// child), the core's unpark hook makes it runnable directly.
 pub struct Waker {
-    read: OwnedFd,
-    write: OwnedFd,
+    kq: OwnedFd,
+    /// The core's: make the thread's task runnable if it's parked, or else
+    /// call the function it's given (which triggers the wake's event).
+    unpark: std::sync::OnceLock<Box<dyn Fn(&dyn Fn()) + Send + Sync>>,
+    /// What a parked wait registered (ident, filter), to take out again
+    /// when the wait is over.
+    registered: Mutex<Vec<(usize, i16)>>,
+}
+
+impl std::fmt::Debug for Waker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Waker({})", self.kq.as_raw_fd())
+    }
+}
+
+/// The wake's user event, and a parked wait's timer, in a thread's kqueue.
+const WAKE_EVENT: usize = 0;
+const TIMER: usize = 1;
+
+fn kev(ident: usize, filter: i16, flags: u16, fflags: u32, data: isize) -> libc::kevent {
+    libc::kevent { ident, filter, flags, fflags, data, udata: std::ptr::null_mut() }
 }
 
 impl Waker {
     pub fn new() -> Waker {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe for a thread waker");
-        for fd in fds {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-        }
-        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        Waker { read, write }
+        let kq = unsafe { libc::kqueue() };
+        assert!(kq >= 0, "kqueue for a thread waker: {}", std::io::Error::last_os_error());
+        unsafe { libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+        let ev = kev(WAKE_EVENT, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0, 0);
+        assert_eq!(super::kfd::now(kq.as_raw_fd(), &[ev], &mut []), 0, "a thread waker's event");
+        Waker { kq, unpark: std::sync::OnceLock::new(), registered: Mutex::default() }
     }
 
-    /// Wake the thread (from any thread; async-signal-safe).
+    /// The core's way of making the thread's task runnable while it's
+    /// parked (set once, as the thread becomes a task).
+    pub fn set_unpark(&self, unpark: Box<dyn Fn(&dyn Fn()) + Send + Sync>) {
+        let _ = self.unpark.set(unpark);
+    }
+
+    /// Wake the thread (from any thread, not a signal handler): its task
+    /// runs again if it's parked, else a sleep in a host call ends (or the
+    /// next one doesn't start).
     pub fn wake(&self) {
-        unsafe { libc::write(self.write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+        match self.unpark.get() {
+            Some(unpark) => unpark(&|| self.trigger()),
+            None => self.trigger(),
+        }
     }
 
-    /// The pipe's read end, to sleep on with other things (see `block`).
-    pub(super) fn fd(&self) -> i32 {
-        self.read.as_raw_fd()
+    /// For the core, parking the thread's task: whether something came to
+    /// the kqueue since the thread last looked (a wake, a signal it
+    /// watches), taken out. Then the task looks again rather than park.
+    pub fn take_wake(&self) -> bool {
+        let mut out: [libc::kevent; 4] = unsafe { std::mem::zeroed() };
+        let mut any = false;
+        while super::kfd::now(self.kq.as_raw_fd(), &[], &mut out) > 0 {
+            any = true;
+        }
+        any
     }
 
-    /// Take out the wakes so far.
-    pub(super) fn drain(&self) {
-        let mut buf = [0u8; 64];
-        while unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    /// Take out what a wait registered, leaving what has come (a wake) for
+    /// the next look: a wait that parks hands its files to the core.
+    pub(super) fn unregister(&self) {
+        let old = std::mem::take(&mut *self.registered.lock().unwrap_or_else(|e| e.into_inner()));
+        if old.is_empty() {
+            return;
+        }
+        // Receipts (no events taken) for each: errors for what had fired.
+        let changes: Vec<libc::kevent> = old.iter().map(|&(ident, filter)| kev(ident, filter, libc::EV_DELETE | libc::EV_RECEIPT, 0, 0)).collect();
+        let mut out = changes.clone();
+        super::kfd::now(self.kq.as_raw_fd(), &changes, &mut out);
     }
 
-    /// Sleep until woken, a host signal arrives, or `deadline`. True if woken
-    /// (the wakes so far are used up).
+    /// The wake's event, alone (async-signal-safe).
+    pub fn trigger(&self) {
+        let ev = kev(WAKE_EVENT, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0);
+        super::kfd::now(self.kq.as_raw_fd(), &[ev], &mut []);
+    }
+
+    /// The kqueue's fd: readable while something's come (to sleep on with
+    /// other things, see `block`; the core watches it for a parked task).
+    pub fn fd(&self) -> i32 {
+        self.kq.as_raw_fd()
+    }
+
+    /// Take out whatever has come so far, and what a parked wait
+    /// registered: a wait that's over leaves nothing behind that would end
+    /// the next one early.
+    pub fn drain(&self) {
+        let old = std::mem::take(&mut *self.registered.lock().unwrap_or_else(|e| e.into_inner()));
+        let changes: Vec<libc::kevent> = old.iter().map(|&(ident, filter)| kev(ident, filter, libc::EV_DELETE, 0, 0)).collect();
+        let mut out: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+        // (Deletes of what has fired already fail, one event each in `out`.)
+        let mut n = super::kfd::now(self.kq.as_raw_fd(), &changes, &mut out);
+        while n == out.len() as i32 {
+            n = super::kfd::now(self.kq.as_raw_fd(), &[], &mut out);
+        }
+    }
+
+    /// Sleep until woken (anything coming into the kqueue), a host signal
+    /// interrupts, or `deadline`. True unless the deadline passed; what
+    /// came is taken out.
+    ///
+    /// Asleep in `poll` on the kqueue's fd, not in `kevent`: a thread asleep
+    /// in `kevent` takes ~8 µs longer to wake (measured, wakebench futex: 36
+    /// µs a round trip against 12.5), every time. The deadline is a timer
+    /// in the kqueue, to the nanosecond (`poll`'s own timeout is in ms).
     pub fn sleep(&self, deadline: Option<Instant>) -> bool {
         let ms = match deadline {
             None => -1,
-            Some(d) => d.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32,
+            Some(d) if self.arm_timer(d) => -1,
+            Some(d) => d.saturating_duration_since(Instant::now()).as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
         };
-        let mut pfd = libc::pollfd { fd: self.read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let woken = unsafe { libc::poll(&mut pfd, 1, ms) } > 0;
-        if woken {
-            let mut buf = [0u8; 64];
-            while unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        let mut pf = libc::pollfd { fd: self.kq.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let n = unsafe { libc::poll(&mut pf, 1, ms) };
+        if n > 0 || deadline.is_some() {
+            self.drain();
         }
-        woken
+        deadline.is_none_or(|d| Instant::now() < d)
     }
+
+    /// A timer in the kqueue for `deadline` (taken out by [`Waker::drain`]):
+    /// false if it couldn't be set.
+    pub(super) fn arm_timer(&self, deadline: Instant) -> bool {
+        let ns = deadline.saturating_duration_since(Instant::now()).as_nanos().clamp(1, isize::MAX as u128) as isize;
+        let ev = kev(TIMER, libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT, libc::NOTE_NSECONDS | libc::NOTE_CRITICAL, ns);
+        if super::kfd::now(self.kq.as_raw_fd(), &[ev], &mut []) < 0 {
+            return false;
+        }
+        self.registered.lock().unwrap_or_else(|e| e.into_inner()).push((TIMER, libc::EVFILT_TIMER));
+        true
+    }
+
+    /// Register `fds` (host fd, poll events; one-shot) and the `deadline`
+    /// in the kqueue, so that it becomes ready when any of them is (or the
+    /// time is up), and take what has come already, in one call: whether
+    /// one of the files is ready, or something else came (a wake, the
+    /// timer). What stays registered is for a sleep on the kqueue
+    /// ([`Waker::wait`]) or a parked wait (the core watches the kqueue).
+    /// Err if a file can't be watched this way (kqueue refuses it, or the
+    /// events have no filter): nothing is left registered then.
+    pub(super) fn arm(&self, fds: &[(i32, i16)], deadline: Option<Instant>) -> Result<Armed, ()> {
+        let mut changes = Vec::new();
+        for &(fd, events) in fds {
+            if fd < 0 {
+                continue;
+            }
+            let mut any = false;
+            if events & (libc::POLLIN | libc::POLLRDNORM) != 0 {
+                changes.push(kev(fd as usize, libc::EVFILT_READ, libc::EV_ADD | libc::EV_ONESHOT, 0, 0));
+                any = true;
+            }
+            if events & (libc::POLLOUT | libc::POLLWRNORM) != 0 {
+                changes.push(kev(fd as usize, libc::EVFILT_WRITE, libc::EV_ADD | libc::EV_ONESHOT, 0, 0));
+                any = true;
+            }
+            // Only exceptional conditions (POLLPRI, or hangups and errors
+            // alone): kqueue's filters would say ready for plain data too,
+            // and the wait would never settle.
+            if !any {
+                return Err(());
+            }
+        }
+        if let Some(d) = deadline {
+            let ns = d.saturating_duration_since(Instant::now()).as_nanos().clamp(1, isize::MAX as u128) as isize;
+            changes.push(kev(TIMER, libc::EVFILT_TIMER, libc::EV_ADD | libc::EV_ONESHOT, libc::NOTE_NSECONDS | libc::NOTE_CRITICAL, ns));
+        }
+        self.registered.lock().unwrap_or_else(|e| e.into_inner()).extend(changes.iter().map(|c| (c.ident, c.filter)));
+        // Room for an error per change, and what was there already.
+        let mut out: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; changes.len() + 4];
+        let mut armed = Armed::default();
+        loop {
+            let n = super::kfd::now(self.kq.as_raw_fd(), &changes, &mut out);
+            if n < 0 {
+                self.drain();
+                return Err(());
+            }
+            for e in &out[..n as usize] {
+                match e.filter {
+                    _ if e.flags & libc::EV_ERROR != 0 => {
+                        if e.data != 0 {
+                            self.drain();
+                            return Err(());
+                        }
+                    }
+                    libc::EVFILT_READ | libc::EVFILT_WRITE => armed.ready = true,
+                    _ => armed.woken = true,
+                }
+            }
+            if (n as usize) < out.len() {
+                return Ok(armed);
+            }
+            changes.clear(); // more to take
+        }
+    }
+
+    /// Watch host signal `sig` (as sent to the host process) in the kqueue
+    /// from now on: a wait for a host child (1:1) wakes on SIGCHLD.
+    pub(super) fn watch_signal(&self, sig: i32) {
+        let ev = kev(sig as usize, libc::EVFILT_SIGNAL, libc::EV_ADD, 0, 0);
+        super::kfd::now(self.kq.as_raw_fd(), &[ev], &mut []);
+    }
+}
+
+/// What [`Waker::arm`] found had come already.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Armed {
+    /// One of the files is ready (or in error).
+    pub ready: bool,
+    /// Something else: a wake, the timer, a signal watched.
+    pub woken: bool,
 }
 
 impl Default for Waker {
@@ -236,17 +409,27 @@ fn enqueue<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, uaddr: u64
 
 /// Sleep out a wait [`begin_wait`] began: until woken (0), a signal for the
 /// thread or the process ending (EINTR), or the timeout (ETIMEDOUT).
+///
+/// On a CPU wanted for another thread, the thread parks instead (PARK, with
+/// the wait still queued in [`Thread::take_park`]): a wake makes its task
+/// runnable, and the core calls this again with the same wait, which then
+/// finds it woken. Nothing is lost, as leaving the queue and waiting again
+/// would lose a wake sent in between.
 pub fn finish_wait(p: &Process, t: &Thread, w: FutexWait) -> Result<i64, i64> {
     let FutexWait { me, deadline } = w;
     let result = loop {
         if me.woken.load(Ordering::Acquire) {
             break Ok(0);
         }
-        if p.signal_ready(t) || p.exiting() || super::signal::must_yield() {
+        if p.signal_ready(t) || p.exiting() {
             break Err(errno::EINTR);
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break Err(errno::ETIMEDOUT);
+        }
+        if super::signal::must_yield() {
+            t.set_park(super::Park { watch: Vec::new(), deadline, futex: Some(FutexWait { me, deadline }), files: Vec::new() });
+            return Err(errno::PARK);
         }
         t.waker.sleep(deadline);
     };

@@ -19,6 +19,18 @@
 //! Calls that wait on a file (a pipe, socket, terminal) wait here for it to
 //! be ready, then make the call, which won't block unless another reader or
 //! writer got there first (then it blocks as before, still interruptible).
+//!
+//! **Parking** (docs/processes.md, step 3a). On a CPU that's wanted for
+//! another thread (the core's yield check: tasks wait for a CPU, or this
+//! one is being taken back), a wait doesn't sleep in the host call at all:
+//! the files it waits for and its deadline are registered in the thread's
+//! waker kqueue ([`super::Waker::arm`]), and the call returns
+//! [`errno::PARK`]. The core sets the task aside, watching the waker's
+//! kqueue in a kqueue of its own, and makes the call again on a CPU once
+//! something comes (a file ready, the deadline, a wake): blocked threads
+//! cost no host thread. The call made again keeps its deadline
+//! ([`Thread::deadline`]). Nothing a call does before it waits here may be
+//! visible, as it's made again from the start.
 
 use std::{os::fd::AsRawFd, time::Instant};
 
@@ -33,23 +45,84 @@ pub(super) enum Woken {
 }
 
 /// Whether thread `t` has something to do other than wait: a signal it
-/// would act on, its process ending, or its CPU wanted for another thread.
+/// would act on, or its process ending. (Its CPU wanted for another thread
+/// parks the wait instead.)
 fn called_away(p: &Process, t: &Thread) -> bool {
-    p.exiting() || p.signal_ready(t) || must_yield()
+    p.exiting() || p.signal_ready(t)
+}
+
+/// Park thread `t`'s call (see the module's comment) to wait until
+/// `deadline`, or a wake: PARK.
+fn park(t: &Thread, deadline: Option<Instant>) -> i64 {
+    t.set_park(super::Park { watch: Vec::new(), deadline, futex: None, files: Vec::new() });
+    errno::PARK
 }
 
 /// Wait until one of `fds` is ready (the count of those that are), until
 /// `deadline` (Err(TimedOut) as Ok), or until thread `t` is called away
-/// (EINTR). `fds` may be empty: a sleep.
+/// (EINTR). `fds` may be empty: a sleep. On a CPU wanted elsewhere, PARK
+/// (or OFFLOAD) instead of a sleep.
 pub(super) fn poll(p: &Process, t: &Thread, fds: &mut Vec<libc::pollfd>, deadline: Option<Instant>) -> Result<Result<i64, Woken>, i64> {
+    wait_for(p, t, fds, t.deadline(deadline), true)
+}
+
+/// [`poll`]; `exact`: false for one file the call will try itself, which
+/// needs no word from `poll` on what it's ready for.
+///
+/// A sleep here is `poll` on the files and the waker's kqueue. Parking
+/// instead, the files are registered in the waker's kqueue first (one-shot,
+/// in the same call that takes what's there), which says at once whether
+/// one is ready, and that kqueue is known to take them, so the core's will
+/// too; then they're handed to the core. (Not `poll` with a zero timeout to
+/// look first: on macOS that takes ~10 µs when nothing is ready.)
+fn wait_for(p: &Process, t: &Thread, fds: &mut Vec<libc::pollfd>, deadline: Option<Instant>, exact: bool) -> Result<Result<i64, Woken>, i64> {
+    if fds.is_empty() {
+        return sleep_until(p, t, deadline).map(|()| Err(Woken::TimedOut));
+    }
     fds.push(libc::pollfd { fd: t.waker.fd(), events: libc::POLLIN, revents: 0 });
+    let real = fds.len() - 1;
     let result = loop {
-        // Look, then sleep on the pipe too (see the module's comment).
+        // Look, then sleep on the waker too (see the module's comment).
         if called_away(p, t) {
             break Err(errno::EINTR);
         }
+        if must_yield() {
+            let watch: Vec<(i32, i16)> = fds[..real].iter().map(|f| (f.fd, f.events)).collect();
+            let Ok(armed) = t.waker.arm(&watch, None) else {
+                // A file kqueue won't take: a worker waits.
+                fds.pop();
+                return Err(errno::OFFLOAD);
+            };
+            if armed.ready {
+                t.waker.unregister();
+                if !exact {
+                    break Ok(Ok(1));
+                }
+                // Something is ready: poll says what (at once).
+                let n = unsafe { libc::poll(fds.as_mut_ptr(), real as libc::nfds_t, 0) };
+                if n > 0 {
+                    break Ok(Ok(n as i64));
+                }
+                // (Taken by another reader meanwhile: wait on.)
+            } else if !armed.woken {
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    t.waker.unregister();
+                    break Ok(Err(Woken::TimedOut));
+                }
+                // The core watches the files now; this kqueue keeps only
+                // what has come (a wake) for the core to look for.
+                t.waker.unregister();
+                fds.pop();
+                t.set_park(super::Park { watch, deadline, futex: None, files: Vec::new() });
+                return Err(errno::PARK);
+            }
+            t.waker.unregister();
+            continue;
+        }
         let ms = match deadline {
             None => -1,
+            // A timer in the waker's kqueue: to the nanosecond.
+            Some(d) if t.waker.arm_timer(d) => -1,
             Some(d) => {
                 let left = d.saturating_duration_since(Instant::now());
                 // Round up: never wake before the deadline.
@@ -79,13 +152,51 @@ pub(super) fn poll(p: &Process, t: &Thread, fds: &mut Vec<libc::pollfd>, deadlin
         }
     };
     fds.pop();
+    if deadline.is_some() {
+        // The timer, if it hasn't fired.
+        t.waker.drain();
+    }
     result
 }
 
 /// Sleep until `deadline` (None: for ever) or until thread `t` is called
-/// away (EINTR).
+/// away (EINTR). Ok once the time is up.
 pub(super) fn sleep(p: &Process, t: &Thread, deadline: Option<Instant>) -> Result<(), i64> {
-    poll(p, t, &mut Vec::new(), deadline).map(|_| ())
+    sleep_until(p, t, t.deadline(deadline))
+}
+
+fn sleep_until(p: &Process, t: &Thread, deadline: Option<Instant>) -> Result<(), i64> {
+    loop {
+        if called_away(p, t) {
+            return Err(errno::EINTR);
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(());
+        }
+        if must_yield() {
+            return Err(park(t, deadline));
+        }
+        // On the waker's kqueue alone: its timeout is to the nanosecond,
+        // where poll's is to the millisecond.
+        t.waker.sleep(deadline);
+    }
+}
+
+/// Wait once for anything to wake thread `t` (or for `deadline`), for a
+/// caller that looks at what it waits for itself, before and after: a
+/// signal it takes (`rt_sigtimedwait`), a child (`wait4`). Ok(false) once
+/// the deadline has passed. Not called away by signals (the caller looks);
+/// on a CPU wanted elsewhere, PARK.
+pub fn wait_woken(t: &Thread, deadline: Option<Instant>) -> Result<bool, i64> {
+    let deadline = t.deadline(deadline);
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Ok(false);
+    }
+    if must_yield() {
+        return Err(park(t, deadline));
+    }
+    t.waker.sleep(deadline);
+    Ok(deadline.is_none_or(|d| Instant::now() < d))
 }
 
 /// Whether a host file can make a call on it block: a pipe, socket,
@@ -103,7 +214,9 @@ pub(crate) fn can_block(host: i32) -> bool {
 /// At once for files that never block, one that's ready (or hung up, or in
 /// error: the call says so), or one opened nonblocking (the call says
 /// EAGAIN).
-pub(super) fn ready(p: &Process, t: &Thread, file: &OpenFile, events: i16) -> Result<(), i64> {
+pub(super) fn ready(p: &Process, t: &Thread, file: &std::sync::Arc<OpenFile>, events: i16) -> Result<(), i64> {
+    // Held for the call (and while it waits parked).
+    crate::fs::hold(file);
     ready_fd(p, t, file.host.as_raw_fd(), file.can_block(), events)
 }
 
@@ -115,19 +228,20 @@ pub(super) fn ready_fd(p: &Process, t: &Thread, host: i32, can_block: bool, even
     let mut pf = libc::pollfd { fd: host, events, revents: 0 };
     // Ready now (or in error, which the call reports). Not an interrupted
     // look (-1, EINTR): that one may be the wakeup, and the call would then
-    // sleep through it; `poll` below looks again.
+    // sleep through it; the wait below looks again.
     let n = unsafe { libc::poll(&mut pf, 1, 0) };
     if n > 0 || (n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)) {
         return Ok(());
     }
+    // Opened nonblocking: the call says EAGAIN itself.
     if unsafe { libc::fcntl(host, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
         return Ok(());
     }
-    pf.revents = 0;
     // A socket's receive or send timeout (SO_RCVTIMEO, SO_SNDTIMEO) bounds
     // the wait, which then says EAGAIN, as the call would have.
-    let deadline = socket_timeout(host, events).map(|d| Instant::now() + d);
-    match poll(p, t, &mut vec![pf], deadline)? {
+    let deadline = t.deadline(socket_timeout(host, events).map(|d| Instant::now() + d));
+    // Ready (or in error, which the call reports) as soon as kqueue says so.
+    match wait_for(p, t, &mut vec![libc::pollfd { fd: host, events, revents: 0 }], deadline, false)? {
         Ok(_) => Ok(()),
         Err(Woken::TimedOut) => Err(errno::EAGAIN),
     }

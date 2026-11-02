@@ -238,12 +238,12 @@ impl Kernel for HostKernel {
         self.kill(p, tid, sig)
     }
 
-    fn wait4(&self, p: &Process, _t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
-        process::host_wait4(p, pid, options)
+    fn wait4(&self, p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
+        process::host_wait4(p, t, pid, options)
     }
 
-    fn waitid(&self, p: &Process, _t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
-        process::host_waitid(p, idtype, id, options)
+    fn waitid(&self, p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
+        process::host_waitid(p, t, idtype, id, options)
     }
 
     fn tcgetpgrp(&self, _p: &Process, host_fd: RawFd) -> Result<i64, i64> {

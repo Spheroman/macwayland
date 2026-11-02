@@ -13,6 +13,7 @@ pub mod hv;
 mod cputime;
 mod fork;
 mod host;
+mod park;
 pub mod loader;
 pub mod mach;
 pub mod memory;
@@ -34,12 +35,13 @@ use std::{
 
 use linux_abi::{
     dispatch,
-    syscall::{ctl, futex_begin_wait, futex_finish_wait, Delivery, FutexWait, HostExec, SigInfo, Spawn, Thread},
+    syscall::{ctl, futex_finish_wait, Delivery, HostExec, Park, SigInfo, Spawn, Thread},
     Action, Process,
 };
 
 use hv::{reg, sys_reg, Vcpu, Vm};
 use memory::{Access, AddressSpace, Machine, Space};
+use park::{Parking, Ready};
 use sched::{Cpu, Job, Offloaded, Placed, Sched, Start, Task};
 
 /// Exception classes (ESR bits 31:26) we care about.
@@ -217,11 +219,14 @@ enum Next {
     Stop,
     /// Its time slice is used and others wait: give up the CPU.
     Preempted,
-    /// It's making a call that would block, with others waiting for the
-    /// CPU (or the CPU was taken back from it in the call): a worker makes
-    /// it (or, for a futex wait begun here, sleeps it out), and the CPU goes
-    /// to another task.
-    Blocked(u64, [u64; 6], Option<FutexWait>),
+    /// It's making a call that would block on something a kqueue can't
+    /// watch, with others waiting for the CPU (or the CPU was taken back
+    /// from it in the call): a worker makes it, and the CPU goes to another
+    /// task.
+    Blocked(u64, [u64; 6]),
+    /// Its call waits, parked (see `park`), and the CPU goes to another
+    /// task: the call is made again when the wait is over.
+    Wait(u64, [u64; 6], Park),
     /// Its process is stopped, or it vforked: set it aside (one VM).
     Park(host::Why),
 }
@@ -303,7 +308,9 @@ struct Host<'a> {
     /// The VM's memory: the frame pool every address space takes from.
     machine: &'a Arc<Machine>,
     /// The run queue and CPUs.
-    sched: Sched,
+    sched: Arc<Sched>,
+    /// Tasks waiting off their CPUs, and the waiter threads' kqueue.
+    parking: Arc<Parking>,
     /// Many processes in the VM: their table. None in 1:1 mode.
     table: Option<Arc<host::Table>>,
     /// 1:1: the Mac program the process becomes instead of ending, with the
@@ -312,6 +319,13 @@ struct Host<'a> {
 }
 
 impl Host<'_> {
+    /// `task`'s thread is one of the host's: reachable by its process's
+    /// others, and unparked by its wakers.
+    fn register(&self, task: &Task) {
+        task.proc.abi.register_thread(&task.thread, task.location.waker());
+        self.parking.adopt(task);
+    }
+
     /// Process `proc` ends this way (unless it already ended another): every
     /// thread is told to stop, and those waiting for a CPU end at once.
     fn end(&self, proc: &Arc<Proc>, how: Result<Exit, Error>) {
@@ -388,15 +402,23 @@ fn execute(space: AddressSpace, start: Start, process: Process, thread: Thread) 
         s.map_into(&vm)?;
     }
     let proc = Proc::new(process, space);
-    let host = Host { vm: &vm, machine: &machine, sched: Sched::new(), table: None, exec_host: Mutex::new(None) };
+    let sched = Arc::new(Sched::new());
+    let parking = Parking::new(sched.clone())?;
+    // A host signal (one the guest handles) wakes the process's threads,
+    // parked ones too.
+    parking.host_signals_for(&proc);
+    let host = Host { vm: &vm, machine: &machine, sched, parking, table: None, exec_host: Mutex::new(None) };
     std::thread::scope(|scope| {
         scope.spawn(|| host.sched.ticker());
+        park::run_waiters(&host, scope);
         let task = Task::new(thread, proc.clone());
-        proc.abi.register_thread(&task.thread, task.location.waker());
+        host.register(&task);
         if let Err(e) = run_cpu(&host, scope, (task, start), true) {
             host.end(&proc, Err(e));
         }
     });
+    // Whatever is still parked has ended with the host.
+    drop(host.parking.take_all());
     proc.abi.set_exiting(false);
     let Host { exec_host, .. } = host;
     if let Some((exec, blocked)) = exec_host.into_inner().unwrap_or_else(|e| e.into_inner()) {
@@ -490,7 +512,9 @@ enum Outcome {
     /// It gave up the CPU and waits its turn again.
     Preempted,
     /// It gave up the CPU to make this call on a worker.
-    Blocked(u64, [u64; 6], Option<FutexWait>),
+    Blocked(u64, [u64; 6]),
+    /// It gave up the CPU to wait, parked, for its call.
+    Wait(u64, [u64; 6], Park),
     /// It's set aside until something lets it run again (one VM).
     Parked(host::Why),
     /// It's over: the thread ended, or the process is ending.
@@ -506,7 +530,7 @@ fn run_cpu<'scope, 'env>(
     first: (Task, Start),
     first_cpu: bool,
 ) -> Result<(), Error> {
-    let mut cpu = match Cpu::new(sh.vm) {
+    let mut cpu = match Cpu::new(sh.vm, &sh.sched) {
         Ok(cpu) => cpu,
         Err(e) if !first_cpu => {
             // Said once: the threads share the CPUs there are.
@@ -534,6 +558,7 @@ fn run_cpu<'scope, 'env>(
         // and it ran nowhere else since.
         let warm = holds == Some((task.proc.abi.pid, task.thread.tid)) && task.last_cpu == Some(cpu.slot);
         let mut after = None;
+        let mut retry = None;
         if sh.table.is_some() {
             cputime::turn_starts();
         }
@@ -574,11 +599,16 @@ fn run_cpu<'scope, 'env>(
                     ctx.restore(vcpu)?;
                     after = Some((nr, arg0, ret));
                 }
+                Start::Retry { nr, args, park, .. } if warm => retry = Some((nr, args, park)),
+                Start::Retry { ctx, nr, args, park } => {
+                    ctx.restore(vcpu)?;
+                    retry = Some((nr, args, park));
+                }
             }
             task.location.set_running(cpu.slot);
             task.last_cpu = Some(cpu.slot);
             task.thread.moved_host_thread();
-            run_task(&mut cpu, sh, scope, &mut task, &mut configured, after.take())
+            run_task(&mut cpu, sh, scope, &mut task, &mut configured, after.take(), retry.take())
         };
         // A panic anywhere in running the task (not only in a system call,
         // which `contained` already catches) is a runtime error like any
@@ -608,16 +638,18 @@ fn run_cpu<'scope, 'env>(
             }
             // Stopped in our vector after the `svc`: the registers say where
             // to return to, and the worker supplies x0.
-            Ok(Outcome::Blocked(nr, args, wait)) => {
+            // Waiting, parked: off every CPU, its call made again when the
+            // wait is over.
+            Ok(Outcome::Wait(nr, args, park)) => {
                 task.location.set_nowhere();
                 let ctx = Box::new(hv::UserContext::save(&cpu.vcpu)?);
-                match sh.sched.offload(Job { task, ctx, nr, args, wait }) {
-                    Offloaded::Queued => {}
-                    Offloaded::NewWorker(job) => {
-                        scope.spawn(move || run_worker(sh, scope, job));
-                    }
-                    Offloaded::Dropped(task) => sh.thread_gone(&task.proc, task.thread.tid),
-                }
+                let (watch, deadline) = (park.watch.clone(), park.deadline);
+                sh.parking.park(task, Start::Retry { ctx, nr, args, park }, &watch, deadline);
+            }
+            Ok(Outcome::Blocked(nr, args)) => {
+                task.location.set_nowhere();
+                let ctx = Box::new(hv::UserContext::save(&cpu.vcpu)?);
+                offload(sh, scope, Job { task, ctx, nr, args });
             }
             Ok(Outcome::Parked(why)) => {
                 task.location.set_nowhere();
@@ -641,9 +673,7 @@ fn run_cpu<'scope, 'env>(
                 break Err(e);
             }
         }
-        if let Some(table) = &sh.table {
-            host::place_ready(sh, scope, table);
-        }
+        place_ready(sh, scope);
     };
     sh.sched.cpu_gone();
     result
@@ -661,6 +691,7 @@ fn run_task<'scope, 'env>(
     task: &mut Task,
     configured: &mut Option<u64>,
     after: Option<(u64, u64, i64)>,
+    retry: Option<(u64, [u64; 6], Park)>,
 ) -> Result<Outcome, Error> {
     let Task { thread, location, proc, .. } = task;
     let proc = proc.clone();
@@ -677,6 +708,19 @@ fn run_task<'scope, 'env>(
         Some((nr, arg0, ret)) => finish_call(vcpu, &space, process, thread, nr, arg0, ret)?,
         None => None,
     };
+    // Back from a parked wait: the call is made again, with what it had
+    // (its deadline, its futex wait), and its files kept open until then.
+    if let Some((nr, args, park)) = retry {
+        let Park { deadline, futex, files, .. } = park;
+        // What came while it waited, and what its wait registered, go:
+        // the call looks for itself now.
+        thread.waker.drain();
+        thread.set_retry(Some(deadline));
+        let next = system_call(vcpu, slot, sh, scope, &proc, &space, thread, nr, args, futex);
+        thread.set_retry(None);
+        drop(files);
+        first = next?;
+    }
     loop {
         let next = match first.take() {
             Some(next) => next,
@@ -685,7 +729,8 @@ fn run_task<'scope, 'env>(
         profile::mark("guest stopped");
         match next {
             Next::Preempted => return Ok(Outcome::Preempted),
-            Next::Blocked(nr, args, wait) => return Ok(Outcome::Blocked(nr, args, wait)),
+            Next::Blocked(nr, args) => return Ok(Outcome::Blocked(nr, args)),
+            Next::Wait(nr, args, park) => return Ok(Outcome::Wait(nr, args, park)),
             Next::Park(why) => return Ok(Outcome::Parked(why)),
             Next::Stop => return done(thread),
             Next::Exit(exit) => {
@@ -777,7 +822,7 @@ fn finish_call(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &mut T
 fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, first: Job) {
     let strace = strace_on();
     let mut next = Some(first);
-    while let Some(Job { mut task, ctx, nr, args, mut wait }) = next.take().or_else(|| sh.sched.next_job()) {
+    while let Some(Job { mut task, ctx, nr, args }) = next.take().or_else(|| sh.sched.next_job()) {
         let proc = task.proc.clone();
         let (process, space) = (&proc.abi, proc.space());
         let cpu_time = sh.table.is_some().then(thread_cpu_ns);
@@ -787,14 +832,9 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
         task.location.set_worker();
         thread.moved_host_thread();
         let ret = loop {
-            // A futex wait begun on the CPU: sleep it out (it ends early for a
-            // signal or the process ending by itself).
-            if let Some(w) = wait.take() {
-                break futex_finish_wait(process, thread, w).unwrap_or_else(|e| -e);
-            }
             // A signal that came while the task waited for a worker (when
             // nothing could interrupt the call) interrupts it now.
-            if (!sets_mask(nr, &args) && process.signal_ready(thread)) || process.exiting() {
+            if (interruptible(nr, &args) && process.signal_ready(thread)) || process.exiting() {
                 break -linux_abi::errno::EINTR;
             }
             let Some(action) = contained(process, nr, || dispatch(process, thread, &*space, nr, args)) else {
@@ -827,9 +867,7 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
         drop(space);
         task.location.set_nowhere();
         place(sh, scope, task, Start::AfterCall { ctx, nr, arg0: args[0], ret });
-        if let Some(table) = &sh.table {
-            host::place_ready(sh, scope, table);
-        }
+        place_ready(sh, scope);
     }
 }
 
@@ -858,57 +896,46 @@ fn panic_message(e: &(dyn std::any::Any + Send)) -> String {
     e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic".into())
 }
 
-/// Calls that may block in the host, and that a worker can make for a task
-/// (they only return: no new thread, exec, exit or signal frame).
+/// Calls that may block, and that a worker can make for a task (they only
+/// return: no new thread, exec, exit or signal frame). `openat` blocks only
+/// for a FIFO (until the other end opens).
 fn may_block(nr: u64) -> bool {
     use linux_abi::nr::*;
     matches!(
         nr,
         FUTEX | READ | READV | PREAD64 | WRITE | WRITEV | PWRITE64 | RECVFROM | RECVMSG | RECVMMSG | SENDTO | SENDMSG | SENDMMSG | ACCEPT | ACCEPT4
             | CONNECT | PPOLL | PSELECT6 | EPOLL_PWAIT | EPOLL_PWAIT2 | NANOSLEEP | CLOCK_NANOSLEEP | WAIT4 | WAITID
-            | RT_SIGTIMEDWAIT | RT_SIGSUSPEND | FLOCK | FCNTL
+            | RT_SIGTIMEDWAIT | RT_SIGSUSPEND | FLOCK | FCNTL | OPENAT
     )
 }
 
-/// Calls that wait with a signal mask of their own, which they check
-/// signals against themselves (a signal ready now may be blocked then).
-fn sets_mask(nr: u64, args: &[u64; 6]) -> bool {
+/// Whether a signal pending as the call starts interrupts it (EINTR) before
+/// it waits, as Linux checks before it sleeps. Not for calls that wait with
+/// a signal mask of their own (they look against that), nor `openat`
+/// (only a FIFO's waits, and that one is rare: a file's open isn't
+/// interruptible).
+fn interruptible(nr: u64, args: &[u64; 6]) -> bool {
     use linux_abi::nr::*;
     match nr {
-        RT_SIGSUSPEND => true,
-        PPOLL => args[3] != 0,
-        PSELECT6 => args[5] != 0,
-        EPOLL_PWAIT | EPOLL_PWAIT2 => args[4] != 0,
-        _ => false,
+        RT_SIGSUSPEND | OPENAT => false,
+        PPOLL => args[3] == 0,
+        PSELECT6 => args[5] == 0,
+        EPOLL_PWAIT | EPOLL_PWAIT2 => args[4] == 0,
+        _ => true,
     }
 }
 
-/// Whether a call [`may_block`] would, where that's cheap to tell: a fd not
-/// ready, a futex word still the value waited for, no zero timeout or
-/// WNOHANG. Calls that won't block stay on the CPU.
-fn would_block(process: &Process, space: &Space, nr: u64, args: &[u64; 6]) -> bool {
+/// Calls that would block on something no kqueue can watch, so that with
+/// others waiting for the CPU a worker makes them: `flock` and `F_SETLKW`
+/// that may wait for a lock. (Everything else that waits parks, from inside
+/// the call; a FIFO's `open`, which can't be told cheaply, is taken back
+/// from the CPU once others wait, and goes to a worker then.)
+fn needs_worker(nr: u64, args: &[u64; 6]) -> bool {
     use linux_abi::nr::*;
-    let ready = |fd: u64, events: i16| {
-        let Ok(file) = process.fds.get(fd) else { return true }; // EBADF at once
-        let mut p = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&file.host), events, revents: 0 };
-        unsafe { libc::poll(&mut p, 1, 0) != 0 }
-    };
-    let zero_timespec = |addr: u64| {
-        let mut t = [0u8; 16];
-        addr != 0 && linux_abi::GuestMemory::read(space, addr, &mut t).is_ok() && t == [0; 16]
-    };
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
     match nr {
-        // (Futex waits are begun on the CPU instead: see run_loop.)
-        READ | READV | PREAD64 | RECVFROM | RECVMSG | RECVMMSG | ACCEPT | ACCEPT4 => !ready(args[0], libc::POLLIN),
-        WRITE | WRITEV | PWRITE64 | SENDTO | SENDMSG | SENDMMSG | CONNECT => !ready(args[0], libc::POLLOUT),
-        EPOLL_PWAIT => args[3] as i32 != 0,
-        EPOLL_PWAIT2 => !zero_timespec(args[3]),
-        PPOLL => !zero_timespec(args[2]),
-        PSELECT6 => !zero_timespec(args[4]),
-        NANOSLEEP | CLOCK_NANOSLEEP | RT_SIGTIMEDWAIT | RT_SIGSUSPEND => true,
-        WAIT4 => args[2] & 1 == 0,  // WNOHANG
-        WAITID => args[3] & 1 == 0, // WNOHANG
-        FLOCK => args[1] & 4 == 0,  // LOCK_NB
+        FLOCK => args[1] & (LOCK_NB | LOCK_UN) == 0,
         FCNTL => matches!(args[1], 7 | 38), // F_SETLKW, F_OFD_SETLKW
         _ => false,
     }
@@ -1025,7 +1052,6 @@ fn run_loop<'scope, 'env>(
 ) -> Result<Next, Error> {
     let process = &proc.abi;
     let mut last_fault = (u64::MAX, 0);
-    let strace = strace_on();
     // MACWL_FAULTS=1 describes each fault that becomes a signal.
     let faults = std::env::var_os("MACWL_FAULTS").is_some_and(|v| v != "0");
     loop {
@@ -1041,10 +1067,11 @@ fn run_loop<'scope, 'env>(
         {
             return Ok(Next::Exit(exit));
         }
-        if let Some(table) = &sh.table {
-            // Tasks a call of this one let run again (a SIGCONT, say) get a
-            // CPU; and a stopped process's task goes no further.
-            host::place_ready(sh, scope, table);
+        // Tasks a call of this one let run again (a SIGCONT, a futex wake
+        // that needs a new CPU) get one.
+        place_ready(sh, scope);
+        if sh.table.is_some() {
+            // A stopped process's task goes no further.
             if proc.stopped.load(Ordering::Acquire) {
                 return Ok(Next::Park(host::Why::Stopped));
             }
@@ -1139,147 +1166,7 @@ fn run_loop<'scope, 'env>(
             if nr == linux_abi::nr::WAIT4 {
                 profile::mark("wait4 called");
             }
-            let may_block = may_block(nr);
-            let action = loop {
-                // Blocked here, for the scheduler to see, before looking for
-                // others waiting: a task queued from now on takes the CPU
-                // back; one queued before, this sees.
-                sched::set_inline(slot, may_block);
-                // Others wait for this CPU: a call that would block gives it
-                // up, and a worker makes it.
-                if may_block && sh.sched.others_waiting() {
-                    // A futex wait queues the thread here (the value check
-                    // and the queueing must be one step: checked here and
-                    // queued later, a wake in between would be missed), and
-                    // a worker sleeps it out.
-                    if nr == linux_abi::nr::FUTEX {
-                        match futex_begin_wait(process, thread, space, args) {
-                            Ok(Some(wait)) => {
-                                sched::set_inline(slot, false);
-                                return Ok(Next::Blocked(nr, args, Some(wait)));
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                sched::set_inline(slot, false);
-                                break Action::Return(-e);
-                            }
-                        }
-                    } else if would_block(process, space, nr, &args) {
-                        sched::set_inline(slot, false);
-                        return Ok(Next::Blocked(nr, args, None));
-                    }
-                }
-                // As Linux checks before it sleeps: a signal that came in
-                // while the call was on its way (when nothing could interrupt
-                // it) interrupts it now, rather than after it's slept.
-                if may_block && !sets_mask(nr, &args) && process.signal_ready(thread) {
-                    sched::set_inline(slot, false);
-                    break Action::Return(-linux_abi::errno::EINTR);
-                }
-                let action = contained(process, nr, || dispatch(process, thread, space, nr, args));
-                sched::set_inline(slot, false);
-                // The call met a runtime error (a panic): its process ends,
-                // and the host carries on.
-                let Some(action) = action else { return Ok(Next::Exit(Exit::Signal(SIGSYS))) };
-                let interrupted = matches!(action, Action::Return(r) if r == -linux_abi::errno::EINTR);
-                // The CPU was taken back, for a task waiting for one: a worker
-                // makes the call again (nothing was done), or the guest gets
-                // EINTR, for the calls a Linux signal interrupts too. A futex
-                // waiter left its queue: made again, it could miss a wake sent
-                // meanwhile, if the word went back to the value it waits for.
-                // It returns 0 instead, a spurious wakeup: the guest looks at
-                // its condition again. (Not EINTR, which Linux gives only for
-                // a signal: glibc's sem_wait passes that on, and foot's render
-                // threads then drew with no work to do.)
-                if interrupted && sched::take_evict(slot) {
-                    if (restartable(nr) && nr != linux_abi::nr::FUTEX) || nr == linux_abi::nr::RT_SIGSUSPEND {
-                        return Ok(Next::Blocked(nr, args, None));
-                    }
-                    if nr == linux_abi::nr::FUTEX && !process.signal_ready(thread) && !process.exiting() {
-                        break Action::Return(0);
-                    }
-                    break action;
-                }
-                // A host signal the guest blocks (one a signalfd reads, say)
-                // broke a blocking host call, which on Linux it wouldn't: back
-                // into the call, unless there's a signal to act on or the
-                // process is ending.
-                if interrupted && restartable(nr) && !process.exiting() && !process.signal_ready(thread) {
-                    continue;
-                }
-                break action;
-            };
-            if nr == linux_abi::nr::WAIT4 {
-                profile::mark("wait4 returned");
-            }
-            if strace {
-                let a = strace_args(space, nr, &args);
-                strace_line(format_args!("{}{}({a}) = {action:?}", who(sh, process, thread), linux_abi::nr::name(nr)));
-            }
-            let ret = match action {
-                // Resuming runs the eret after the hvc, back to the
-                // instruction after the guest's svc.
-                Action::Return(v) => v,
-                Action::Exit(code) => {
-                    profile::mark("exit_group");
-                    return Ok(Next::Exit(Exit::Code(code)));
-                }
-                Action::ExitThread(code) => return Ok(Next::ExitThread(code)),
-                Action::Spawn(spawn) => spawn_thread(vcpu, sh, scope, proc, space, thread, &spawn)?,
-                Action::SigReturn => match signal::sigreturn(vcpu, space) {
-                    Ok(mask) => {
-                        thread.sigreturn(mask);
-                        // The restored mask may let pending signals through.
-                        if let Some(exit) = deliver_signals(vcpu, space, process, thread, None)? {
-                            return Ok(Next::Exit(exit));
-                        }
-                        continue;
-                    }
-                    Err(()) => return Ok(Next::Exit(Exit::Signal(11))), // SIGSEGV, as Linux
-                },
-                Action::Fork(f) => {
-                    profile::mark("fork");
-                    let ctx = hv::UserContext::save(vcpu)?;
-                    let ret = match &sh.table {
-                        // In the VM: copy on write, the child queued.
-                        Some(table) => match host::fork(sh, scope, table, vcpu, proc, space, thread, ctx, &f)? {
-                            // vfork: the parent waits until its child execs
-                            // or exits, set aside, off its CPU.
-                            Ok(child) if f.vfork => {
-                                if let Some(next) = finish_call(vcpu, space, process, thread, nr, args[0], child)? {
-                                    return Ok(next);
-                                }
-                                return Ok(Next::Park(host::Why::Vfork(child)));
-                            }
-                            Ok(child) => child,
-                            Err(e) => -e,
-                        },
-                        None => fork::fork(space, process, thread, &ctx, &f).unwrap_or_else(|e| -e),
-                    };
-                    profile::mark("fork done, parent resumes");
-                    ret
-                }
-                // A Mac program replaces the host process: never with other
-                // processes in its VM (the dispatcher refuses already; this
-                // is the second lock on that door).
-                Action::ExecHost(_) if sh.table.is_some() => -linux_abi::errno::ENOEXEC,
-                Action::ExecHost(exec) => return Ok(Next::ExecHost(exec)),
-                Action::Exec(exec) => {
-                    profile::mark("exec: loading");
-                    let argv: Vec<&[u8]> = exec.argv.iter().map(Vec::as_slice).collect();
-                    let envp: Vec<&[u8]> = exec.envp.iter().map(Vec::as_slice).collect();
-                    match load(sh.machine, &exec.elf, &argv, &envp, process) {
-                        Ok(program) => {
-                            profile::mark("exec: loaded");
-                            process.exec_done(thread, exec.exe, &exec.comm);
-                            process.set_arg_area(program.args, program.env);
-                            return Ok(Next::Exec(program));
-                        }
-                        Err(e) => -exec_errno(&e),
-                    }
-                }
-            };
-            if let Some(next) = finish_call(vcpu, space, process, thread, nr, args[0], ret)? {
+            if let Some(next) = system_call(vcpu, slot, sh, scope, proc, space, thread, nr, args, None)? {
                 return Ok(next);
             }
             continue;
@@ -1329,6 +1216,160 @@ fn run_loop<'scope, 'env>(
     }
 }
 
+/// System call `nr` of a task on a CPU, from the guest's `svc` or made again
+/// after a parked wait (`futex`: the futex wait it parked in): Some(why) if
+/// the task is to stop running here, None to carry on in the guest.
+#[allow(clippy::too_many_arguments)]
+fn system_call<'scope, 'env>(
+    vcpu: &mut Vcpu,
+    slot: usize,
+    sh: &'scope Host<'env>,
+    scope: &'scope Scope<'scope, 'env>,
+    proc: &Arc<Proc>,
+    space: &Space,
+    thread: &mut Thread,
+    nr: u64,
+    args: [u64; 6],
+    mut futex: Option<linux_abi::syscall::FutexWait>,
+) -> Result<Option<Next>, Error> {
+    let process = &proc.abi;
+    let strace = strace_on();
+        let may_block = may_block(nr);
+        let action = loop {
+            // Blocked here, for the scheduler to see, before looking for
+            // others waiting: a task queued from now on takes the CPU
+            // back; one queued before, this sees.
+            sched::set_inline(slot, may_block);
+            // Others wait for this CPU: a call that would block on what no
+            // kqueue can watch (a lock, a FIFO's open) gives it up, and a
+            // worker makes it. (The others park, from inside the call: see
+            // linux_abi's `block`.)
+            if may_block && sh.sched.others_waiting() && needs_worker(nr, &args) {
+                sched::set_inline(slot, false);
+                return Ok(Some(Next::Blocked(nr, args)));
+            }
+            // As Linux checks before it sleeps: a signal that came in
+            // while the call was on its way (when nothing could interrupt
+            // it) interrupts it now, rather than after it's slept.
+            if may_block && interruptible(nr, &args) && process.signal_ready(thread) {
+                sched::set_inline(slot, false);
+                break Action::Return(-linux_abi::errno::EINTR);
+            }
+            // A futex wait made again after it parked: the same wait,
+            // still queued (made from scratch, it could miss a wake).
+            let action = match futex.take() {
+                Some(w) => Some(Action::Return(futex_finish_wait(process, thread, w).unwrap_or_else(|e| -e))),
+                None => contained(process, nr, || dispatch(process, thread, space, nr, args)),
+            };
+            sched::set_inline(slot, false);
+            // The call met a runtime error (a panic): its process ends,
+            // and the host carries on.
+            let Some(action) = action else { return Ok(Some(Next::Exit(Exit::Signal(SIGSYS)))) };
+            // The call waits, parked: the CPU goes to another task.
+            if action == Action::Return(-linux_abi::errno::PARK) {
+                sched::take_evict(slot);
+                let park = thread.take_park().expect("a parked call says what it waits for");
+                return Ok(Some(Next::Wait(nr, args, park)));
+            }
+            // It can't park (a file kqueue won't watch): a worker makes it.
+            if action == Action::Return(-linux_abi::errno::OFFLOAD) {
+                sched::take_evict(slot);
+                return Ok(Some(Next::Blocked(nr, args)));
+            }
+            let interrupted = matches!(action, Action::Return(r) if r == -linux_abi::errno::EINTR);
+            // The CPU was taken back, for a task waiting for one, from a
+            // call blocked in the host (a lock, a FIFO's open, a read that
+            // lost a race for data another reader took): a worker makes it
+            // again (nothing was done), or the guest gets EINTR. (Waits that
+            // can park have done so, from inside the call.)
+            if interrupted && sched::take_evict(slot) {
+                if restartable(nr) && !process.exiting() && !process.signal_ready(thread) {
+                    return Ok(Some(Next::Blocked(nr, args)));
+                }
+                break action;
+            }
+            // A host signal the guest blocks (one a signalfd reads, say)
+            // broke a blocking host call, which on Linux it wouldn't: back
+            // into the call, unless there's a signal to act on or the
+            // process is ending.
+            if interrupted && restartable(nr) && !process.exiting() && !process.signal_ready(thread) {
+                continue;
+            }
+            break action;
+        };
+        if nr == linux_abi::nr::WAIT4 {
+            profile::mark("wait4 returned");
+        }
+        if strace {
+            let a = strace_args(space, nr, &args);
+            strace_line(format_args!("{}{}({a}) = {action:?}", who(sh, process, thread), linux_abi::nr::name(nr)));
+        }
+        let ret = match action {
+            // Resuming runs the eret after the hvc, back to the
+            // instruction after the guest's svc.
+            Action::Return(v) => v,
+            Action::Exit(code) => {
+                profile::mark("exit_group");
+                return Ok(Some(Next::Exit(Exit::Code(code))));
+            }
+            Action::ExitThread(code) => return Ok(Some(Next::ExitThread(code))),
+            Action::Spawn(spawn) => spawn_thread(vcpu, sh, scope, proc, space, thread, &spawn)?,
+            Action::SigReturn => match signal::sigreturn(vcpu, space) {
+                Ok(mask) => {
+                    thread.sigreturn(mask);
+                    // The restored mask may let pending signals through.
+                    if let Some(exit) = deliver_signals(vcpu, space, process, thread, None)? {
+                        return Ok(Some(Next::Exit(exit)));
+                    }
+                    return Ok(None);
+                }
+                Err(()) => return Ok(Some(Next::Exit(Exit::Signal(11)))), // SIGSEGV, as Linux
+            },
+            Action::Fork(f) => {
+                profile::mark("fork");
+                let ctx = hv::UserContext::save(vcpu)?;
+                let ret = match &sh.table {
+                    // In the VM: copy on write, the child queued.
+                    Some(table) => match host::fork(sh, scope, table, vcpu, proc, space, thread, ctx, &f)? {
+                        // vfork: the parent waits until its child execs
+                        // or exits, set aside, off its CPU.
+                        Ok(child) if f.vfork => {
+                            if let Some(next) = finish_call(vcpu, space, process, thread, nr, args[0], child)? {
+                                return Ok(Some(next));
+                            }
+                            return Ok(Some(Next::Park(host::Why::Vfork(child))));
+                        }
+                        Ok(child) => child,
+                        Err(e) => -e,
+                    },
+                    None => fork::fork(space, process, thread, &ctx, &f).unwrap_or_else(|e| -e),
+                };
+                profile::mark("fork done, parent resumes");
+                ret
+            }
+            // A Mac program replaces the host process: never with other
+            // processes in its VM (the dispatcher refuses already; this
+            // is the second lock on that door).
+            Action::ExecHost(_) if sh.table.is_some() => -linux_abi::errno::ENOEXEC,
+            Action::ExecHost(exec) => return Ok(Some(Next::ExecHost(exec))),
+            Action::Exec(exec) => {
+                profile::mark("exec: loading");
+                let argv: Vec<&[u8]> = exec.argv.iter().map(Vec::as_slice).collect();
+                let envp: Vec<&[u8]> = exec.envp.iter().map(Vec::as_slice).collect();
+                match load(sh.machine, &exec.elf, &argv, &envp, process) {
+                    Ok(program) => {
+                        profile::mark("exec: loaded");
+                        process.exec_done(thread, exec.exe, &exec.comm);
+                        process.set_arg_area(program.args, program.env);
+                        return Ok(Some(Next::Exec(program)));
+                    }
+                    Err(e) => -exec_errno(&e),
+                }
+            }
+        };
+        finish_call(vcpu, space, process, thread, nr, args[0], ret)
+}
+
 /// `clone` with CLONE_THREAD: start a thread like the caller (x0 = 0, its own
 /// stack and TLS), on an idle CPU, a new one, or when one's free. Returns its
 /// tid, or -EAGAIN if the process is ending.
@@ -1365,7 +1406,7 @@ fn spawn_thread<'scope, 'env>(
         let _ = linux_abi::GuestMemory::write(space, addr, &(tid as i32).to_le_bytes());
     }
     let task = Task::new(child, proc.clone());
-    proc.abi.register_thread(&task.thread, task.location.waker());
+    sh.register(&task);
     // The process is ending: the thread never runs.
     if !place(sh, scope, task, Start::Resume(Box::new(ctx))) {
         return Ok(-linux_abi::errno::EAGAIN);
@@ -1379,21 +1420,52 @@ fn place<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env
     match sh.sched.add(task, start) {
         Placed::Queued => true,
         Placed::NewCpu(task, start) => {
-            // (Not holding the process: the CPU outlives its first task.)
-            let proc = Arc::downgrade(&task.proc);
-            scope.spawn(move || {
-                if let Err(e) = run_cpu(sh, scope, (task, start), false)
-                    && let Some(proc) = proc.upgrade()
-                {
-                    sh.end(&proc, Err(e));
-                }
-            });
+            start_cpu(sh, scope, task, start);
             true
         }
         Placed::Dropped(task) => {
             sh.thread_gone(&task.proc.clone(), task.thread.tid);
             false
         }
+    }
+}
+
+/// Start a CPU (the run queue made room for one) with `task` as its first.
+fn start_cpu<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, task: Task, start: Start) {
+    // (Not holding the process: the CPU outlives its first task.)
+    let proc = Arc::downgrade(&task.proc);
+    scope.spawn(move || {
+        if let Err(e) = run_cpu(sh, scope, (task, start), false)
+            && let Some(proc) = proc.upgrade()
+        {
+            sh.end(&proc, Err(e));
+        }
+    });
+}
+
+/// Put the tasks let run again by threads that couldn't (see
+/// [`park::Ready`]) on the run queue, or on CPUs started for them.
+pub(crate) fn place_ready<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>) {
+    for ready in sh.parking.take_ready() {
+        match ready {
+            Ready::Place(task, start) => {
+                place(sh, scope, task, start);
+            }
+            Ready::NewCpu(task, start) => start_cpu(sh, scope, task, start),
+            Ready::Gone(task) => sh.thread_gone(&task.proc.clone(), task.thread.tid),
+            Ready::Offload(job) => offload(sh, scope, job),
+        }
+    }
+}
+
+/// A call for a worker: an idle one, a new one, or its turn.
+fn offload<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, job: Job) {
+    match sh.sched.offload(job) {
+        Offloaded::Queued => {}
+        Offloaded::NewWorker(job) => {
+            scope.spawn(move || run_worker(sh, scope, job));
+        }
+        Offloaded::Dropped(task) => sh.thread_gone(&task.proc, task.thread.tid),
     }
 }
 

@@ -24,8 +24,7 @@ pub(crate) fn host_exit_watch(pid: i64) -> Result<OwnedFd, i64> {
     let kq = ok(unsafe { libc::kqueue() } as i64)? as i32;
     let kq = unsafe { OwnedFd::from_raw_fd(kq) };
     let ev = libc::kevent { ident: pid as usize, filter: libc::EVFILT_PROC, flags: libc::EV_ADD, fflags: libc::NOTE_EXIT, data: 0, udata: std::ptr::null_mut() };
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    ok(unsafe { libc::kevent(kq.as_raw_fd(), &ev, 1, std::ptr::null_mut(), 0, &zero) } as i64)?;
+    ok(super::kfd::now(kq.as_raw_fd(), &[ev], &mut []) as i64)?;
     Ok(kq)
 }
 

@@ -796,8 +796,27 @@ pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, p
 }
 
 /// [`wait4`] when each Linux process is a host process: the host's `wait4`,
-/// its status in Linux's terms.
-pub(super) fn host_wait4(p: &Process, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
+/// its status in Linux's terms. It doesn't block in the host's: it looks
+/// (WNOHANG) and waits for SIGCHLD to the host (watched in the thread's
+/// waker kqueue, registered before the first look), so that the wait parks
+/// like any other, and a wake can't be missed.
+pub(super) fn host_wait4(p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
+    if options & WNOHANG != 0 {
+        return host_wait4_now(p, pid, options);
+    }
+    t.waker.watch_signal(libc::SIGCHLD);
+    loop {
+        if let Some(got) = host_wait4_now(p, pid, options | WNOHANG)? {
+            return Ok(Some(got));
+        }
+        if p.exiting() || p.signal_ready(t) {
+            return Err(errno::EINTR);
+        }
+        super::block::wait_woken(t, None)?;
+    }
+}
+
+fn host_wait4_now(p: &Process, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
     let mut host_opts = 0;
     if options & WNOHANG != 0 {
         host_opts |= libc::WNOHANG;
@@ -867,8 +886,24 @@ pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, 
 }
 
 /// [`waitid`] when each Linux process is a host process: the host's
-/// `waitid`, in Linux's terms.
-pub(super) fn host_waitid(p: &Process, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
+/// `waitid`, in Linux's terms; waiting as [`host_wait4`] does.
+pub(super) fn host_waitid(p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
+    if options & WNOHANG != 0 {
+        return host_waitid_now(p, idtype, id, options);
+    }
+    t.waker.watch_signal(libc::SIGCHLD);
+    loop {
+        if let Some(got) = host_waitid_now(p, idtype, id, options | WNOHANG)? {
+            return Ok(Some(got));
+        }
+        if p.exiting() || p.signal_ready(t) {
+            return Err(errno::EINTR);
+        }
+        super::block::wait_woken(t, None)?;
+    }
+}
+
+fn host_waitid_now(p: &Process, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
     const WSTOPPED: u64 = 2;
     const WEXITED: u64 = 4;
     const WNOWAIT: u64 = 0x0100_0000;

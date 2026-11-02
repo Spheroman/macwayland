@@ -10,18 +10,20 @@
 //! CPUs wait their turn: a ticker preempts a task that has run a whole slice
 //! while others wait (round robin, for now).
 //!
-//! A system call that would block, while another task waits for a CPU, goes
-//! to a **worker** (a host thread without a vCPU), and the CPU takes the next
-//! task; when the call returns, the task waits for a CPU again. A task that
-//! was already blocked in a call on its CPU when others came to wait is
-//! **evicted**: its call is interrupted and handed to a worker (or, for the
-//! calls Linux lets a signal interrupt, returns EINTR).
+//! A system call that would block, while another task waits for a CPU,
+//! **parks** its task (see `park`: it waits in a kqueue, or in memory, with
+//! no host thread), and the CPU takes the next task; when the wait is over,
+//! the task waits for a CPU again and makes the call there. A task that was
+//! already blocked in a call on its CPU when others came to wait is
+//! **evicted**: its call is interrupted, and parks. Calls with nothing a
+//! kqueue can watch (`flock`, a FIFO's `open`) go to a **worker** (a host
+//! thread without a vCPU) instead, from a bounded pool.
 
 use std::{
     collections::VecDeque,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -44,6 +46,9 @@ pub(crate) enum Start {
     /// the call left them, at the instruction after the `svc`), and the
     /// call's result.
     AfterCall { ctx: Box<UserContext>, nr: u64, arg0: u64, ret: i64 },
+    /// Back from a parked wait: these registers (at the instruction after
+    /// the `svc`), and the call to make again, with what its wait had.
+    Retry { ctx: Box<UserContext>, nr: u64, args: [u64; 6], park: linux_abi::syscall::Park },
 }
 
 /// A system call for a worker to make, for a task that gave up its CPU.
@@ -52,8 +57,6 @@ pub(crate) struct Job {
     pub ctx: Box<UserContext>,
     pub nr: u64,
     pub args: [u64; 6],
-    /// For a futex wait: begun on the CPU (the thread queued), to sleep out.
-    pub wait: Option<linux_abi::syscall::FutexWait>,
 }
 
 /// How long a task runs before one that's waiting gets the CPU.
@@ -101,13 +104,21 @@ pub(crate) fn take_evict(slot: usize) -> bool {
 thread_local! {
     /// The signal slot of the CPU this host thread is (None: not a CPU).
     static THIS_CPU: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The run queue of this CPU's host.
+    static THIS_SCHED: std::cell::RefCell<Option<Arc<Sched>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// For `linux_abi`'s blocking calls: whether this host thread's CPU is being
-/// taken back (so a call waiting in a loop of its own should give up).
-pub(crate) fn evicting() -> bool {
-    THIS_CPU.with(|cpu| cpu.get().is_some_and(|slot| EVICT[slot].load(Ordering::Acquire)))
+/// For `linux_abi`'s blocking calls: whether the call on this host thread
+/// should leave its CPU rather than sleep on it (park): it's a CPU, and
+/// tasks wait for one, or this one is being taken back.
+pub(crate) fn should_yield() -> bool {
+    let Some(slot) = THIS_CPU.with(|cpu| cpu.get()) else { return false };
+    EVICT[slot].load(Ordering::Acquire) || THIS_SCHED.with(|s| s.borrow().as_ref().is_some_and(|s| s.others_waiting()))
 }
+
+/// The most workers a host has: they're for calls with nothing a kqueue can
+/// watch, which are few; more wait their turn.
+const MAX_WORKERS: usize = 256;
 
 /// How many CPUs a process gets: one per physical core (at most 64, the
 /// most Hypervisor.framework allows); MACWL_CPUS=n for fewer (tests).
@@ -131,6 +142,8 @@ pub(crate) struct Sched {
     /// Tasks waiting for a CPU (`ready.len()`, readable without the lock:
     /// each system call that may block asks).
     waiting: AtomicUsize,
+    /// The host's parking kqueue, told when the host ends (-1: none).
+    stop_kq: AtomicI32,
 }
 
 struct State {
@@ -189,7 +202,13 @@ impl Sched {
             changed: Condvar::new(),
             jobs_changed: Condvar::new(),
             waiting: AtomicUsize::new(0),
+            stop_kq: AtomicI32::new(-1),
         }
+    }
+
+    /// Tell `kq`'s waiters when the host ends.
+    pub fn set_stop_kq(&self, kq: i32) {
+        self.stop_kq.store(kq, Ordering::Release);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -304,6 +323,10 @@ impl Sched {
         s.stopping = true;
         self.changed.notify_all();
         self.jobs_changed.notify_all();
+        let kq = self.stop_kq.load(Ordering::Acquire);
+        if kq >= 0 {
+            crate::park::stop(kq);
+        }
         let mut tasks: Vec<Task> = s.ready.drain(..).map(|(t, _)| t).collect();
         tasks.extend(s.jobs.drain(..).map(|j| j.task));
         self.waiting.store(0, Ordering::Release);
@@ -340,7 +363,7 @@ impl Sched {
         // As for CPUs: an idle worker counts once, however many jobs come
         // before it wakes. (Left queued behind a job that blocks for good,
         // one would never be made.)
-        if s.jobs.len() >= s.idle_workers {
+        if s.jobs.len() >= s.idle_workers && s.workers < MAX_WORKERS {
             s.workers += 1;
             return Offloaded::NewWorker(job);
         }
@@ -403,11 +426,12 @@ pub(crate) struct Cpu<'vm> {
 impl<'vm> Cpu<'vm> {
     /// A CPU on this host thread, or why there's none: no vCPU to be had
     /// (Hypervisor.framework allows 64 a process), or no slot left.
-    pub fn new(vm: &'vm Vm) -> Result<Self, crate::Error> {
+    pub fn new(vm: &'vm Vm, sched: &Arc<Sched>) -> Result<Self, crate::Error> {
         let vcpu = Vcpu::new(vm)?;
         let slot = signal::add_vcpu(vcpu.id()).ok_or_else(|| crate::Error::Unexpected("no vCPU slot left".into()))?;
         THIS_CPU.with(|cpu| cpu.set(Some(slot)));
-        linux_abi::syscall::set_yield_check(evicting);
+        THIS_SCHED.with(|s| *s.borrow_mut() = Some(sched.clone()));
+        linux_abi::syscall::set_yield_check(should_yield);
         Ok(Cpu { vcpu, slot })
     }
 }
@@ -416,6 +440,7 @@ impl Drop for Cpu<'_> {
     fn drop(&mut self) {
         // Out of the tables before the vCPU goes (it's dropped after this).
         THIS_CPU.with(|cpu| cpu.set(None));
+        THIS_SCHED.with(|s| *s.borrow_mut() = None);
         signal::remove_vcpu(self.slot);
     }
 }
@@ -423,7 +448,11 @@ impl Drop for Cpu<'_> {
 /// Where a task is, for whoever needs its attention (a signal for it, the
 /// process ending): an atomic, as wakers run on other threads.
 #[derive(Debug)]
-pub(crate) struct Location(AtomicU64);
+pub(crate) struct Location {
+    at: AtomicU64,
+    /// Its id while it's parked (see `park`).
+    pub id: u64,
+}
 
 /// Nowhere to reach: not running, not in a host call.
 const NOWHERE: u64 = u64::MAX;
@@ -434,23 +463,23 @@ const WORKER: u64 = 1 << 62;
 impl Location {
     /// In a system call on this (worker) host thread.
     pub fn set_worker(&self) {
-        self.0.store(WORKER | unsafe { libc::pthread_self() } as u64, Ordering::Release);
+        self.at.store(WORKER | unsafe { libc::pthread_self() } as u64, Ordering::Release);
     }
 
     /// Running on the CPU in signal slot `slot` (in the guest, or in a
     /// system call on that CPU's host thread).
     pub fn set_running(&self, slot: usize) {
-        self.0.store(slot as u64, Ordering::Release);
+        self.at.store(slot as u64, Ordering::Release);
     }
 
     pub fn set_nowhere(&self) {
-        self.0.store(NOWHERE, Ordering::Release);
+        self.at.store(NOWHERE, Ordering::Release);
     }
 
     /// Get the task's attention: out of the guest, and out of whatever
     /// host call it's blocked in.
     pub fn wake(&self) {
-        match self.0.load(Ordering::Acquire) {
+        match self.at.load(Ordering::Acquire) {
             NOWHERE => {}
             worker if worker & WORKER != 0 => unsafe {
                 libc::pthread_kill((worker & !WORKER) as libc::pthread_t, signal::INTERRUPT);
@@ -478,6 +507,6 @@ pub(crate) struct Task {
 
 impl Task {
     pub fn new(thread: Thread, proc: Arc<Proc>) -> Self {
-        Task { thread, proc, location: Arc::new(Location(AtomicU64::new(NOWHERE))), last_cpu: None }
+        Task { thread, proc, location: Arc::new(Location { at: AtomicU64::new(NOWHERE), id: crate::park::new_id() }), last_cpu: None }
     }
 }

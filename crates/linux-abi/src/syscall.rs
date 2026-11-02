@@ -8,6 +8,7 @@
 
 mod block;
 pub(crate) use block::can_block;
+pub use block::wait_woken;
 mod epoll;
 mod futex;
 mod inotify;
@@ -30,6 +31,7 @@ mod tests;
 pub(crate) use epoll::{new_instance as new_epoll, rewatch};
 pub(crate) use inotify::{inotify_copy, inotify_pending, inotify_read};
 pub(crate) use kfd::{eventfd_copy, timerfd_copy};
+pub use kfd::now as kevent_now;
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::{HostSignalWait, SignalFd};
 pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
@@ -147,24 +149,73 @@ pub struct Thread {
     pub clear_child_tid: u64,
     /// Its process's inbox, whose alerts reach its waker.
     inbox: Arc<Inbox>,
+    /// What a call that parked waits for (see [`Thread::take_park`]).
+    park: Mutex<Option<Park>>,
+    /// The call is made again after a parked wait: the deadline that wait
+    /// had (Some(None): none), which the call keeps rather than starting
+    /// its timeout over.
+    retry: Option<Option<std::time::Instant>>,
+}
+
+/// What a call waits for, having returned [`errno::PARK`] to the core: its
+/// files (for the core to watch), its deadline, and (`futex`) the wait
+/// still queued; wakes reach it through the waker's unpark hook. The core holds this while the task waits, and gives back
+/// the deadline ([`Thread::set_retry`]) and the futex wait
+/// ([`futex_finish_wait`]) when it makes the call again.
+#[derive(Debug)]
+pub struct Park {
+    /// Host fds and the poll events it waits for (none: a wait in memory,
+    /// which the waker's unpark hook ends).
+    pub watch: Vec<(i32, i16)>,
+    pub deadline: Option<std::time::Instant>,
+    pub futex: Option<FutexWait>,
+    /// The files the call uses, kept open while it waits.
+    pub files: Vec<Arc<crate::fs::OpenFile>>,
 }
 
 impl Thread {
     /// The process's first thread (tid = pid).
     pub fn main(p: &Process) -> Thread {
         let waker = p.inbox.new_waker();
-        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker, clear_child_tid: 0, inbox: p.inbox.clone() }
+        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker, clear_child_tid: 0, inbox: p.inbox.clone(), park: Mutex::new(None), retry: None }
     }
 
     /// A thread `self` creates (`clone` with CLONE_THREAD), as tid `tid`.
     pub fn spawn(&self, tid: i64) -> Thread {
         let waker = self.inbox.new_waker();
-        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker, clear_child_tid: 0, inbox: self.inbox.clone() }
+        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker, clear_child_tid: 0, inbox: self.inbox.clone(), park: Mutex::new(None), retry: None }
     }
 
     /// The signals it blocks (Linux numbering, bit n-1 for signal n).
     pub fn blocked_signals(&self) -> u64 {
         self.signals.blocked
+    }
+
+    /// What the call that returned [`errno::PARK`] waits for.
+    pub fn take_park(&self) -> Option<Park> {
+        self.park.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    pub(crate) fn set_park(&self, park: Park) {
+        *self.park.lock().unwrap_or_else(|e| e.into_inner()) = Some(park);
+    }
+
+    /// The next call is one made again after a parked wait, which had
+    /// `deadline` (None: it's a call like any other).
+    pub fn set_retry(&mut self, deadline: Option<Option<std::time::Instant>>) {
+        self.retry = deadline;
+    }
+
+    /// Whether the call is one made again after a parked wait.
+    pub(crate) fn retrying(&self) -> bool {
+        self.retry.is_some()
+    }
+
+    /// The deadline of a wait the call makes, `computed` from its timeout
+    /// now: the first time, that; made again after a parked wait, the one
+    /// it had then (a timeout runs from the call, not from each try).
+    pub(crate) fn deadline(&self, computed: Option<std::time::Instant>) -> Option<std::time::Instant> {
+        self.retry.unwrap_or(computed)
     }
 }
 
@@ -246,8 +297,15 @@ impl Process {
     /// host process is likely to have (Linux tids share the pid space), and
     /// unique within the process.
     pub fn new_tid(&self) -> i64 {
-        let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        0x1000_0000 + (self.pid % 0x8000) * 0x1000 + (n % 0x1000)
+        // 65536 a process (more threads than that can be blocked at once),
+        // skipping those still in use as they come round again.
+        loop {
+            let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let tid = 0x1000_0000 + (self.pid % 0x800) * 0x1_0000 + (n % 0x1_0000);
+            if !self.inbox.threads().contains_key(&tid) {
+                return tid;
+            }
+        }
     }
 
     /// Its program's arguments and environment are at `[args.0, args.1)`
@@ -399,6 +457,16 @@ pub enum Action {
 /// Run system call `nr` with arguments x0–x5, for thread `t`.
 pub fn dispatch<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, nr: u64, args: [u64; 6]) -> Action {
     let action = dispatch_call(p, t, mem, nr, args);
+    if action == Action::Return(-errno::PARK) {
+        // The call is made again when the wait is over, and sets a mask
+        // of its own again (ppoll's, sigsuspend's): the thread's own until
+        // then. And the files it uses stay open while it waits.
+        t.signals.end_wait_mask();
+        let files = crate::fs::take_in_flight();
+        if let Some(park) = t.park.get_mut().unwrap_or_else(|e| e.into_inner()) {
+            park.files = files;
+        }
+    }
     crate::fs::end_call();
     t.sync_host_mask();
     action
@@ -596,7 +664,7 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::LISTEN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::listen(h, a1 as i32) } as i64)),
         nr::ACCEPT => net::accept4(p, t, mem, a0, a1, a2, 0),
         nr::ACCEPT4 => net::accept4(p, t, mem, a0, a1, a2, a3),
-        nr::CONNECT => net::connect(p, mem, a0, a1, a2),
+        nr::CONNECT => net::connect(p, t, mem, a0, a1, a2),
         nr::GETSOCKNAME => net::getname(p, mem, a0, a1, a2, false),
         nr::GETPEERNAME => net::getname(p, mem, a0, a1, a2, true),
         nr::SENDTO => net::sendto(p, t, mem, a0, a1, a2, a3, a4, a5),

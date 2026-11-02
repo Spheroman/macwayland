@@ -180,8 +180,27 @@ fn finish(result: Result<Exit, macwl_runtime::Error>) -> ExitCode {
     }
 }
 
+/// As many host fds as the Mac allows a process: each guest thread has a
+/// kqueue (its waker), and a host blocks thousands of threads (a shell's
+/// default soft limit is 256).
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    let mut max: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let per_proc = if unsafe { libc::sysctlbyname(c"kern.maxfilesperproc".as_ptr(), (&raw mut max).cast(), &mut len, std::ptr::null_mut(), 0) } == 0 { max as u64 } else { 10240 };
+    let want = lim.rlim_max.min(per_proc);
+    if want > lim.rlim_cur {
+        lim.rlim_cur = want;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    }
+}
+
 fn main() -> ExitCode {
     macwl_runtime::profile::mark("main");
+    raise_fd_limit();
     // A guest process forked by another (see the runtime's fork module).
     if std::env::args_os().nth(1).is_some_and(|a| a == "--fork-child") {
         return finish(macwl_runtime::run_fork_child());

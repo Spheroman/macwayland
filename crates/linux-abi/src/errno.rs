@@ -68,6 +68,16 @@ pub const EALREADY: i64 = 114;
 pub const EINPROGRESS: i64 = 115;
 pub const ECANCELED: i64 = 125;
 
+/// Not errnos the guest ever sees: what a call that would block tells the
+/// core instead, on a CPU that's wanted for another thread (see
+/// `syscall::block`). PARK: the thread waits off its CPU for what
+/// `Thread::take_park` says, and the call is made again once that comes.
+/// OFFLOAD: the wait can't be watched that way (a file kqueue can't
+/// watch); a worker makes the call. (Linux keeps 512 and up for its own
+/// such values, ERESTARTSYS and friends.)
+pub const PARK: i64 = 600;
+pub const OFFLOAD: i64 = 601;
+
 /// Translate a Darwin errno (as from `io::Error::raw_os_error`) to Linux.
 pub fn from_darwin(e: i32) -> i64 {
     match e {

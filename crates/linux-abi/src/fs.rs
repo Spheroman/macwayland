@@ -160,6 +160,19 @@ pub fn end_call() {
     IN_FLIGHT.with(|f| f.borrow_mut().clear());
 }
 
+/// The current system call uses `file` too (its host fd stays open until
+/// the call ends, or while the call waits parked: [`take_in_flight`]).
+pub(crate) fn hold(file: &Arc<OpenFile>) {
+    IN_FLIGHT.with(|f| f.borrow_mut().push(file.clone()));
+}
+
+/// The files the current call uses, for a wait that leaves this host
+/// thread (a parked task) to keep open: the host fds it watches mustn't be
+/// closed and reused while it waits.
+pub(crate) fn take_in_flight() -> Vec<Arc<OpenFile>> {
+    IN_FLIGHT.with(|f| std::mem::take(&mut *f.borrow_mut()))
+}
+
 /// Guest fd numbers → open files. Guest numbering is independent of the
 /// host's, so a guest's fd 3 can be any host fd. Shared by the process's
 /// threads.

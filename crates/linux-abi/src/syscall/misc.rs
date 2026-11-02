@@ -84,7 +84,7 @@ pub(super) fn nanosleep<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &
         return Err(errno::EINVAL);
     }
     let now = std::time::Instant::now();
-    let deadline = now.checked_add(std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+    let deadline = t.deadline(now.checked_add(std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)));
     let r = super::block::sleep(p, t, deadline);
     if r == Err(errno::EINTR) && rem != 0 {
         let left = deadline.map_or(std::time::Duration::MAX, |d| d.saturating_duration_since(std::time::Instant::now()));
