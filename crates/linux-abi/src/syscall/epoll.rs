@@ -163,15 +163,31 @@ pub(super) fn epoll_wait<M: GuestMemory + ?Sized>(
     if sigmask != 0 {
         signal::wait_with_mask(t, mem.read_pod::<u64>(sigmask)?);
     }
-    if p.signal_ready(t) {
-        return Err(errno::EINTR);
-    }
     // Room for a read and a write event per fd.
     let n = (maxevents as usize).min(1024) * 2;
     let mut out: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; n];
-    let ts = timeout.map(|t| libc::timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
-    let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
-    let got = ok(unsafe { libc::kevent(ep.host.as_raw_fd(), std::ptr::null(), 0, out.as_mut_ptr(), n as i32, tsp) } as i64)? as usize;
+    let kq = ep.host.as_raw_fd();
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let deadline = timeout.map(|ts| {
+        let now = std::time::Instant::now();
+        now.checked_add(std::time::Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)).unwrap_or(now + std::time::Duration::from_secs(1 << 32))
+    });
+    // The kqueue reads as ready when it has events: the thread sleeps on it
+    // where a wakeup can't be missed (see `block`), then takes them.
+    let got = loop {
+        if p.signal_ready(t) {
+            return Err(errno::EINTR);
+        }
+        let got = ok(unsafe { libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), n as i32, &zero) } as i64)? as usize;
+        if got > 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break got;
+        }
+        let mut fds = vec![libc::pollfd { fd: kq, events: libc::POLLIN, revents: 0 }];
+        if super::block::poll(p, t, &mut fds, deadline)?.is_err() {
+            // Timed out: whatever came last.
+            break ok(unsafe { libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), n as i32, &zero) } as i64)? as usize;
+        }
+    };
 
     // One epoll_event per guest fd, in the order kqueue reported them.
     let mut ready: Vec<(i32, u32)> = Vec::new();

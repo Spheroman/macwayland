@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{misc, ok, Process};
+use super::{misc, ok, Process, Thread};
 use crate::{
     abi::Timespec,
     errno,
@@ -62,10 +62,17 @@ pub(super) fn drain(kq: RawFd) {
     while unsafe { libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 4, &zero) } > 0 {}
 }
 
-/// Block until the kqueue has something (a signal interrupts: EINTR).
-pub(super) fn wait(kq: RawFd) -> Result<(), i64> {
+/// Block until the kqueue has something (a signal interrupts: EINTR): for
+/// a host thread of the runtime's own.
+pub(super) fn wait_raw(kq: RawFd) -> Result<(), i64> {
     let mut out: libc::kevent = unsafe { std::mem::zeroed() };
     ok(unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null()) } as i64).map(|_| ())
+}
+
+/// Thread `t` of `p` waits until the kqueue has something, or it's called
+/// away (EINTR): see `block`.
+pub(super) fn wait(p: &Process, t: &Thread, kq: RawFd) -> Result<(), i64> {
+    super::block::poll(p, t, &mut vec![libc::pollfd { fd: kq, events: libc::POLLIN, revents: 0 }], None).map(|_| ())
 }
 
 pub(super) fn nonblocking(file: &OpenFile) -> bool {
@@ -125,7 +132,7 @@ pub(super) fn eventfd2(p: &Process, initval: u64, flags: u64) -> Result<i64, i64
 }
 
 /// `read` on an eventfd: the count (or 1, for a semaphore), which resets.
-pub(crate) fn eventfd_read(file: &OpenFile, state: &Mutex<EventFd>, buf: &mut [u8]) -> Result<i64, i64> {
+pub(crate) fn eventfd_read(p: &Process, t: &Thread, file: &OpenFile, state: &Mutex<EventFd>, buf: &mut [u8]) -> Result<i64, i64> {
     if buf.len() < 8 {
         return Err(errno::EINVAL);
     }
@@ -147,7 +154,7 @@ pub(crate) fn eventfd_read(file: &OpenFile, state: &Mutex<EventFd>, buf: &mut [u
         if nonblocking(file) {
             return Err(errno::EAGAIN);
         }
-        wait(kq)?;
+        wait(p, t, kq)?;
     }
 }
 
@@ -255,7 +262,7 @@ pub(super) fn timerfd_gettime<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd:
 }
 
 /// `read` on a timerfd: how many times it has expired since the last read.
-pub(crate) fn timerfd_read(file: &OpenFile, timer: &Mutex<TimerFd>, buf: &mut [u8]) -> Result<i64, i64> {
+pub(crate) fn timerfd_read(p: &Process, t: &Thread, file: &OpenFile, timer: &Mutex<TimerFd>, buf: &mut [u8]) -> Result<i64, i64> {
     if buf.len() < 8 {
         return Err(errno::EINVAL);
     }
@@ -284,6 +291,6 @@ pub(crate) fn timerfd_read(file: &OpenFile, timer: &Mutex<TimerFd>, buf: &mut [u
         if nonblocking(file) {
             return Err(errno::EAGAIN);
         }
-        wait(kq)?;
+        wait(p, t, kq)?;
     }
 }

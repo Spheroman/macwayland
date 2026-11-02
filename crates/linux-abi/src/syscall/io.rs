@@ -6,7 +6,7 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use super::{gather, iov_len, iovecs, kfd, ok, path_arg, scatter, tty, Process, MAX_IO};
+use super::{gather, iov_len, iovecs, kfd, ok, path_arg, scatter, tty, Process, Thread, MAX_IO};
 use crate::{
     abi::{self, fcntl, ioctl, o, PollFd, Timespec, POLLRDHUP},
     errno,
@@ -19,13 +19,13 @@ use crate::{
 const MAX_FD: u64 = 1024;
 
 /// Read from `fd` into `data`, at `off` or (None) the file position.
-fn read_host(p: &Process, fd: u64, data: &mut [u8], off: Option<u64>) -> Result<i64, i64> {
+fn read_host(p: &Process, t: &Thread, fd: u64, data: &mut [u8], off: Option<u64>) -> Result<i64, i64> {
     let entry = p.fds.get(fd)?;
     match &entry.kind {
-        FileKind::EventFd(state) => return kfd::eventfd_read(&entry, state, data),
-        FileKind::TimerFd(timer) => return kfd::timerfd_read(&entry, timer, data),
-        FileKind::Inotify(_) => return super::inotify_read(&entry, data),
-        FileKind::SignalFd(signalfd) => return super::signalfd_read(p, &entry, signalfd, data),
+        FileKind::EventFd(state) => return kfd::eventfd_read(p, t, &entry, state, data),
+        FileKind::TimerFd(timer) => return kfd::timerfd_read(p, t, &entry, timer, data),
+        FileKind::Inotify(_) => return super::inotify_read(p, t, &entry, data),
+        FileKind::SignalFd(signalfd) => return super::signalfd_read(p, t, &entry, signalfd, data),
         FileKind::Epoll(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
@@ -38,6 +38,9 @@ fn read_host(p: &Process, fd: u64, data: &mut [u8], off: Option<u64>) -> Result<
         }
         return Ok(n as i64);
     }
+    if off.is_none() {
+        super::block::ready(p, t, &entry, libc::POLLIN)?;
+    }
     let ptr = data.as_mut_ptr().cast();
     ok(match off {
         Some(off) => unsafe { libc::pread(host, ptr, data.len(), off as i64) },
@@ -46,7 +49,7 @@ fn read_host(p: &Process, fd: u64, data: &mut [u8], off: Option<u64>) -> Result<
 }
 
 /// Write `data` to `fd`, at `off` or (None) the file position.
-fn write_host(p: &Process, fd: u64, data: &[u8], off: Option<u64>) -> Result<i64, i64> {
+fn write_host(p: &Process, t: &Thread, fd: u64, data: &[u8], off: Option<u64>) -> Result<i64, i64> {
     let entry = p.fds.get(fd)?;
     match &entry.kind {
         FileKind::EventFd(state) => return kfd::eventfd_write(&entry, state, data),
@@ -67,6 +70,9 @@ fn write_host(p: &Process, fd: u64, data: &[u8], off: Option<u64>) -> Result<i64
         }
         return Ok(n as i64);
     }
+    if off.is_none() {
+        super::block::ready(p, t, &entry, libc::POLLOUT)?;
+    }
     let ptr = data.as_ptr().cast();
     match off {
         Some(off) => ok(unsafe { libc::pwrite(host, ptr, data.len(), off as i64) } as i64),
@@ -75,51 +81,51 @@ fn write_host(p: &Process, fd: u64, data: &[u8], off: Option<u64>) -> Result<i64
     }
 }
 
-pub(super) fn read<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, len: u64) -> Result<i64, i64> {
+pub(super) fn read<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, buf: u64, len: u64) -> Result<i64, i64> {
     let mut data = vec![0u8; len.min(MAX_IO) as usize];
-    let n = read_host(p, fd, &mut data, None)?;
+    let n = read_host(p, t, fd, &mut data, None)?;
     mem.write(buf, &data[..n as usize])?;
     Ok(n)
 }
 
-pub(super) fn write<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, len: u64) -> Result<i64, i64> {
+pub(super) fn write<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, buf: u64, len: u64) -> Result<i64, i64> {
     let mut data = vec![0u8; len.min(MAX_IO) as usize];
     mem.read(buf, &mut data)?;
-    write_host(p, fd, &data, None)
+    write_host(p, t, fd, &data, None)
 }
 
-pub(super) fn readv<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, iov: u64, count: u64) -> Result<i64, i64> {
+pub(super) fn readv<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, iov: u64, count: u64) -> Result<i64, i64> {
     let iov = iovecs(mem, iov, count)?;
     let mut data = vec![0u8; iov_len(&iov) as usize];
-    let n = read_host(p, fd, &mut data, None)?;
+    let n = read_host(p, t, fd, &mut data, None)?;
     scatter(mem, &iov, &data[..n as usize])?;
     Ok(n)
 }
 
 /// Gathers into one buffer for a single host `write`, which keeps writev's
 /// all-at-once behaviour for pipes and sockets.
-pub(super) fn writev<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, iov: u64, count: u64) -> Result<i64, i64> {
+pub(super) fn writev<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, iov: u64, count: u64) -> Result<i64, i64> {
     let data = gather(mem, &iovecs(mem, iov, count)?)?;
-    write_host(p, fd, &data, None)
+    write_host(p, t, fd, &data, None)
 }
 
-pub(super) fn pread<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, len: u64, off: u64) -> Result<i64, i64> {
+pub(super) fn pread<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, buf: u64, len: u64, off: u64) -> Result<i64, i64> {
     if (off as i64) < 0 {
         return Err(errno::EINVAL);
     }
     let mut data = vec![0u8; len.min(MAX_IO) as usize];
-    let n = read_host(p, fd, &mut data, Some(off))?;
+    let n = read_host(p, t, fd, &mut data, Some(off))?;
     mem.write(buf, &data[..n as usize])?;
     Ok(n)
 }
 
-pub(super) fn pwrite<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, len: u64, off: u64) -> Result<i64, i64> {
+pub(super) fn pwrite<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, buf: u64, len: u64, off: u64) -> Result<i64, i64> {
     if (off as i64) < 0 {
         return Err(errno::EINVAL);
     }
     let mut data = vec![0u8; len.min(MAX_IO) as usize];
     mem.read(buf, &mut data)?;
-    write_host(p, fd, &data, Some(off))
+    write_host(p, t, fd, &data, Some(off))
 }
 
 pub(super) fn lseek(p: &Process, fd: u64, off: i64, whence: u64) -> Result<i64, i64> {
@@ -465,25 +471,14 @@ pub(super) fn pselect6<M: GuestMemory + ?Sized>(p: &Process, t: &mut super::Thre
             fds.push(fd);
         }
     }
-    let ms = if timeout == 0 {
-        -1
-    } else {
-        let ts: Timespec = mem.read_pod(timeout)?;
-        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-            return Err(errno::EINVAL);
-        }
-        (ts.tv_sec.saturating_mul(1000) + (ts.tv_nsec + 999_999) / 1_000_000).min(i32::MAX as i64) as i32
-    };
+    let deadline = poll_deadline(mem, timeout)?;
     if sigmask != 0 {
         let mask_ptr: u64 = mem.read_pod(sigmask)?;
         if mask_ptr != 0 {
             super::signal::wait_with_mask(t, mem.read_pod::<u64>(mask_ptr)?);
         }
     }
-    if p.signal_ready(t) {
-        return Err(errno::EINTR);
-    }
-    ok(unsafe { libc::poll(host.as_mut_ptr(), host.len() as libc::nfds_t, ms) } as i64)?;
+    let _ready_or_timed_out = super::block::poll(p, t, &mut host, deadline)?;
     // Back into the sets: what's ready, and only that.
     let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
     let mut count = 0;
@@ -525,8 +520,23 @@ fn host_poll_events(host: i32, events: i16) -> i16 {
     }
 }
 
-/// `ppoll`.
-pub(super) fn ppoll<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fds: u64, nfds: u64, timeout: u64) -> Result<i64, i64> {
+/// When a `ppoll` or `pselect6` with this timeout (a guest `timespec`, 0
+/// for none) gives up.
+fn poll_deadline<M: GuestMemory + ?Sized>(mem: &M, timeout: u64) -> Result<Option<std::time::Instant>, i64> {
+    if timeout == 0 {
+        return Ok(None);
+    }
+    let ts: Timespec = mem.read_pod(timeout)?;
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(errno::EINVAL);
+    }
+    let d = std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+    Ok(Some(std::time::Instant::now().checked_add(d).unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(1 << 32))))
+}
+
+/// `ppoll(fds, nfds, timeout, sigmask, size)`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ppoll<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, fds: u64, nfds: u64, timeout: u64, sigmask: u64) -> Result<i64, i64> {
     if nfds > MAX_FD * 64 {
         return Err(errno::EINVAL);
     }
@@ -549,16 +559,11 @@ pub(super) fn ppoll<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fds: u64, nfd
             libc::pollfd { fd, events: events & !POLLRDHUP, revents: 0 }
         })
         .collect();
-    let ms = if timeout == 0 {
-        -1
-    } else {
-        let ts: Timespec = mem.read_pod(timeout)?;
-        if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-            return Err(errno::EINVAL);
-        }
-        (ts.tv_sec.saturating_mul(1000) + (ts.tv_nsec + 999_999) / 1_000_000).min(i32::MAX as i64) as i32
-    };
-    let mut n = ok(unsafe { libc::poll(host.as_mut_ptr(), host.len() as libc::nfds_t, ms) } as i64)?;
+    let deadline = poll_deadline(mem, timeout)?;
+    if sigmask != 0 {
+        super::signal::wait_with_mask(t, mem.read_pod::<u64>(sigmask)?);
+    }
+    let mut n = super::block::poll(p, t, &mut host, deadline)?.unwrap_or(0);
     for (i, pf) in polls.iter_mut().enumerate() {
         pf.revents = if invalid[i] {
             n += 1;

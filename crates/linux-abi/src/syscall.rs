@@ -6,6 +6,8 @@
 //! returns -ENOSYS and is logged once per call number, so running a program
 //! shows what to implement next.
 
+mod block;
+pub(crate) use block::can_block;
 mod epoll;
 mod futex;
 mod inotify;
@@ -425,8 +427,8 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         // macOS has no CPU affinity: accept any mask, as if the scheduler
         // honoured it.
         nr::SCHED_SETAFFINITY => Ok(0),
-        nr::NANOSLEEP => misc::nanosleep(mem, a0, a1),
-        nr::CLOCK_NANOSLEEP => misc::clock_nanosleep(mem, a0, a1, a2, a3),
+        nr::NANOSLEEP => misc::nanosleep(p, t, mem, a0, a1),
+        nr::CLOCK_NANOSLEEP => misc::clock_nanosleep(p, t, mem, a0, a1, a2, a3),
         nr::UNAME => misc::uname(mem, a0),
         nr::GETRANDOM => misc::getrandom(mem, a0, a1),
         nr::PRLIMIT64 => misc::prlimit64(p, mem, a0, a1, a2, a3),
@@ -456,12 +458,12 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::MPROTECT => neg(mem.mprotect(a0, a1, a2)),
         nr::MADVISE => mem::madvise(p, mem, a0, a1, a2),
 
-        nr::READ => io::read(p, mem, a0, a1, a2),
-        nr::WRITE => io::write(p, mem, a0, a1, a2),
-        nr::READV => io::readv(p, mem, a0, a1, a2),
-        nr::WRITEV => io::writev(p, mem, a0, a1, a2),
-        nr::PREAD64 => io::pread(p, mem, a0, a1, a2, a3),
-        nr::PWRITE64 => io::pwrite(p, mem, a0, a1, a2, a3),
+        nr::READ => io::read(p, t, mem, a0, a1, a2),
+        nr::WRITE => io::write(p, t, mem, a0, a1, a2),
+        nr::READV => io::readv(p, t, mem, a0, a1, a2),
+        nr::WRITEV => io::writev(p, t, mem, a0, a1, a2),
+        nr::PREAD64 => io::pread(p, t, mem, a0, a1, a2, a3),
+        nr::PWRITE64 => io::pwrite(p, t, mem, a0, a1, a2, a3),
         nr::LSEEK => io::lseek(p, a0, a1 as i64, a2),
         nr::CLOSE => p.fds.remove(a0).map(|_| 0),
         nr::DUP => io::dup(p, a0),
@@ -469,7 +471,7 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::FCNTL => io::fcntl(p, mem, a0, a1, a2),
         nr::IOCTL => io::ioctl(p, mem, a0, a1, a2),
         nr::PIPE2 => io::pipe2(p, mem, a0, a1),
-        nr::PPOLL => io::ppoll(p, mem, a0, a1, a2),
+        nr::PPOLL => io::ppoll(p, t, mem, a0, a1, a2, a3),
         nr::PSELECT6 => io::pselect6(p, t, mem, a0, [a1, a2, a3], a4, a5),
         nr::EPOLL_CREATE1 => epoll::epoll_create1(p, a0),
         nr::EVENTFD2 => kfd::eventfd2(p, a0, a1),
@@ -530,20 +532,20 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::SOCKETPAIR => net::socketpair(p, mem, a0, a1, a2, a3),
         nr::BIND => net::bind(p, mem, a0, a1, a2),
         nr::LISTEN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::listen(h, a1 as i32) } as i64)),
-        nr::ACCEPT => net::accept4(p, mem, a0, a1, a2, 0),
-        nr::ACCEPT4 => net::accept4(p, mem, a0, a1, a2, a3),
+        nr::ACCEPT => net::accept4(p, t, mem, a0, a1, a2, 0),
+        nr::ACCEPT4 => net::accept4(p, t, mem, a0, a1, a2, a3),
         nr::CONNECT => net::connect(p, mem, a0, a1, a2),
         nr::GETSOCKNAME => net::getname(p, mem, a0, a1, a2, false),
         nr::GETPEERNAME => net::getname(p, mem, a0, a1, a2, true),
-        nr::SENDTO => net::sendto(p, mem, a0, a1, a2, a3, a4, a5),
-        nr::RECVFROM => net::recvfrom(p, mem, a0, a1, a2, a3, a4, a5),
+        nr::SENDTO => net::sendto(p, t, mem, a0, a1, a2, a3, a4, a5),
+        nr::RECVFROM => net::recvfrom(p, t, mem, a0, a1, a2, a3, a4, a5),
         nr::SETSOCKOPT => net::setsockopt(p, mem, a0, a1, a2, a3, a4),
         nr::GETSOCKOPT => net::getsockopt(p, mem, a0, a1, a2, a3, a4),
         nr::SHUTDOWN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::shutdown(h, a1 as i32) } as i64)),
-        nr::SENDMSG => net::sendmsg(p, mem, a0, a1, a2),
-        nr::RECVMSG => net::recvmsg(p, mem, a0, a1, a2),
-        nr::SENDMMSG => net::sendmmsg(p, mem, a0, a1, a2, a3),
-        nr::RECVMMSG => net::recvmmsg(p, mem, a0, a1, a2, a3),
+        nr::SENDMSG => net::sendmsg(p, t, mem, a0, a1, a2),
+        nr::RECVMSG => net::recvmsg(p, t, mem, a0, a1, a2),
+        nr::SENDMMSG => net::sendmmsg(p, t, mem, a0, a1, a2, a3),
+        nr::RECVMMSG => net::recvmmsg(p, t, mem, a0, a1, a2, a3),
 
         _ => {
             p.unimplemented(format!("system call {nr} ({})", nr::name(nr)));

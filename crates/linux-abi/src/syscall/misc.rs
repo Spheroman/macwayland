@@ -56,34 +56,40 @@ pub(super) fn gettimeofday<M: GuestMemory + ?Sized>(mem: &M, tv: u64, tz: u64) -
 
 /// `nanosleep` and relative `clock_nanosleep`. Interrupted (EINTR), it
 /// says how much of the sleep was left in `rem`, if given, as Linux does.
-pub(super) fn nanosleep<M: GuestMemory + ?Sized>(mem: &M, req: u64, rem: u64) -> Result<i64, i64> {
-    let t: Timespec = mem.read_pod(req)?;
-    if t.tv_sec < 0 || !(0..1_000_000_000).contains(&t.tv_nsec) {
+/// It sleeps where a wakeup can't be missed (see `block`): until the time
+/// is up, or the thread is called away (a signal to handle, the process
+/// ending, its CPU wanted).
+pub(super) fn nanosleep<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, req: u64, rem: u64) -> Result<i64, i64> {
+    let ts: Timespec = mem.read_pod(req)?;
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
         return Err(errno::EINVAL);
     }
-    let ts = libc::timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec };
-    let mut left = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let r = ok(unsafe { libc::nanosleep(&ts, &mut left) } as i64);
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+    let r = super::block::sleep(p, t, deadline);
     if r == Err(errno::EINTR) && rem != 0 {
-        mem.write_pod(rem, &Timespec { tv_sec: left.tv_sec, tv_nsec: left.tv_nsec })?;
+        let left = deadline.map_or(std::time::Duration::MAX, |d| d.saturating_duration_since(std::time::Instant::now()));
+        let left = left.min(std::time::Duration::from_secs(i64::MAX as u64 / 2));
+        mem.write_pod(rem, &Timespec { tv_sec: left.as_secs() as i64, tv_nsec: left.subsec_nanos() as i64 })?;
     }
-    r.map(|_| 0)
+    r.map(|()| 0)
 }
 
-pub(super) fn clock_nanosleep<M: GuestMemory + ?Sized>(mem: &M, id: u64, flags: u64, req: u64, rem: u64) -> Result<i64, i64> {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn clock_nanosleep<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, id: u64, flags: u64, req: u64, rem: u64) -> Result<i64, i64> {
     const TIMER_ABSTIME: u64 = 1;
     let host = host_clock(id)?;
     if flags & TIMER_ABSTIME == 0 {
-        return nanosleep(mem, req, rem);
+        return nanosleep(p, t, mem, req, rem);
     }
-    let t: Timespec = mem.read_pod(req)?;
+    let at: Timespec = mem.read_pod(req)?;
     let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     ok(unsafe { libc::clock_gettime(host, &mut now) } as i64)?;
     let ns = |s: i64, n: i64| s as i128 * 1_000_000_000 + n as i128;
-    let wait = ns(t.tv_sec, t.tv_nsec) - ns(now.tv_sec, now.tv_nsec);
+    let wait = ns(at.tv_sec, at.tv_nsec) - ns(now.tv_sec, now.tv_nsec);
     if wait > 0 {
-        let ts = libc::timespec { tv_sec: (wait / 1_000_000_000) as i64, tv_nsec: (wait % 1_000_000_000) as i64 };
-        ok(unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) } as i64)?;
+        let wait = std::time::Duration::from_nanos(wait.min(u64::MAX as i128) as u64);
+        super::block::sleep(p, t, std::time::Instant::now().checked_add(wait))?;
     }
     Ok(0)
 }

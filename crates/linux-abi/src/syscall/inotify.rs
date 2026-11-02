@@ -27,7 +27,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use super::{kfd, ok, path_arg, Process};
+use super::{kfd, ok, path_arg, Process, Thread};
 use crate::{
     abi::at,
     errno,
@@ -305,7 +305,7 @@ pub(super) fn inotify_rm_watch(p: &Process, fd: u64, wd: u64) -> Result<i64, i64
 }
 
 /// `read` on an instance: as many whole events as fit.
-pub(crate) fn inotify_read(file: &OpenFile, buf: &mut [u8]) -> Result<i64, i64> {
+pub(crate) fn inotify_read(p: &Process, t: &Thread, file: &OpenFile, buf: &mut [u8]) -> Result<i64, i64> {
     let shared = instance(file)?;
     let kq = file.host.as_raw_fd();
     loop {
@@ -334,7 +334,7 @@ pub(crate) fn inotify_read(file: &OpenFile, buf: &mut [u8]) -> Result<i64, i64> 
         if kfd::nonblocking(file) {
             return Err(errno::EAGAIN);
         }
-        kfd::wait(kq)?;
+        kfd::wait(p, t, kq)?;
     }
 }
 

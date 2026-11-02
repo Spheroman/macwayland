@@ -22,7 +22,7 @@ use std::{
 use super::{
     kfd, ok,
     signal::{Inbox, SigInfo, ThreadSignals},
-    Process,
+    Process, Thread,
 };
 use crate::{
     errno,
@@ -115,7 +115,7 @@ impl HostSignalWait {
             }
             // The trigger stays set until taken: a signal between the look
             // and the wait ends the wait at once.
-            let _ = kfd::wait(self.kq.host.as_raw_fd());
+            let _ = kfd::wait_raw(self.kq.host.as_raw_fd());
         }
     }
 }
@@ -163,7 +163,7 @@ fn siginfo(info: &SigInfo) -> [u8; SIGINFO_SIZE] {
 }
 
 /// `read` on a signalfd: as many of its pending signals as fit.
-pub(crate) fn signalfd_read(p: &Process, file: &OpenFile, signalfd: &SignalFd, buf: &mut [u8]) -> Result<i64, i64> {
+pub(crate) fn signalfd_read(p: &Process, t: &Thread, file: &OpenFile, signalfd: &SignalFd, buf: &mut [u8]) -> Result<i64, i64> {
     if buf.len() < SIGINFO_SIZE {
         return Err(errno::EINVAL);
     }
@@ -195,18 +195,8 @@ pub(crate) fn signalfd_read(p: &Process, file: &OpenFile, signalfd: &SignalFd, b
         if kfd::nonblocking(file) {
             return Err(errno::EAGAIN);
         }
-        match kfd::wait(kq) {
-            Ok(()) => {}
-            // A host signal ran its handler on this thread: one of ours (go
-            // round and read it), or another (for the guest to handle).
-            Err(e) if e == errno::EINTR => {
-                let mut s = p.signals();
-                p.take_external(&mut s, &ThreadSignals::default(), -1);
-                if !s.pending.any(mask) {
-                    return Err(errno::EINTR);
-                }
-            }
-            Err(e) => return Err(e),
-        }
+        // Signals for it trigger the kqueue; called away (a signal to
+        // handle, the process ending), EINTR.
+        kfd::wait(p, t, kq)?;
     }
 }

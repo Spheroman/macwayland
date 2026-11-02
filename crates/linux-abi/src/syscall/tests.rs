@@ -1519,7 +1519,7 @@ fn inotify_goes_to_a_forked_child() {
     let mut buf = [0u8; 64];
     let start = std::time::Instant::now();
     let n = loop {
-        match inotify_read(&file, &mut buf) {
+        match inotify_read(&t.p, &t.th, &file, &mut buf) {
             Ok(n) => break n as usize,
             Err(e) if e == errno::EAGAIN && start.elapsed().as_secs() < 5 => std::thread::sleep(std::time::Duration::from_millis(20)),
             Err(e) => panic!("read: {e}"),
@@ -1595,4 +1595,59 @@ fn a_fork_in_the_host_shares_open_files() {
     assert_eq!(child.child_policy(), (false, true));
     t.ok(nr::RT_SIGACTION, &[17, ign, 0, 8]);
     assert_eq!(t.p.child_policy(), (true, true), "SIGCHLD ignored: children reaped as they end");
+}
+
+/// A thread blocked in a host call is woken by its waker's pipe alone, with
+/// no interrupt to its host thread at all (the extreme of an interrupt lost
+/// just before the call sleeps): a read of an empty pipe, a sleep, a poll
+/// and a read of an eventfd all end once the process is ending.
+#[test]
+fn a_blocked_call_wakes_without_an_interrupt() {
+    use std::sync::Arc;
+    for case in ["read", "nanosleep", "ppoll", "eventfd"] {
+        let root = tempfile::tempdir().unwrap();
+        let p = Arc::new(Process::new(root.path()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = p.clone();
+        let blocked = std::thread::spawn(move || {
+            let mut th = Thread::main(&p2);
+            // Its wake does nothing: only the waker's pipe can end the call.
+            p2.register_thread(&th, Box::new(|| {}));
+            let m = FlatMem(std::cell::RefCell::new(vec![0; 4096]));
+            let call = |th: &mut Thread, nr: u64, a: [u64; 6]| match dispatch(&*p2, th, &m, nr, a) {
+                Action::Return(v) => v,
+                other => panic!("{other:?}"),
+            };
+            let (nr, args) = match case {
+                "read" | "ppoll" => {
+                    assert_eq!(call(&mut th, nr::PIPE2, [BASE, 0, 0, 0, 0, 0]), 0);
+                    let mut fds = [0u8; 8];
+                    m.read(BASE, &mut fds).unwrap();
+                    let rfd = u32::from_le_bytes(fds[..4].try_into().unwrap()) as u64;
+                    if case == "read" {
+                        (nr::READ, [rfd, BASE + 64, 1, 0, 0, 0])
+                    } else {
+                        m.write(BASE + 64, &[rfd as u8, 0, 0, 0, 1, 0, 0, 0]).unwrap(); // { fd, POLLIN }
+                        (nr::PPOLL, [BASE + 64, 1, 0, 0, 0, 0])
+                    }
+                }
+                "nanosleep" => {
+                    m.write(BASE + 64, &[100u64.to_le_bytes(), 0u64.to_le_bytes()].concat()).unwrap();
+                    (nr::NANOSLEEP, [BASE + 64, 0, 0, 0, 0, 0])
+                }
+                _ => {
+                    let efd = call(&mut th, nr::EVENTFD2, [0, 0, 0, 0, 0, 0]) as u64;
+                    (nr::READ, [efd, BASE + 64, 8, 0, 0, 0])
+                }
+            };
+            tx.send(()).unwrap();
+            call(&mut th, nr, args)
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        p.set_exiting(true);
+        assert_eq!(blocked.join().unwrap(), -errno::EINTR, "{case}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{case}");
+    }
 }

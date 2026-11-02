@@ -8,7 +8,7 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use super::{gather, iov_len, iovecs, io::set_nonblocking, ok, scatter, Process, MAX_IO};
+use super::{block, gather, iov_len, iovecs, io::set_nonblocking, ok, scatter, Process, Thread, MAX_IO};
 use crate::{
     abi::net::*,
     errno,
@@ -272,12 +272,13 @@ pub(super) fn connect<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, ad
     ok(unsafe { libc::connect(p.fds.host(fd)?, host.as_ptr().cast(), host.len() as u32) } as i64).map(|_| 0)
 }
 
-pub(super) fn accept4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, addr: u64, len_ptr: u64, flags: u64) -> Result<i64, i64> {
+pub(super) fn accept4<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, addr: u64, len_ptr: u64, flags: u64) -> Result<i64, i64> {
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(errno::EINVAL);
     }
     let mut buf = [0u8; SOCKADDR_MAX];
     let mut len = buf.len() as u32;
+    block::ready(p, t, &*p.fds.get(fd)?, libc::POLLIN)?;
     let host = ok(unsafe { libc::accept(p.fds.host(fd)?, buf.as_mut_ptr().cast(), &mut len) } as i64)? as i32;
     let n = install(p, unsafe { OwnedFd::from_raw_fd(host) }, flags)?;
     let guest = addr_to_guest(p, &buf[..len as usize]);
@@ -333,19 +334,25 @@ fn msg_flags_to_guest(flags: i32) -> i32 {
     out as i32
 }
 
-pub(super) fn sendto<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> Result<i64, i64> {
+pub(super) fn sendto<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen: u64) -> Result<i64, i64> {
     let mut data = vec![0u8; len.min(MAX_IO) as usize];
     mem.read(buf, &mut data)?;
     let host_addr = if addr != 0 { Some(addr_to_host(p, mem, addr, addrlen)?) } else { None };
     let (ap, al) = host_addr.as_ref().map_or((std::ptr::null(), 0), |a| (a.as_ptr(), a.len() as u32));
     let host = p.fds.host(fd)?;
+    if flags & MSG_DONTWAIT == 0 {
+        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLOUT)?;
+    }
     send_waiting(host, flags & MSG_DONTWAIT != 0, || unsafe { libc::sendto(host, data.as_ptr().cast(), data.len(), msg_flags_to_host(flags), ap.cast(), al) })
 }
 
-pub(super) fn recvfrom<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, len: u64, flags: u64, addr: u64, len_ptr: u64) -> Result<i64, i64> {
+pub(super) fn recvfrom<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, buf: u64, len: u64, flags: u64, addr: u64, len_ptr: u64) -> Result<i64, i64> {
     let mut data = vec![0u8; len.min(MAX_IO) as usize];
     let mut abuf = [0u8; SOCKADDR_MAX];
     let mut alen = abuf.len() as u32;
+    if flags & MSG_DONTWAIT == 0 {
+        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLIN)?;
+    }
     let n = ok(unsafe {
         libc::recvfrom(p.fds.host(fd)?, data.as_mut_ptr().cast(), data.len(), msg_flags_to_host(flags), abuf.as_mut_ptr().cast(), &mut alen)
     } as i64)?;
@@ -510,7 +517,7 @@ mod in_flight {
     }
 }
 
-pub(super) fn sendmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, msg: u64, flags: u64) -> Result<i64, i64> {
+pub(super) fn sendmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, msg: u64, flags: u64) -> Result<i64, i64> {
     let m: MsgHdr = mem.read_pod(msg)?;
     let data = gather(mem, &iovecs(mem, m.iov, m.iovlen)?)?;
     let name = if m.name != 0 && m.namelen > 0 { Some(addr_to_host(p, mem, m.name, m.namelen as u64)?) } else { None };
@@ -553,6 +560,9 @@ pub(super) fn sendmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, ms
         }
     }
     let host = p.fds.host(fd)?;
+    if flags & MSG_DONTWAIT == 0 {
+        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLOUT)?;
+    }
     let n = send_waiting(host, flags & MSG_DONTWAIT != 0, || unsafe { libc::sendmsg(host, &hdr, msg_flags_to_host(flags)) })?;
     if let Some(r) = receipt {
         r.sent();
@@ -567,11 +577,11 @@ const MSG_WAITFORONE: u64 = 0x10000;
 
 /// `sendmmsg`: `sendmsg` for each, as far as they go. An error after the
 /// first is left for the next call, as Linux does.
-pub(super) fn sendmmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, msgs: u64, n: u64, flags: u64) -> Result<i64, i64> {
+pub(super) fn sendmmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, msgs: u64, n: u64, flags: u64) -> Result<i64, i64> {
     let n = n.min(1024);
     for i in 0..n {
         let at = msgs + i * MMSGHDR;
-        match sendmsg(p, mem, fd, at, flags) {
+        match sendmsg(p, t, mem, fd, at, flags) {
             Ok(len) => mem.write_pod(at + MSG_LEN, &(len as u32))?,
             Err(e) if i == 0 => return Err(e),
             Err(_) => return Ok(i as i64),
@@ -582,12 +592,12 @@ pub(super) fn sendmmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, m
 
 /// `recvmmsg`: `recvmsg` for each, as far as there's something to take;
 /// with MSG_WAITFORONE, only the first waits. (Its timeout isn't kept.)
-pub(super) fn recvmmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, msgs: u64, n: u64, flags: u64) -> Result<i64, i64> {
+pub(super) fn recvmmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, msgs: u64, n: u64, flags: u64) -> Result<i64, i64> {
     let n = n.min(1024);
     for i in 0..n {
         let at = msgs + i * MMSGHDR;
         let f = if i > 0 && flags & MSG_WAITFORONE != 0 { flags | MSG_DONTWAIT } else { flags } & !MSG_WAITFORONE;
-        match recvmsg(p, mem, fd, at, f) {
+        match recvmsg(p, t, mem, fd, at, f) {
             Ok(len) => mem.write_pod(at + MSG_LEN, &(len as u32))?,
             Err(e) if i == 0 => return Err(e),
             Err(_) => return Ok(i as i64),
@@ -596,7 +606,7 @@ pub(super) fn recvmmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, m
     Ok(n as i64)
 }
 
-pub(super) fn recvmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, msg: u64, flags: u64) -> Result<i64, i64> {
+pub(super) fn recvmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, msg: u64, flags: u64) -> Result<i64, i64> {
     let mut m: MsgHdr = mem.read_pod(msg)?;
     let iov = iovecs(mem, m.iov, m.iovlen)?;
     let mut data = vec![0u8; iov_len(&iov) as usize];
@@ -620,6 +630,9 @@ pub(super) fn recvmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, ms
     }
     hdr.msg_control = control.as_mut_ptr().cast();
     hdr.msg_controllen = host_space;
+    if flags & MSG_DONTWAIT == 0 {
+        block::ready(p, t, &*p.fds.get(fd)?, libc::POLLIN)?;
+    }
     let n = ok(unsafe { libc::recvmsg(p.fds.host(fd)?, &mut hdr, msg_flags_to_host(flags)) } as i64)?;
 
     // Received fds become guest fds, as many as fit.

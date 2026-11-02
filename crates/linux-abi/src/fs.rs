@@ -37,6 +37,17 @@ pub struct OpenFile {
     pub pos: AtomicU64,
     /// What it is, if the dispatcher emulates it.
     pub kind: FileKind,
+    /// Whether a call on it can block (a pipe, socket, device), found out
+    /// the first time it's asked.
+    can_block: std::sync::OnceLock<bool>,
+}
+
+impl OpenFile {
+    /// Whether a read or write on it can block (not a regular file or a
+    /// directory).
+    pub fn can_block(&self) -> bool {
+        *self.can_block.get_or_init(|| crate::syscall::can_block(self.host.as_raw_fd()))
+    }
 }
 
 /// Open files the dispatcher emulates on top of a host descriptor.
@@ -93,7 +104,7 @@ impl FdEntry {
     }
 
     fn open(self) -> Slot {
-        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(None), pos: AtomicU64::new(0), kind: self.kind };
+        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(None), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default() };
         Slot { file: Arc::new(file), cloexec: self.cloexec }
     }
 }

@@ -52,6 +52,17 @@ impl Waker {
         unsafe { libc::write(self.write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
     }
 
+    /// The pipe's read end, to sleep on with other things (see `block`).
+    pub(super) fn fd(&self) -> i32 {
+        self.read.as_raw_fd()
+    }
+
+    /// Take out the wakes so far.
+    pub(super) fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
+
     /// Sleep until woken, a host signal arrives, or `deadline`. True if woken
     /// (the wakes so far are used up).
     pub fn sleep(&self, deadline: Option<Instant>) -> bool {
