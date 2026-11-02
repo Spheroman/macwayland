@@ -59,6 +59,51 @@ See [ROADMAP.md](ROADMAP.md) for the full list and design notes.
 `third_party/smithay` is Smithay 0.7.0 with a small macOS fix (see its
 `MACWAYLAND.md`).
 
+## Compared with Cocoa-Way and Wawona
+
+[Cocoa-Way](https://github.com/J-x-Z/cocoa-way) and
+[Wawona](https://github.com/Wawona/Wawona) also put Wayland windows on a
+Mac, and both are further along as compositors. The difference is where the
+Linux programs run.
+
+- **Cocoa-Way** is a Smithay compositor with a Metal renderer, for Linux apps
+  that run somewhere else: on a remote host over SSH, or locally in Apple
+  Container, Docker or OrbStack. Either way they reach it through Waypipe. It
+  has desktop and rootless (one Mac window per app) modes, Retina scaling,
+  clipboard and audio forwarding, and a control plane for managing app
+  profiles.
+- **Wawona** is a compositor for macOS, iOS, Android and more, built on
+  Smithay's protocol layer and presenting with CAMetalLayer. Its clients are
+  programs ported and recompiled for each platform (Weston clients, foot,
+  zsh), WASI packages, or remote and VM programs over Waypipe.
+- **macwayland** runs the unmodified Linux binary itself as a Mac process,
+  under Hypervisor.framework with no guest kernel. Its system calls are
+  carried out on XNU, which no compositor alone can do.
+
+What that buys:
+
+- **No Waypipe, no VM.** Clients talk to the compositor over a local Unix
+  socket, and their `wl_shm` buffers are host memory the shell draws from
+  directly, with no serialising or copying. This is a large part of how it
+  gets within a frame of a native Mac app.
+- **One machine.** Linux programs use the Mac's own files (APFS, not a disk
+  image) and its clipboard, and can exec Mac programs, the way WSL runs
+  Windows ones.
+- **No porting.** Binaries from Nix or an arm64 distro run as they are.
+
+What it costs:
+
+- Linux system calls are implemented here, so some are missing. Cocoa-Way and
+  Wawona get an actual Linux kernel from their remote host or VM.
+- Only arm64 Linux programs run, and only on Apple silicon. Waypipe can bring
+  in apps from any architecture or machine.
+- The compositor is younger. It has one full-screen session (no per-app Mac
+  windows), no Retina scaling, no wlr-layer-shell and no GPU acceleration
+  yet. The GPU plan is a Vulkan driver split between guest and host, plus
+  D3DMetal for Windows games (see [ROADMAP.md](ROADMAP.md)).
+
+This describes the other two as their READMEs did in November 2026.
+
 ## Requirements
 
 - An Apple silicon Mac. Tested on macOS 26.6 and 27.
