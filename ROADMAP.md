@@ -219,6 +219,16 @@ from a static Linux binary.
      saving), making the cap 128 *running* processes.
    Not yet: threads in a forked process (item 5), `CLONE_VM` without vfork,
    pidfds, `kill(-1)` (refused: on a Mac that's the whole login session).
+   **Next: many processes in one VM** (design: `docs/processes.md`). A
+   *host* (one Mac process, one VM) runs every Linux process of a session,
+   each with its own page tables and ASID: a switch between processes
+   measured as cheap as one between threads (1.4 µs a round either way,
+   `examples/switch_cost.rs`). Fork copies page tables copy-on-write inside
+   the VM (estimated 10–50x faster than today's 2.6 ms, `guest/forkbench.c`);
+   pids, groups, sessions, `wait`, signals and job control are the host's
+   own; Mac programs (item 13) become separate processes standing in for the
+   Linux process that exec'd them. The 128-VM cap then counts sessions, not
+   processes.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
