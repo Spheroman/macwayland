@@ -992,14 +992,24 @@ fn wait_for_host_signal_until(inbox: &Inbox, deadline: Option<std::time::Instant
                 None => {
                     libc::sigsuspend(&old);
                 }
-                Some(d) => {
-                    // A timed sigsuspend: pselect with no files sets the
-                    // mask and sleeps in one step (Darwin's pselect is a
-                    // system call), so one arriving between the look and
-                    // the sleep ends the sleep.
+                // Where signals are in memory (many processes in a host),
+                // whoever sends one interrupts this thread itself: a timed
+                // sigsuspend, pselect with no files, sets the mask and
+                // sleeps in one step (Darwin's pselect is a system call),
+                // so one arriving between the look and the sleep ends it.
+                Some(d) if !inbox.mirror_host.load(Ordering::Relaxed) => {
                     let left = d.saturating_duration_since(std::time::Instant::now());
                     let ts = libc::timespec { tv_sec: left.as_secs().min(i32::MAX as u64) as i64, tv_nsec: left.subsec_nanos() as i64 };
                     libc::pselect(0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &ts, &old);
+                }
+                // A host signal (1:1) lands on whichever thread of the
+                // process doesn't block it, likely another: look again every
+                // 10 ms.
+                Some(d) => {
+                    let step = d.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_millis(10));
+                    libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+                    let ts = libc::timespec { tv_sec: 0, tv_nsec: step.as_nanos() as i64 };
+                    libc::nanosleep(&ts, std::ptr::null_mut());
                 }
             }
         }
