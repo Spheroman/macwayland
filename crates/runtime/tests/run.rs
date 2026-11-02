@@ -725,3 +725,190 @@ fn locks_and_timers_stay_within_the_host_thread_budget() {
     assert!(stdout.ends_with("hostbudget ok\n"), "stdout: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success());
 }
+
+/// `guest/tty ARGS` with `one_vm` (None: as the tests run), checked to end
+/// well.
+fn tty_guest(one_vm: Option<bool>, args: &[&std::ffi::OsStr]) {
+    let path = format!("{}/../../target/guest/tty", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let mut cmd = macwl_run();
+    if let Some(on) = one_vm {
+        cmd.env("MACWL_ONE_VM", if on { "1" } else { "0" });
+    }
+    let out = cmd.arg(&path).args(args).stdin(std::process::Stdio::null()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.ends_with("tty ok\n"), "tty {args:?}: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// An arm64 Linux package from nixpkgs (`MACWL_TEST_<NAME>` overrides): its
+/// store path.
+fn linux_package(name: &str) -> std::ffi::OsString {
+    if let Some(path) = std::env::var_os(format!("MACWL_TEST_{}", name.to_uppercase())) {
+        return path;
+    }
+    let out = std::process::Command::new("nix")
+        .args(["build", &format!("nixpkgs#legacyPackages.aarch64-linux.{name}.out"), "--max-jobs", "0", "--no-link", "--print-out-paths"])
+        .output()
+        .expect("nix (or MACWL_TEST_<NAME> with the package's store path)");
+    assert!(out.status.success(), "nix build {name}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().into()
+}
+
+/// Terminals and job control on a pty the guest opens (guest/tty.c): a
+/// session leader's controlling terminal (TIOCSCTTY, /dev/tty, TIOCGSID), a
+/// background read stopped by SIGTTIN and continued in the foreground, EIO
+/// with SIGTTIN ignored and in an orphaned group, TOSTOP and SIGTTOU,
+/// tcsetattr and tcsetpgrp from the background (SIGTTOU blocked: allowed),
+/// Ctrl-C, Ctrl-\ and Ctrl-Z for the foreground job alone, Ctrl-V quoting,
+/// SIGWINCH on a resize, TIOCNOTTY, and hangups (the master closing; the
+/// session leader ending).
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn terminals_and_job_control() {
+    tty_guest(None, &["rules".as_ref()]);
+}
+
+/// The same in one VM, where the host keeps terminals' sessions and
+/// foreground groups itself (docs/processes.md, section 6).
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_terminals_and_job_control() {
+    tty_guest(Some(true), &["rules".as_ref()]);
+}
+
+/// Bash's job control on a pty, typed at through the master: `cat &`
+/// stopped by SIGTTIN and `fg`, Ctrl-Z, `jobs`, `bg`, Ctrl-C ending the
+/// foreground job and not a background one, and a hangup that ends bash
+/// (by SIGHUP) and its jobs. nixpkgs' arm64 bash and coreutils.
+#[test]
+#[ignore = "needs scripts/build-guest.sh and nix"]
+fn bash_job_control() {
+    let (bash, coreutils) = (linux_package("bash"), linux_package("coreutils"));
+    let bash = std::path::Path::new(&bash).join("bin/bash");
+    tty_guest(None, &["bash".as_ref(), bash.as_os_str(), &coreutils]);
+}
+
+/// The same in one VM.
+#[test]
+#[ignore = "needs scripts/build-guest.sh and nix"]
+fn one_vm_bash_job_control() {
+    let (bash, coreutils) = (linux_package("bash"), linux_package("coreutils"));
+    let bash = std::path::Path::new(&bash).join("bin/bash");
+    tty_guest(Some(true), &["bash".as_ref(), bash.as_os_str(), &coreutils]);
+}
+
+/// `macwl-run ARGS` in one VM, in a terminal of its own (a pty, `rows` by
+/// `cols`, as a Mac terminal's): the child and the terminal's master.
+fn in_a_terminal(args: &[&std::ffi::OsStr], env: &[(&str, &std::ffi::OsStr)], rows: u16, cols: u16) -> (std::process::Child, OwnedFd) {
+    use std::os::{fd::FromRawFd, unix::process::CommandExt};
+    let (mut master, mut slave) = (0, 0);
+    let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) }, 0);
+    // The master isn't the child's: only this end closing hangs it up.
+    unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let mut cmd = macwl_run();
+    cmd.env("MACWL_ONE_VM", "1").args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let stdio = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().unwrap());
+    cmd.stdin(stdio(&slave)).stdout(stdio(&slave)).stderr(stdio(&slave));
+    // A session of its own with the pty as its terminal, as a Mac terminal
+    // starts a shell (whose job macwl-run then is).
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as u64, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().unwrap();
+    drop(slave);
+    (child, master)
+}
+
+/// Read `master` until `want` has come (after `seen`'s first `from` bytes),
+/// for up to 20 s: where it ends.
+fn read_until(master: &OwnedFd, seen: &mut Vec<u8>, from: usize, want: &str) -> usize {
+    use std::os::fd::AsRawFd;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(i) = seen[from..].windows(want.len()).position(|w| w == want.as_bytes()) {
+            return from + i + want.len();
+        }
+        assert!(std::time::Instant::now() < end, "no {want:?} in {:?}", String::from_utf8_lossy(seen));
+        let mut p = libc::pollfd { fd: master.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut p, 1, 50) } > 0 {
+            let mut buf = [0u8; 4096];
+            let n = unsafe { libc::read(master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+            }
+        }
+    }
+}
+
+/// `macwl-run` in one VM started in a terminal relays it (docs/processes.md,
+/// "Its terminal"): its program gets a pty of the host's, with the
+/// terminal's size; Ctrl-Z stops the program and, with it, `macwl-run` (as
+/// the Mac shell expects of its job), with the terminal's settings given
+/// back; continued, the program reads again; Ctrl-C ends a program, which
+/// macwl-run reports as 128 + SIGINT; the terminal going hangs it up.
+#[test]
+#[ignore = "needs nix"]
+fn one_vm_relays_its_terminal() {
+    use std::os::fd::AsRawFd;
+    let coreutils = std::path::PathBuf::from(linux_package("coreutils")).join("bin");
+    let tool = |name: &str| coreutils.join(name).into_os_string();
+    let type_in = |master: &OwnedFd, s: &str| assert_eq!(unsafe { libc::write(master.as_raw_fd(), s.as_ptr().cast(), s.len()) }, s.len() as isize);
+    let wait = |child: &std::process::Child, options: i32| {
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(child.id() as i32, &mut st, options) }, child.id() as i32);
+        st
+    };
+
+    // Its size.
+    let (child, master) = in_a_terminal(&[&tool("stty"), "size".as_ref()], &[], 33, 101);
+    let mut seen = Vec::new();
+    read_until(&master, &mut seen, 0, "33 101");
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "{st:#x}");
+
+    // Ctrl-Z, and `fg`.
+    let (child, master) = in_a_terminal(&[&tool("cat")], &[], 24, 80);
+    let mut seen = Vec::new();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "one\n");
+    let at = read_until(&master, &mut seen, 0, "one");
+    let at = read_until(&master, &mut seen, at, "one");
+    type_in(&master, "\x1a");
+    let st = wait(&child, libc::WUNTRACED);
+    assert!(libc::WIFSTOPPED(st), "{st:#x}");
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(master.as_raw_fd(), &mut t) };
+    assert!(t.c_lflag & libc::ICANON != 0, "the terminal's own settings back while stopped");
+    unsafe { libc::kill(child.id() as i32, libc::SIGCONT) };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_in(&master, "two\n");
+    let at = read_until(&master, &mut seen, at, "two");
+    read_until(&master, &mut seen, at, "two");
+    type_in(&master, "\x04");
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "{st:#x}");
+
+    // Ctrl-C.
+    let (child, master) = in_a_terminal(&[&tool("sleep"), "100".as_ref()], &[], 24, 80);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "\x03");
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 128 + 2, "{st:#x}");
+
+    // The terminal goes: the program gets SIGHUP.
+    let (child, master) = in_a_terminal(&[&tool("sleep"), "100".as_ref()], &[], 24, 80);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    drop(master);
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 128 + 1, "{st:#x}");
+}
