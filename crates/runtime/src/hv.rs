@@ -38,6 +38,7 @@ pub mod sys_reg {
     pub const FAR_EL1: u16 = 0xc300;
     pub const MAIR_EL1: u16 = 0xc510;
     pub const VBAR_EL1: u16 = 0xc600;
+    pub const CNTKCTL_EL1: u16 = 0xc708;
     pub const SP_EL1: u16 = 0xe208;
     pub const TPIDR_EL0: u16 = 0xde82;
     pub const TPIDRRO_EL0: u16 = 0xde83;

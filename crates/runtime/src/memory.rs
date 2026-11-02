@@ -204,6 +204,10 @@ impl AddressSpace {
         // FPEN = 0b11: FP/SIMD usable at EL0 (musl's memcpy uses NEON).
         vcpu.set_sys_reg(CPACR_EL1, 0b11 << 20)?;
         vcpu.set_sys_reg(VBAR_EL1, VECTORS_VA)?;
+        // EL0VCTEN: EL0 may read the virtual counter and its frequency
+        // (CNTVCT_EL0, CNTFRQ_EL0), as Linux allows for its vDSO. Windows
+        // programs under Wine read them directly.
+        vcpu.set_sys_reg(CNTKCTL_EL1, 1 << 1)?;
         let sctlr = 0x30d0_0800 // RES1 bits
             | (1 << 0)   // M: MMU on
             | (1 << 2)   // C: data cacheable

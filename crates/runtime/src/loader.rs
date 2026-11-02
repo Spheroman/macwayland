@@ -206,13 +206,21 @@ pub fn build_stack(
         space.write(top, bytes).map_err(|f| LoadError::OutOfRange(f.addr))?;
         Ok(top)
     };
-    let mut push_str = |space: &mut AddressSpace, s: &[u8]| {
-        let mut owned = s.to_vec();
-        owned.push(0);
-        push(space, &owned)
-    };
-    let argv_ptrs = argv.iter().map(|s| push_str(space, s)).collect::<Result<Vec<_>, _>>()?;
-    let envp_ptrs = envp.iter().map(|s| push_str(space, s)).collect::<Result<Vec<_>, _>>()?;
+    // The strings as one block, as Linux lays them out: argv's then envp's,
+    // each in order, so argv[0] is lowest and each string follows the one
+    // before. Programs rely on this: Wine's preloader drops argv[0] by
+    // sliding argv[1..] down over it in place (off = argv[1] - argv[0]).
+    let mut block = Vec::new();
+    let mut offsets = Vec::with_capacity(argv.len() + envp.len());
+    for s in argv.iter().chain(envp) {
+        offsets.push(block.len() as u64);
+        block.extend_from_slice(s);
+        block.push(0);
+    }
+    let strings = push(space, &block)?;
+    let mut ptrs = offsets.into_iter().map(|off| strings + off);
+    let argv_ptrs: Vec<u64> = ptrs.by_ref().take(argv.len()).collect();
+    let envp_ptrs: Vec<u64> = ptrs.collect();
     let mut random = [0u8; 16];
     unsafe { libc::arc4random_buf(random.as_mut_ptr().cast(), random.len()) };
     let random_ptr = push(space, &random)?;
