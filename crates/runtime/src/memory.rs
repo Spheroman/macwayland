@@ -767,19 +767,40 @@ impl AddressSpace {
     /// Remove `[start, end)` from the regions and page tables, and release
     /// shared windows no region uses any more.
     fn unmap(&mut self, start: u64, end: u64) {
+        let shown = self.windows_shown(start, end);
         self.vmas.remove(start, end);
         if self.user.unmap_range(&mut self.phys, start, end) {
             self.tlb_stale = true;
         }
-        self.release_unused_windows();
+        self.release_unused_windows(shown);
     }
 
-    fn release_unused_windows(&mut self) {
-        let ranges: Vec<(u64, u64)> = {
-            let windows = self.machine.windows();
-            self.windows.iter().filter_map(|&w| windows.find(w)).collect()
-        };
-        for (ws, we) in ranges {
+    /// The shared windows the regions in `[start, end)` show (as (start,
+    /// end)): the only ones that removing those regions can leave unused.
+    fn windows_shown(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        let windows = self.machine.windows();
+        let mut shown: Vec<(u64, u64)> = self
+            .vmas
+            .overlapping(start, end)
+            .filter_map(|(s, v)| match v.backing {
+                Backing::Shared { ipa } | Backing::File { ipa } => windows.find(ipa).or_else(|| windows.find(ipa + (v.end - s) - 1)),
+                Backing::Private => None,
+            })
+            .collect();
+        shown.sort_unstable();
+        shown.dedup();
+        shown
+    }
+
+    /// Of `candidates` (windows whose regions went), release those no
+    /// region shows any more. (Only those: looking at every window against
+    /// every region, on each unmap and each private file page's first
+    /// write, was a Wine process's busiest work in the runtime.)
+    fn release_unused_windows(&mut self, candidates: Vec<(u64, u64)>) {
+        for (ws, we) in candidates {
+            if !self.windows.contains(&ws) {
+                continue;
+            }
             let used = self.vmas.iter().any(|(s, v)| match v.backing {
                 Backing::Shared { ipa } | Backing::File { ipa } => ipa < we && ipa + (v.end - s) > ws,
                 Backing::Private => false,
@@ -957,7 +978,8 @@ impl AddressSpace {
             self.tlb_stale = true;
         }
         self.vmas.insert(start, end, v.prot, Backing::Private);
-        self.release_unused_windows();
+        let window = self.machine.windows().find(ipa).into_iter().collect();
+        self.release_unused_windows(window);
         self.copy_in(start, &data, None)
     }
 
