@@ -1001,7 +1001,22 @@ fn run_loop<'scope, 'env>(
         }
         if space.lock().take_tlb_stale() {
             // Return to EL0 through the vector's TLB-flushing path (which
-            // erets to ELR_EL1/SPSR_EL1).
+            // erets to ELR_EL1/SPSR_EL1). Those hold where EL0 resumes only
+            // when the vCPU stopped in the vector; stopped in the program (a
+            // kick), they're whatever the last exception left, so they're set
+            // from where it stopped. And stopped part-way through the flush
+            // path itself, the guest's x0 is in TPIDR_EL1: back into x0 first,
+            // or the path, starting over, would save the borrowed ASID in its
+            // place. (Another thread's fault marks the address space stale
+            // at any time, so both happen: a spinning thread's pointer became
+            // its ASID << 48, or it went back to an old pc.)
+            let (pc, cpsr) = (vcpu.reg(reg::PC)?, vcpu.reg(reg::CPSR)?);
+            if cpsr & 0xf == 0 {
+                vcpu.set_sys_reg(sys_reg::ELR_EL1, pc)?;
+                vcpu.set_sys_reg(sys_reg::SPSR_EL1, cpsr)?;
+            } else if memory::flush_path_borrows_x0(pc) {
+                vcpu.set_reg(reg::X0, vcpu.sys_reg(sys_reg::TPIDR_EL1)?)?;
+            }
             vcpu.set_reg(reg::CPSR, 0x3c5)?; // EL1h, interrupts masked
             vcpu.set_reg(reg::PC, memory::VECTOR_FLUSH_PATH)?;
         }
