@@ -284,7 +284,17 @@ impl Machine {
         if !s.running {
             s.running = true;
             let (reclaim, pool) = (self.reclaim.clone(), self.pool.clone());
-            std::thread::spawn(move || reclaim.run(&pool));
+            if linux_abi::host_threads::spawn("reclaim", move || reclaim.run(&pool)).is_err() {
+                // No thread to spare: give the frames back here instead.
+                s.running = false;
+                let queued = std::mem::take(&mut s.queue);
+                drop(s);
+                for retired in queued {
+                    self.pool.release(&retired.frames(&self.pool));
+                }
+                self.reclaim.changed.notify_all();
+                return;
+            }
         }
         self.reclaim.changed.notify_all();
     }

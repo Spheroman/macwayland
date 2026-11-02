@@ -9,6 +9,7 @@
 pub mod abi;
 pub mod errno;
 pub mod fs;
+pub mod host_threads;
 pub mod hostinfo;
 pub mod identity;
 pub mod memory;

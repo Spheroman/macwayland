@@ -250,7 +250,7 @@ pub fn run_child() -> Result<Exit, Error> {
     // Requests from the parent (to change our process group) come on the
     // control socket; a thread answers them while the guest runs.
     let requests = ctl_sock.try_clone()?;
-    std::thread::spawn(move || answer_parent(requests));
+    linux_abi::host_threads::spawn("parent requests", move || answer_parent(requests))?;
     let (mut process, mut thread) = Process::decode_forked(&mut d, fds.collect(), ctl_sock).map_err(|_| bad("process state"))?;
     let space = Space::new(space);
     process.forked_child(&mut thread, &space, &f);

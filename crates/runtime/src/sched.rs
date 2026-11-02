@@ -120,6 +120,24 @@ pub(crate) fn should_yield() -> bool {
 /// watch, which are few; more wait their turn.
 const MAX_WORKERS: usize = 256;
 
+/// Host threads kept for the host's own besides its CPUs and waiters (the
+/// ticker, timers, reclaiming, host signals and the like), out of the
+/// budget workers may use.
+const RESERVED: usize = 8;
+
+/// The most workers a host may have: [`MAX_WORKERS`], or less if the host
+/// thread budget (linux_abi::host_threads) is lower, so that what workers
+/// take never leaves a CPU or the host's own threads without one. (Idle
+/// workers stay, holding theirs.) At least two, so blocked calls always
+/// move.
+fn max_workers(max_cpus: usize) -> usize {
+    let own = max_cpus + crate::park::waiters() + RESERVED;
+    linux_abi::host_threads::budget().saturating_sub(own).clamp(2, MAX_WORKERS)
+}
+
+/// How often an idle ticker still checks the process's thread count.
+const WATCHDOG: Duration = Duration::from_millis(100);
+
 /// How many CPUs a process gets: one per physical core (at most 64, the
 /// most Hypervisor.framework allows); MACWL_CPUS=n for fewer (tests).
 fn max_cpus() -> usize {
@@ -157,6 +175,8 @@ struct State {
     /// Of those, waiting for a task.
     idle: usize,
     max_cpus: usize,
+    /// See [`max_workers`].
+    max_workers: usize,
     /// The process is ending: CPUs leave once their task is done.
     stopping: bool,
     /// When each CPU's task started its slice (by signal slot).
@@ -196,6 +216,7 @@ impl Sched {
                 cpus: 1,
                 idle: 0,
                 max_cpus: max_cpus(),
+                max_workers: max_workers(max_cpus()),
                 stopping: false,
                 since: [None; MAX_CPUS],
             }),
@@ -363,13 +384,22 @@ impl Sched {
         // As for CPUs: an idle worker counts once, however many jobs come
         // before it wakes. (Left queued behind a job that blocks for good,
         // one would never be made.)
-        if s.jobs.len() >= s.idle_workers && s.workers < MAX_WORKERS {
+        if s.jobs.len() >= s.idle_workers && s.workers < s.max_workers {
             s.workers += 1;
             return Offloaded::NewWorker(job);
         }
         s.jobs.push_back(job);
         self.jobs_changed.notify_one();
         Offloaded::Queued
+    }
+
+    /// A worker [`offload`](Self::offload) asked for couldn't be started
+    /// (no host thread left in the budget): its job waits for one that is.
+    pub fn worker_unstarted(&self, job: Job) {
+        let mut s = self.lock();
+        s.workers -= 1;
+        s.jobs.push_back(job);
+        self.jobs_changed.notify_one();
     }
 
     /// The next call for a worker, waiting for one; None once the process
@@ -395,9 +425,13 @@ impl Sched {
     pub fn ticker(&self) {
         let mut s = self.lock();
         while !s.stopping {
+            // The watchdog on the process's real thread count, whoever made
+            // them (linux_abi::host_threads).
+            linux_abi::host_threads::check();
             if s.ready.is_empty() {
-                // Nothing waits: nothing to preempt for.
-                s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+                // Nothing waits: nothing to preempt for. (Awake now and then
+                // for the watchdog.)
+                s = self.changed.wait_timeout(s, WATCHDOG).unwrap_or_else(|e| e.into_inner()).0;
                 continue;
             }
             let now = Instant::now();

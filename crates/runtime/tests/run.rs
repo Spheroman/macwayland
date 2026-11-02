@@ -683,3 +683,45 @@ fn one_vm_refuses_mac_programs() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "execve: ENOEXEC\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success());
 }
+
+/// Blocked guest threads cost no host thread each (docs/processes.md, step
+/// 3a): 300 threads blocked in `read` and futex waits under a host thread
+/// budget of 32, so the host's watchdog would end it at 48 host threads. See
+/// guest/blockmany.c. (Never with thousands: linux_abi::host_threads.)
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn blocked_threads_cost_no_host_thread_each() {
+    use std::io::Write;
+    let path = format!("{}/../../target/guest/blockmany", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let mut child = macwl_run()
+        .env("MACWL_MAX_HOST_THREADS", "32")
+        .arg(&path)
+        .arg("300")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // It waits for a byte once they're all blocked; it's there already.
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("blocked 300") && stdout.ends_with("blockmany ok\n"), "stdout: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success());
+}
+
+/// Calls that need a worker (100 threads waiting in `flock`) and 200 armed
+/// timers under a host thread budget of 32: workers are bounded by the
+/// budget and calls wait their turn; timers share one host thread. See
+/// guest/hostbudget.c.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn locks_and_timers_stay_within_the_host_thread_budget() {
+    let path = format!("{}/../../target/guest/hostbudget", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let out = macwl_run().env("MACWL_MAX_HOST_THREADS", "32").arg(&path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.ends_with("hostbudget ok\n"), "stdout: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success());
+}

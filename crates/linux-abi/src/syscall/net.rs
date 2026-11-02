@@ -547,9 +547,7 @@ mod in_flight {
             if kq < 0 {
                 return None;
             }
-            std::thread::Builder::new()
-                .name("receipts".into())
-                .spawn(move || loop {
+            crate::host_threads::spawn("receipts", move || loop {
                     let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
                     if unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut ev, 1, std::ptr::null()) } == 1 {
                         // Nothing is written to a receipt: readable is closed.

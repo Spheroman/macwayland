@@ -939,7 +939,7 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     table.insert(pid, 1, pid, pid, proc.clone(), SIGCHLD);
     let host = Host { vm: &vm, machine: &machine, sched, parking, table: Some(table.clone()), exec_host: Mutex::new(None) };
     std::thread::scope(|scope| {
-        scope.spawn(|| host.sched.ticker());
+        linux_abi::host_threads::spawn_scoped(scope, "ticker", || host.sched.ticker()).expect("the host's own threads fit its budget");
         crate::park::run_waiters(&host, scope);
         let task = Task::new(thread, proc.clone());
         host.register(&task);
@@ -971,8 +971,7 @@ fn route_host_signals(table: &Arc<Table>) -> Result<(), Error> {
         let inbox = Arc::new(Inbox::default());
         inbox.receive_host_signals();
         let wait = HostSignalWait::new(&inbox)?;
-        catch_host_signals(&FROM_HOST);
-        std::thread::spawn(move || {
+        linux_abi::host_threads::spawn("host signals", move || {
             // The inbox lives as long as the host process: host signal
             // handlers find it through a raw pointer.
             let _inbox = inbox;
@@ -983,7 +982,11 @@ fn route_host_signals(table: &Arc<Table>) -> Result<(), Error> {
                     table.from_host(sig);
                 }
             }
-        });
+        })
+        .map_err(|_| linux_abi::errno::EAGAIN)?;
+        // Only now that the thread (and the inbox it keeps) is there: the
+        // handlers reach the inbox through a raw pointer.
+        catch_host_signals(&FROM_HOST);
         Ok(())
     });
     started.map_err(|e| Error::Io(std::io::Error::from_raw_os_error(e as i32)))

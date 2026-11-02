@@ -409,7 +409,7 @@ fn execute(space: AddressSpace, start: Start, process: Process, thread: Thread) 
     parking.host_signals_for(&proc);
     let host = Host { vm: &vm, machine: &machine, sched, parking, table: None, exec_host: Mutex::new(None) };
     std::thread::scope(|scope| {
-        scope.spawn(|| host.sched.ticker());
+        linux_abi::host_threads::spawn_scoped(scope, "ticker", || host.sched.ticker()).expect("the host's own threads fit its budget");
         park::run_waiters(&host, scope);
         let task = Task::new(thread, proc.clone());
         host.register(&task);
@@ -1434,13 +1434,15 @@ fn place<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env
 fn start_cpu<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, task: Task, start: Start) {
     // (Not holding the process: the CPU outlives its first task.)
     let proc = Arc::downgrade(&task.proc);
-    scope.spawn(move || {
+    // CPUs are at most MAX_CPUS a host: they always fit the budget.
+    linux_abi::host_threads::spawn_scoped(scope, "cpu", move || {
         if let Err(e) = run_cpu(sh, scope, (task, start), false)
             && let Some(proc) = proc.upgrade()
         {
             sh.end(&proc, Err(e));
         }
-    });
+    })
+    .expect("a host's CPUs fit its host thread budget");
 }
 
 /// Put the tasks let run again by threads that couldn't (see
@@ -1463,7 +1465,18 @@ fn offload<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'e
     match sh.sched.offload(job) {
         Offloaded::Queued => {}
         Offloaded::NewWorker(job) => {
-            scope.spawn(move || run_worker(sh, scope, job));
+            // Workers are bounded (sched::MAX_WORKERS), and the budget
+            // bounds them again: without a thread, the call waits its turn.
+            let job = std::sync::Arc::new(std::sync::Mutex::new(Some(job)));
+            let mine = job.clone();
+            let started = linux_abi::host_threads::spawn_scoped(scope, "worker", move || {
+                let job = mine.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the worker's first job");
+                run_worker(sh, scope, job)
+            });
+            if started.is_err() {
+                let job = job.lock().unwrap_or_else(|e| e.into_inner()).take().expect("not taken: the worker never started");
+                sh.sched.worker_unstarted(job);
+            }
         }
         Offloaded::Dropped(task) => sh.thread_gone(&task.proc, task.thread.tid),
     }
@@ -1576,7 +1589,9 @@ fn deliver_signals(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &m
 /// on files, sockets and children; not sleeps or waits for signals).
 fn restartable(nr: u64) -> bool {
     use linux_abi::nr::*;
-    matches!(nr, READ | READV | WRITE | WRITEV | PREAD64 | PWRITE64 | WAIT4 | WAITID | OPENAT | IOCTL | RECVFROM | SENDTO | RECVMSG | SENDMSG | RECVMMSG | SENDMMSG | ACCEPT | ACCEPT4 | FUTEX)
+    // Locks too: an interrupted `flock` or `F_SETLKW` hasn't taken the lock
+    // (and no other `fcntl` command blocks, so none is interrupted).
+    matches!(nr, READ | READV | WRITE | WRITEV | PREAD64 | PWRITE64 | WAIT4 | WAITID | OPENAT | IOCTL | RECVFROM | SENDTO | RECVMSG | SENDMSG | RECVMMSG | SENDMMSG | ACCEPT | ACCEPT4 | FUTEX | FLOCK | FCNTL)
 }
 
 /// Whether an abort's fault status code (ISS bits 5:0) is a translation or

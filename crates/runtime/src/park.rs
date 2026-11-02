@@ -348,7 +348,7 @@ pub(crate) fn stop(kq: i32) {
 }
 
 /// How many waiter threads a host has (MACWL_WAITERS=n to change).
-fn waiters() -> usize {
+pub(crate) fn waiters() -> usize {
     std::env::var("MACWL_WAITERS").ok().and_then(|n| n.parse().ok()).unwrap_or(2).clamp(1, 16)
 }
 
@@ -357,7 +357,7 @@ fn waiters() -> usize {
 /// process's threads for a host signal, until the host ends.
 pub(crate) fn run_waiters<'scope, 'env>(sh: &'scope crate::Host<'env>, scope: &'scope crate::Scope<'scope, 'env>) {
     for _ in 0..waiters() {
-        scope.spawn(move || {
+        linux_abi::host_threads::spawn_scoped(scope, "waiter", move || {
             let mut out: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
             loop {
                 let (ids, stop, signal) = sh.parking.wait(&mut out);
@@ -375,6 +375,7 @@ pub(crate) fn run_waiters<'scope, 'env>(sh: &'scope crate::Host<'env>, scope: &'
                     return;
                 }
             }
-        });
+        })
+        .expect("the host's own threads fit its budget");
     }
 }

@@ -1,8 +1,10 @@
 //! POSIX timers (`timer_create` and friends) and interval timers
 //! (`setitimer`): a signal when a timer expires.
 //!
-//! macOS has no per-process timers like Linux's, so each armed timer is a
-//! host thread that sleeps until its deadline. On expiry it queues the
+//! macOS has no per-process timers like Linux's, so armed timers are
+//! watched by one host thread, the [`service`], whatever their number (a
+//! thread each would let a guest make host threads at will). On expiry a
+//! timer queues the
 //! signal (with Linux's timer `siginfo`: id, overrun, `sigev_value`) for the
 //! process or one thread, in the process's [`Inbox`], then gets the
 //! attention of that process's threads (and no other's): kicking their vCPUs
@@ -11,9 +13,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc, Condvar, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -44,7 +44,7 @@ struct State {
     /// Expiries since the signal last went out, beyond the first.
     overrun: i32,
     deleted: bool,
-    /// A thread is sleeping for this timer.
+    /// The service is watching this timer.
     running: bool,
 }
 
@@ -57,7 +57,6 @@ pub(super) struct PosixTimer {
     notify: i32,
     tid: Option<i64>,
     state: Mutex<State>,
-    wake: Condvar,
     /// Where its signals go: its process's.
     inbox: Arc<Inbox>,
 }
@@ -95,7 +94,7 @@ pub(super) fn timer_create<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem
     mem.write_pod(id_out, &id)?;
     ts.next += 1;
     let state = State { deadline: None, interval: Duration::ZERO, overrun: 0, deleted: false, running: false };
-    let timer = PosixTimer { id, clock, signo, value, notify, tid, state: Mutex::new(state), wake: Condvar::new(), inbox: p.inbox.clone() };
+    let timer = PosixTimer { id, clock, signo, value, notify, tid, state: Mutex::new(state), inbox: p.inbox.clone() };
     ts.timers.insert(id, Arc::new(timer));
     Ok(0)
 }
@@ -133,12 +132,18 @@ pub(super) fn timer_settime<M: GuestMemory + ?Sized>(p: &Process, mem: &M, id: u
     } else {
         Some(Instant::now() + value)
     };
-    if s.deadline.is_some() && !s.running {
-        s.running = true;
-        let timer = timer.clone();
-        std::thread::spawn(move || run(timer));
+    let start = s.deadline.is_some() && !s.running;
+    s.running |= start;
+    drop(s);
+    if start {
+        if let Err(e) = service::watch(timer.clone()) {
+            timer.state.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+            return Err(e);
+        }
+    } else {
+        // An earlier deadline: the service looks again now.
+        service::poke(timer.clone());
     }
-    timer.wake.notify_all();
     Ok(0)
 }
 
@@ -158,26 +163,24 @@ pub(super) fn timer_getoverrun(p: &Process, id: u64) -> Result<i64, i64> {
 pub(super) fn timer_delete(p: &Process, id: u64) -> Result<i64, i64> {
     let timer = timers(p).timers.remove(&(id as i32)).ok_or(errno::EINVAL)?;
     timer.state.lock().unwrap_or_else(|e| e.into_inner()).deleted = true;
-    timer.wake.notify_all();
     Ok(0)
 }
 
-/// A timer's thread: sleep until it expires, signal, repeat while armed.
-fn run(timer: Arc<PosixTimer>) {
-    let mut s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if s.deleted {
-            s.running = false;
-            return;
-        }
-        let Some(deadline) = s.deadline else {
-            s.running = false;
-            return;
+impl service::Expiring for PosixTimer {
+    /// Signal if expired (re-arming an interval timer), and say how long
+    /// until the service should look again; None once it's disarmed.
+    fn tick(&self) -> Option<Duration> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = match s.deadline {
+            Some(d) if !s.deleted => d,
+            _ => {
+                s.running = false;
+                return None;
+            }
         };
         let now = Instant::now();
         if now < deadline {
-            s = timer.wake.wait_timeout(s, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
-            continue;
+            return Some(deadline - now);
         }
         // Expired: count the periods missed, re-arm, and signal.
         let mut expiries = 1;
@@ -188,23 +191,27 @@ fn run(timer: Arc<PosixTimer>) {
             expiries += missed as i32;
             s.deadline = Some(deadline + s.interval * (missed + 1));
         }
-        if timer.notify != SIGEV_NONE {
-            let info = signal::SigInfo { signo: timer.signo, code: SI_TIMER, timer: Some((timer.id, expiries - 1, timer.value)), ..Default::default() };
-            let mut fired = timer.inbox.fired.lock().unwrap_or_else(|e| e.into_inner());
+        let next = s.deadline.map(|d| d.saturating_duration_since(now));
+        if next.is_none() {
+            s.running = false;
+        }
+        if self.notify != SIGEV_NONE {
+            let info = signal::SigInfo { signo: self.signo, code: SI_TIMER, timer: Some((self.id, expiries - 1, self.value)), ..Default::default() };
+            let mut fired = self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner());
             // Still pending from last time: count it as an overrun instead.
-            if let Some((_, prev)) = fired.iter_mut().find(|(tid, i)| *tid == timer.tid && i.timer.is_some_and(|t| t.0 == timer.id)) {
+            if let Some((_, prev)) = fired.iter_mut().find(|(tid, i)| *tid == self.tid && i.timer.is_some_and(|t| t.0 == self.id)) {
                 if let Some(t) = &mut prev.timer {
                     t.1 = t.1.saturating_add(expiries);
                 }
             } else {
-                fired.push((timer.tid, info));
+                fired.push((self.tid, info));
             }
             s.overrun = expiries - 1;
             drop(fired);
             drop(s);
-            signal::alert(&timer.inbox);
-            s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
+            signal::alert(&self.inbox);
         }
+        next
     }
 }
 
@@ -224,7 +231,6 @@ pub(super) struct ITimer {
     /// when several threads run.
     cpu: bool,
     state: Mutex<IState>,
-    wake: Condvar,
     inbox: Arc<Inbox>,
 }
 
@@ -239,7 +245,7 @@ struct IState {
     /// When it expires next, on its clock.
     deadline: Option<Duration>,
     interval: Duration,
-    /// A thread is sleeping for this timer.
+    /// The service is watching this timer.
     running: bool,
 }
 
@@ -267,14 +273,20 @@ pub(super) fn setitimer<M: GuestMemory + ?Sized>(p: &Process, mem: &M, which: u6
     if let Some((interval, value)) = new {
         s.interval = interval;
         s.deadline = (!value.is_zero()).then(|| now + value);
-        if s.deadline.is_some() && !s.running {
-            s.running = true;
-            let timer = timer.clone();
-            std::thread::spawn(move || run_itimer(timer));
+        let start = s.deadline.is_some() && !s.running;
+        s.running |= start;
+        drop(s);
+        if start {
+            if let Err(e) = service::watch(timer.clone()) {
+                timer.state.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+                return Err(e);
+            }
+        } else {
+            service::poke(timer.clone());
         }
-        timer.wake.notify_all();
+    } else {
+        drop(s);
     }
-    drop(s);
     if old != 0 {
         mem.write_pod(old, &prev)?;
     }
@@ -294,41 +306,154 @@ fn itimer(p: &Process, which: usize) -> Arc<ITimer> {
                 1 => (26, p.kernel.cpu_clock(p, true), true),  // SIGVTALRM
                 _ => (27, p.kernel.cpu_clock(p, false), true), // SIGPROF
             };
-            Arc::new(ITimer { signo, clock, cpu, state: Mutex::default(), wake: Condvar::new(), inbox: p.inbox.clone() })
+            Arc::new(ITimer { signo, clock, cpu, state: Mutex::default(), inbox: p.inbox.clone() })
         })
         .clone()
 }
 
-/// An interval timer's thread: sleep until it expires, signal, repeat while
-/// armed.
-fn run_itimer(timer: Arc<ITimer>) {
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
-    let mut s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
+impl service::Expiring for ITimer {
+    fn tick(&self) -> Option<Duration> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(deadline) = s.deadline else {
             s.running = false;
-            return;
+            return None;
         };
-        let now = (timer.clock)();
+        let now = (self.clock)();
         if now < deadline {
             // CPU time can run up to a second a second per CPU: look again
             // before it could have got there.
-            let wait = if timer.cpu { ((deadline - now) / cpus).max(Duration::from_millis(1)) } else { deadline - now };
-            s = timer.wake.wait_timeout(s, wait).unwrap_or_else(|e| e.into_inner()).0;
-            continue;
+            let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+            return Some(if self.cpu { ((deadline - now) / cpus).max(Duration::from_millis(1)) } else { deadline - now });
         }
         // Late (a busy host): the next period counts from now, rather than
         // firing again at once.
         s.deadline = (!s.interval.is_zero()).then(|| (deadline + s.interval).max(now + Duration::from_micros(100)));
+        let next = s.deadline.map(|d| d.saturating_sub(now));
+        if next.is_none() {
+            s.running = false;
+        }
         {
             // A standard signal: pending once, however often it fires.
-            let mut fired = timer.inbox.fired.lock().unwrap_or_else(|e| e.into_inner());
-            if !fired.iter().any(|(tid, i)| tid.is_none() && i.signo == timer.signo && i.timer.is_none()) {
-                fired.push((None, signal::SigInfo { signo: timer.signo, code: SI_KERNEL, ..Default::default() }));
+            let mut fired = self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner());
+            if !fired.iter().any(|(tid, i)| tid.is_none() && i.signo == self.signo && i.timer.is_none()) {
+                fired.push((None, signal::SigInfo { signo: self.signo, code: SI_KERNEL, ..Default::default() }));
             }
         }
         drop(s);
-        signal::alert(&timer.inbox);
-        s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
+        signal::alert(&self.inbox);
+        next
+    }
+}
+
+/// The one host thread that watches every armed timer of the process.
+mod service {
+    use std::{
+        cmp::Reverse,
+        collections::{BinaryHeap, HashMap},
+        sync::{Arc, Condvar, Mutex, OnceLock},
+        time::{Duration, Instant},
+    };
+
+    use crate::errno;
+
+    /// A timer the service watches.
+    pub(super) trait Expiring: Send + Sync {
+        /// Fire if due; how long until the next look, or None to stop
+        /// watching.
+        fn tick(&self) -> Option<Duration>;
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// When to look at which timer. An entry whose time isn't its
+        /// timer's `scheduled` any more is stale and skipped.
+        heap: BinaryHeap<Reverse<(Instant, usize)>>,
+        /// Watched timers by address, with when they're next looked at.
+        timers: HashMap<usize, (Arc<dyn Expiring>, Instant)>,
+    }
+
+    struct Service {
+        state: Mutex<State>,
+        wake: Condvar,
+    }
+
+    fn service() -> Result<&'static Service, i64> {
+        static SERVICE: OnceLock<Option<Service>> = OnceLock::new();
+        static STARTED: OnceLock<bool> = OnceLock::new();
+        let svc = SERVICE.get_or_init(|| Some(Service { state: Mutex::default(), wake: Condvar::new() })).as_ref().expect("made above");
+        let ok = *STARTED.get_or_init(|| crate::host_threads::spawn("timers", move || run(svc)).is_ok());
+        if ok { Ok(svc) } else { Err(errno::EAGAIN) }
+    }
+
+    fn key(t: &Arc<dyn Expiring>) -> usize {
+        Arc::as_ptr(t) as *const () as usize
+    }
+
+    /// Start watching `timer` (it was just armed): it's looked at now.
+    pub(super) fn watch(timer: Arc<dyn Expiring>) -> Result<(), i64> {
+        let svc = service()?;
+        schedule(svc, timer);
+        Ok(())
+    }
+
+    /// Look at a watched `timer` now (its deadline may be earlier). Nothing
+    /// if it isn't watched.
+    pub(super) fn poke(timer: Arc<dyn Expiring>) {
+        if let Ok(svc) = service() {
+            let k = key(&timer);
+            if svc.state.lock().unwrap_or_else(|e| e.into_inner()).timers.contains_key(&k) {
+                schedule(svc, timer);
+            }
+        }
+    }
+
+    fn schedule(svc: &Service, timer: Arc<dyn Expiring>) {
+        let now = Instant::now();
+        let k = key(&timer);
+        let mut s = svc.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.timers.insert(k, (timer, now));
+        s.heap.push(Reverse((now, k)));
+        svc.wake.notify_one();
+    }
+
+    fn run(svc: &Service) {
+        let mut s = svc.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let now = Instant::now();
+            match s.heap.peek() {
+                None => {
+                    s = svc.wake.wait(s).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+                Some(Reverse((at, _))) if *at > now => {
+                    let wait = *at - now;
+                    s = svc.wake.wait_timeout(s, wait).unwrap_or_else(|e| e.into_inner()).0;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            let Reverse((at, k)) = s.heap.pop().expect("peeked");
+            let Some((timer, scheduled)) = s.timers.get(&k).map(|(t, at)| (t.clone(), *at)) else { continue };
+            if scheduled != at {
+                continue; // stale: looked at again since
+            }
+            drop(s);
+            let next = timer.tick();
+            s = svc.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Re-armed while we looked (poke scheduled it anew): keep that.
+            if s.timers.get(&k).is_some_and(|(_, at2)| *at2 != scheduled) {
+                continue;
+            }
+            match next {
+                Some(d) => {
+                    let at = Instant::now() + d;
+                    s.timers.insert(k, (timer, at));
+                    s.heap.push(Reverse((at, k)));
+                }
+                None => {
+                    s.timers.remove(&k);
+                }
+            }
+        }
     }
 }
