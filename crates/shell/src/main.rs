@@ -59,13 +59,13 @@ use objc2::{
     runtime::{NSObject, NSObjectProtocol, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDidResignActiveNotification, NSBackingStoreType, NSEvent, NSEventMask,
     NSBitmapFormat, NSBitmapImageRep, NSCursor, NSCursorFrameResizeDirections, NSCursorFrameResizePosition,
     NSDeviceRGBColorSpace, NSEventPhase, NSEventType, NSImage, NSPasteboard, NSPasteboardTypeString, NSScreen,
     NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use macwl_compositor::{BufferData, BufferRelease, Cursor, InputEvent, Layer, Options, Rect, ShmPoolHandle};
-use objc2_foundation::{NSDefaultRunLoopMode, NSRunLoop, NSRunLoopCommonModes, NSString};
+use objc2_foundation::{NSDefaultRunLoopMode, NSNotification, NSNotificationCenter, NSRunLoop, NSRunLoopCommonModes, NSString};
 use objc2_metal::{
     MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -998,6 +998,9 @@ const KEY_Q: u16 = 0x0c;
 const COMMAND: u64 = 1 << 20;
 const CAPS_LOCK_KEY: u16 = 0x39;
 
+/// The keys (evdev codes) the compositor has been told are down.
+static HELD_KEYS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
 /// Send a key event on to the compositor, in Linux terms: key downs and ups
 /// (not AppKit's repeats: clients repeat keys themselves, as on Linux), and
 /// modifier changes as presses and releases of those keys.
@@ -1005,6 +1008,11 @@ fn forward_key(keys: &macwl_compositor::InputSender, event: &NSEvent, ty: NSEven
     let time_ms = (event.timestamp() * 1000.0) as u32;
     let send = |mac: u16, pressed: bool| {
         if let Some(code) = macwl_compositor::keymap::evdev_from_mac(mac) {
+            let mut held = HELD_KEYS.lock().unwrap();
+            held.retain(|&k| k != code);
+            if pressed {
+                held.push(code);
+            }
             let _ = keys.send(InputEvent::Key { code, pressed, time_ms });
         }
     };
@@ -1020,6 +1028,17 @@ fn forward_key(keys: &macwl_compositor::InputSender, event: &NSEvent, ty: NSEven
         } else if let Some(&(_, bit)) = macwl_compositor::keymap::MODIFIERS.iter().find(|&&(k, _)| k == key) {
             send(key, flags & bit != 0);
         }
+    }
+}
+
+/// Release every key the compositor thinks is down. For when the shell stops
+/// being the active app: the releases of keys held then (Cmd of a Cmd+Tab,
+/// say) go to whichever app is active instead, and without this the client
+/// would see them held from then on.
+fn release_held_keys(keys: &macwl_compositor::InputSender) {
+    let time_ms = (CACurrentMediaTime() * 1000.0) as u32;
+    for code in std::mem::take(&mut *HELD_KEYS.lock().unwrap()) {
+        let _ = keys.send(InputEvent::Key { code, pressed: false, time_ms });
     }
 }
 
@@ -1254,6 +1273,7 @@ fn main() {
     let key_pending: Arc<Mutex<Option<(f64, f64)>>> = Arc::default();
     let monitor_key_pending = key_pending.clone();
     let auto_key_sender = keys.clone();
+    let resign_keys = keys.clone();
     let (monitor_view, monitor_layer) = (view.clone(), layer.clone());
     let monitor = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         let event = unsafe { event.as_ref() };
@@ -1303,6 +1323,15 @@ fn main() {
         if is_key { std::ptr::null_mut() } else { event as *const NSEvent as *mut NSEvent }
     });
     let _monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Any, &monitor) };
+    let on_resign = RcBlock::new(move |_: NonNull<NSNotification>| release_held_keys(&resign_keys));
+    let _on_resign = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(NSApplicationDidResignActiveNotification),
+            None,
+            None,
+            &on_resign,
+        )
+    };
 
     // --- Auto mode: fake input events at random times ---------------------------
     let auto = auto_samples.map(|samples| {
