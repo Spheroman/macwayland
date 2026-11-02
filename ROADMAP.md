@@ -252,8 +252,15 @@ from a static Linux binary.
    (300 blocked guest threads: 22–23 host threads); host threads are
    budgeted (1024) with a watchdog on their real count, and timers share
    one thread; real-time signals queue; eventfd wakeups 3x faster and a
-   50 µs sleep 56 µs (was 1.1 ms). Terminals (step 4), clients (5) and Mac
-   programs (6: refused with ENOEXEC under the flag) follow.
+   50 µs sleep 56 µs (was 1.1 ms). Step 4 done (2026-11-02): terminals and
+   job control in one VM, the host keeping each pty's session and
+   foreground group with Linux's rules (keyboard signals on master
+   writes, SIGTTIN/SIGTTOU and EIO, orphaned groups, hangups, SIGWINCH),
+   and a `macwl-run` started in a Mac terminal relaying it to a pty of the
+   host's, stopping with its first process as the Mac shell's job. foot
+   with bash: Ctrl-C, Ctrl-Z, `jobs`, `bg`, `fg` and vim suspended and
+   resumed, the same in one VM and 1:1. Clients (5) and Mac programs (6:
+   refused with ENOEXEC under the flag) follow.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return

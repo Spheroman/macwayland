@@ -1,9 +1,9 @@
 # Processes in one VM: a host per session
 
 Status: design (2026-11-02), open questions decided (2026-11-02, see
-"Decisions"); steps 1, 2 and 3 done (2026-11-02: processes in one VM work
-behind `MACWL_ONE_VM=1`; step 4, terminals, is next). ROADMAP items 6 and
-13; extends the thread
+"Decisions"); steps 1, 2, 3, 3a and 4 done (2026-11-02: processes in one
+VM work behind `MACWL_ONE_VM=1`, terminals and job control included; step
+5, clients, is next). ROADMAP items 6 and 13; extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
 
@@ -1051,6 +1051,108 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    stops parked; the relay for a host started in a Mac terminal. Tests: bash
    job control in `signals` under a pty; foot through the headless
    compositor (`MACWL_TYPE`): Ctrl-C, Ctrl-Z, `jobs`, `bg`, `fg`, vim.
+
+   **Done, 2026-11-02.** In one VM the host's ptys are no Mac process's
+   controlling terminal (host opens get O_NOCTTY); the table keeps each
+   pty's session and foreground group, with Linux's rules
+   (`drivers/tty/tty_jobctrl.c`), behind the `Kernel`'s terminal calls:
+
+   - **Controlling terminals**: a session leader opening a slave without
+     O_NOCTTY, or `TIOCSCTTY`, takes it; fork inherits it, `setsid` drops
+     it; `TIOCNOTTY` (a leader's foreground group then gets SIGHUP and
+     SIGCONT); `/dev/tty` opens it, or ENXIO; `TIOCGSID`;
+     `/proc/<pid>/stat`'s `tty_nr` and `tpgid`.
+   - **`tcsetpgrp`/`tcgetpgrp`**: the session's own terminal, groups of the
+     session (a background caller's `tcsetpgrp` is a change: SIGTTOU unless
+     blocked, bash's case).
+   - **Keyboard signals**: a write to a master is typed input. With ISIG
+     each VINTR, VQUIT and VSUSP (after ISTRIP; VLNEXT quoting the next
+     byte in canonical mode with IEXTEN, as `n_tty`) is written, then its
+     signal goes to the foreground group, so a Ctrl-C after typed text
+     comes after it; the Mac driver echoes and flushes as before. The line
+     discipline's rules are unit tests (`tty.rs`).
+   - **SIGTTIN/SIGTTOU**: a background read, a TOSTOP write, or a change
+     (`tcsetattr`, `tcflush`, `tcflow`, `tcsendbreak`, `tcsetpgrp`) of the
+     controlling terminal sends the signal to the caller's group and the
+     call is made again once that's been dealt with (Linux's ERESTARTSYS);
+     EIO for a read with SIGTTIN blocked or ignored, or from an orphaned
+     group; a write or change with SIGTTOU blocked or ignored goes ahead.
+   - **Hangups**: a master's last close gives the session leader SIGHUP
+     and SIGCONT (and the session loses its terminal); a session leader
+     ending gives its foreground group SIGHUP; a group orphaned with a
+     stopped process in it gets SIGHUP and SIGCONT, and SIGTSTP, SIGTTIN
+     and SIGTTOU do nothing to an orphaned group.
+   - **SIGWINCH** to the foreground group when `TIOCSWINSZ` changes the
+     size. A new pty starts at 0x0, as on Linux (macOS kept the size the
+     last pty of its number had, so a first resize could be no change).
+   - **Stops park** the process's tasks (step 3), so a stopped job holds no
+     CPU.
+   - **The relay** (`crates/runtime/src/relay.rs`): a `macwl-run` started
+     with a terminal as stdin gives its first process a pty of the host's
+     in place of that terminal (its fds 0-2 that were it, one open file),
+     with the terminal's settings and size, as its controlling terminal;
+     the Mac terminal goes raw and two host threads join it to the
+     master, input through the keyboard rules above. When the first
+     process stops, the terminal gets its settings back and the host stops
+     with SIGSTOP, so the Mac shell sees its job stop; continued (`fg`,
+     `bg`), the terminal is raw again and the first process's group gets
+     SIGCONT. The Mac terminal's SIGWINCH and SIGHUP are the pty's resize
+     and hangup; its going away (EOF) hangs the pty up. The first
+     process's group isn't orphaned: the Mac shell stands as its parent in
+     the session (`Entry::mac_parent`). Only `macwl-run` turns it on (a
+     test harness running hosts in-process doesn't).
+
+   Found on the way, fixed in both modes:
+   - A call a signal interrupted with no handler run for it (a stop, then
+     SIGCONT) is made again, as Linux restarts ERESTARTSYS: `cat` stopped
+     by Ctrl-Z and continued saw EINTR and exited.
+   - Generating SIGCONT discards pending stop signals, and a stop signal a
+     pending SIGCONT, as Linux does.
+   - `kill`, `tkill` and `tgkill` read their pids as ints: glibc's
+     `kill(-pgid)` leaves the register's upper half zero, which read as a
+     huge pid (bash's `fg` got ESRCH in one VM).
+   - 1:1: since step 3a a read waited for input before it was made, so a
+     background process's terminal read was never stopped by the Mac
+     driver until something was typed; a background read is now made at
+     once.
+
+   Choices the design left open, taken by the rule (2026-11-02):
+   - **Linux's rules throughout, not the Mac driver's**, including the
+     orphaned-group rules (EIO, discarded stops, SIGHUP and SIGCONT to an
+     orphaned group with a stopped member), ERESTARTSYS restarts after
+     stops, and VLNEXT state kept across writes per pty, rather than
+     only the common cases.
+   - **Hangup as Linux does it**: the master's close signals the session
+     leader (SIGHUP, SIGCONT), and the leader's end the foreground group,
+     rather than signalling the foreground group directly; a shell then
+     hangs its jobs up itself, as on Linux.
+   - **Signals between the bytes**: a write to a master is split at each
+     signal character, and the signal sent once its byte is in, rather
+     than one signal pass after the whole write.
+   - **The relay stops the whole host** when the first process stops, so
+     the Mac shell's job control works on `macwl-run` as on any program;
+     step 5's clients stop only themselves.
+
+   Tests (`crates/runtime/guest/tty.c`, both modes):
+   `terminals_and_job_control` (the rules process by process, with
+   `one_vm_` copy), `bash_job_control` (nixpkgs arm64 bash typed at
+   through the master: `cat &` stopped by SIGTTIN and `fg`, Ctrl-Z,
+   `jobs`, `bg`, Ctrl-C ending only the foreground job, a hangup ending
+   bash by SIGHUP and its jobs), `one_vm_relays_its_terminal` (size,
+   Ctrl-Z stopping `macwl-run` with the terminal's settings back, SIGCONT,
+   Ctrl-C, hangup); 4 line-discipline unit tests. In 1:1 two checks are
+   skipped: the Mac driver doesn't count a process forked after its
+   session took the terminal (a spare launched ahead) as having it, so a
+   resize's SIGWINCH and a non-leader's `TIOCNOTTY` skip it there. foot
+   (nixpkgs) through the headless compositor, typed with `MACWL_TYPE`,
+   running bash: `sleep 100` Ctrl-Z, `jobs` (Stopped), `bg`, `jobs`
+   (Running), `fg`, Ctrl-C (`$?` 130), `cat &` (Stopped), `fg`, typed
+   to, Ctrl-D, vim (`-u NONE`) Ctrl-Z, `jobs`, `fg`, `:wq` (saved): the
+   same in one VM and 1:1. Stress: the tty tests 30-80 runs 4-8 at a time
+   per mode, no failures; runtime 35 unit + 39 integration in both modes,
+   10 suite runs. Wine boots and runs `cmd.exe` in both modes (and in one
+   VM from a terminal, through the relay). `wakebench` p50s unchanged
+   (within 0.5 µs either way, both modes).
 5. **Clients.** `--serve`, `MACWL_HOST`, the client protocol, exit status,
    forwarded signals, the relay, hangup when a client dies; `session.sh`
    starts one host. Tests: a client's exit code and signal status; `kill

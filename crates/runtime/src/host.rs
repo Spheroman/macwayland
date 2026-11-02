@@ -11,8 +11,11 @@
 //! `waitid`, `kill`, `setpgid` and the rest. Signals between processes go
 //! through one routing function ([`Table::deliver`]).
 //!
-//! What stays for later steps: terminals and job control (step 4: `tcsetpgrp`
-//! says ENOTTY here), clients joining a host (5), Mac programs (6: an
+//! Terminals are the table's too (step 4): each pty's session and
+//! foreground group, keyboard signals, SIGTTIN/SIGTTOU and hangups, with
+//! Linux's rules; a host started in a Mac terminal relays it (`relay`).
+//!
+//! What stays for later steps: clients joining a host (5), Mac programs (6: an
 //! `execve` of one fails with ENOEXEC, and the host process never execs).
 //! The table's entries are a kind ([`Kind`]) so that stand-ins for Mac
 //! programs (6) and for processes in other hosts (9) fit in beside local
@@ -1280,8 +1283,9 @@ fn rusage_of(cpu: Times, rss_kb: u64) -> [u8; RUSAGE_SIZE] {
 
 /// The Linux signals a host catches for itself, to route to its processes
 /// ([`Table::from_host`]): what a terminal or a `kill` from the Mac side
-/// sends. (SIGTSTP and friends stay the host's: a Ctrl-Z stops it whole,
-/// as the Mac shell expects of a job, until step 4's relay.)
+/// sends. With a relay, Ctrl-C and Ctrl-Z are bytes on the relay's pty and
+/// SIGWINCH and SIGHUP are its resize and hangup. (A SIGTSTP from a Mac
+/// `kill` stays the host's: it stops whole, as a Mac job.)
 const FROM_HOST: [u64; 8] = [1, 2, 3, 10, 12, 14, 15, 28];
 
 /// Run `elf` as the first process of a new host, and everything it starts,
