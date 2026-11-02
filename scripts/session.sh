@@ -14,7 +14,7 @@ foot=$(linux_pkg foot)
 
 runtime=/tmp/macwl-session-$(id -u)
 rm -rf "$runtime"
-mkdir -p "$runtime"
+mkdir -m 700 "$runtime"
 XDG_RUNTIME_DIR=$runtime target/release/macwl-shell &
 shell=$!
 trap 'kill $shell 2>/dev/null' EXIT

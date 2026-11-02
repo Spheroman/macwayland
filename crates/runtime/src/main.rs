@@ -215,7 +215,7 @@ fn main() -> ExitCode {
     // --root), and where programs keep their config and caches.
     let home = std::env::var_os("HOME").map_or_else(|| b"/".to_vec(), |h| h.into_encoded_bytes());
     let mut env = vec![b"PATH=/usr/local/bin:/usr/bin:/bin".to_vec(), [b"HOME=", &home[..]].concat(), format!("TERM={term}").into_bytes()];
-    for var in ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DEBUG", "RUST_LOG", "RUST_BACKTRACE", "LANG", "FONTCONFIG_FILE"] {
+    for var in ["USER", "LOGNAME", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DEBUG", "RUST_LOG", "RUST_BACKTRACE", "LANG", "FONTCONFIG_FILE"] {
         if let Some(value) = std::env::var_os(var) {
             env.push([var.as_bytes(), b"=", value.as_bytes()].concat());
         }
