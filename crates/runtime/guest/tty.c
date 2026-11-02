@@ -151,12 +151,34 @@ static void catch_int_forever(int tty) {
     for (;;) pause();
 }
 
-static void winch_waiter(int tty) {
-    signal(SIGWINCH, on_sig);
+// Wait for `sig`, having said "R" once its handler is in (blocked
+// meanwhile, so it can't come between the look and the wait).
+static void await_signal(int sig) {
+    sigset_t s, old;
+    sigemptyset(&s);
+    sigaddset(&s, sig);
+    sigprocmask(SIG_BLOCK, &s, &old);
+    signal(sig, on_sig);
     write(report[1], "R", 1);
-    (void)tty;
-    while (got_sig != SIGWINCH) pause();
-    _exit(0);
+    while (got_sig != sig) sigsuspend(&old);
+    sigprocmask(SIG_SETMASK, &old, 0);
+}
+
+static void winch_waiter(int tty) {
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGWINCH);
+    sigprocmask(SIG_BLOCK, &s, 0);
+    write(report[1], "R", 1);
+    for (;;) {
+        struct timespec ts = {10, 0};
+        if (sigtimedwait(&s, 0, &ts) == SIGWINCH) _exit(0);
+        if (getenv("TTY_TRACE")) {
+            struct winsize ws = {0};
+            ioctl(tty, TIOCGWINSZ, &ws);
+            fprintf(stderr, "tty %d: no SIGWINCH yet: size %dx%d, foreground %d, mine %d\n", getpid(), ws.ws_row, ws.ws_col, tcgetpgrp(tty), getpgrp());
+        }
+    }
 }
 
 static void read_line(int tty) {
@@ -291,8 +313,10 @@ static void session_rules(const char *name, int m) {
     j = one_vm() ? job(winch_waiter, tty) : job(pause_forever, tty);
     CHECK(!one_vm() || (read(report[0], &c, 1) == 1 && c == 'R'));
     foreground(tty, j);
-    struct winsize ws = {40, 100, 0, 0};
+    struct winsize ws = {40, 100, 0, 0}, was;
+    CHECK(ioctl(m, TIOCGWINSZ, &was) == 0);
     CHECK(ioctl(m, TIOCSWINSZ, &ws) == 0);
+    if (getenv("TTY_TRACE")) fprintf(stderr, "tty %d: size %dx%d to 40x100, foreground %d\n", getpid(), was.ws_row, was.ws_col, tcgetpgrp(tty));
     if (!one_vm()) kill(j, SIGKILL);
     st = wait_status(j, 0);
     CHECK(one_vm() ? WIFEXITED(st) && WEXITSTATUS(st) == 0 : WIFSIGNALED(st));
@@ -373,9 +397,7 @@ static void session_hangup(const char *name, int m) {
     close(m);
     int tty = become_session(name);
     (void)tty;
-    signal(SIGHUP, on_sig);
-    write(report[1], "R", 1);
-    while (got_sig != SIGHUP) pause();
+    await_signal(SIGHUP);
     write(report[1], "H", 1);
     _exit(0);
 }

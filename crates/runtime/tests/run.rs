@@ -735,9 +735,37 @@ fn tty_guest(one_vm: Option<bool>, args: &[&std::ffi::OsStr]) {
     if let Some(on) = one_vm {
         cmd.env("MACWL_ONE_VM", if on { "1" } else { "0" });
     }
-    let out = cmd.arg(&path).args(args).stdin(std::process::Stdio::null()).output().unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && stdout.ends_with("tty ok\n"), "tty {args:?}: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // Its waits traced to stderr, which a failure (or two minutes without
+    // an end) shows.
+    let mut child = cmd
+        .env("MACWL_ENV_TTY_TRACE", "1")
+        .arg(&path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let drain = |mut r: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = r.read_to_end(&mut v);
+        String::from_utf8_lossy(&v).into_owned()
+    });
+    let (out, err) = (drain(Box::new(child.stdout.take().unwrap())), drain(Box::new(child.stderr.take().unwrap())));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if std::time::Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
+    assert!(status.is_some_and(|s| s.success()) && stdout.ends_with("tty ok\n"), "tty {args:?} ({status:?}): {stdout}, stderr: {stderr}");
 }
 
 /// An arm64 Linux package from nixpkgs (`MACWL_TEST_<NAME>` overrides): its
