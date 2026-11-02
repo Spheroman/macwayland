@@ -343,6 +343,9 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         // Every thread is SCHED_OTHER at nice 0, for now (docs/mn-threads.md,
         // step 5, is where priorities come in). getpriority returns 20 - nice.
         nr::GETPRIORITY => Ok(20),
+        // Lowering one's priority (nice >= 0) is allowed and, for now, has no
+        // effect; raising it needs CAP_SYS_NICE.
+        nr::SETPRIORITY => if (a2 as i32) < 0 { Err(errno::EACCES) } else { Ok(0) },
         nr::SCHED_GETSCHEDULER => Ok(0),
         nr::SCHED_GETPARAM => mem.write_pod(a1, &0i32).map(|()| 0),
         // SCHED_FIFO and SCHED_RR are 1 to 99; the others only 0.
@@ -352,6 +355,8 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         // Restartable sequences need the kernel to notice preemption; without
         // them glibc falls back on atomics, as on kernels before 4.18.
         nr::RSEQ => Err(errno::ENOSYS),
+        // A kernel built without it; Wine probes and does without.
+        nr::USERFAULTFD => Err(errno::ENOSYS),
         // glibc tries clone3 first and falls back on clone.
         nr::CLONE3 => Err(errno::ENOSYS),
         nr::CLONE => match process::clone(p, a0, a1, a2, a3, a4) {
@@ -376,6 +381,9 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::GETRUSAGE => misc::getrusage(mem, a0, a1),
         nr::SYSINFO => misc::sysinfo(mem, a0),
         nr::SCHED_GETAFFINITY => misc::sched_getaffinity(mem, a1, a2),
+        // macOS has no CPU affinity: accept any mask, as if the scheduler
+        // honoured it.
+        nr::SCHED_SETAFFINITY => Ok(0),
         nr::NANOSLEEP => misc::nanosleep(mem, a0, a1),
         nr::CLOCK_NANOSLEEP => misc::clock_nanosleep(mem, a0, a1, a2, a3),
         nr::UNAME => misc::uname(mem, a0),

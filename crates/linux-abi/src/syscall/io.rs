@@ -347,6 +347,8 @@ pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, req:
         // makes a new one): what Linux says on a file system without them,
         // and `cp` copies instead.
         ioctl::FICLONE | ioctl::FICLONERANGE => Err(errno::EOPNOTSUPP),
+        // Not ext2-like and not FAT: what Linux answers on, say, tmpfs.
+        ioctl::FS_IOC_GETFLAGS | ioctl::VFAT_IOCTL_READDIR_BOTH => Err(errno::ENOTTY),
         _ => {
             p.unimplemented(format!("ioctl {req:#x}"));
             Err(errno::ENOTTY)
