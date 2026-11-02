@@ -9,7 +9,7 @@
 
 use std::{os::fd::RawFd, time::Duration};
 
-use super::{ok, process, signal, Process};
+use super::{ok, process, signal, Process, Thread};
 use crate::errno;
 
 /// A child that changed state, as `wait4` reports it.
@@ -55,13 +55,17 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     /// `setsid`.
     fn setsid(&self, p: &Process) -> Result<i64, i64>;
     /// `kill(target, sig)` for a target other than the caller itself: another
-    /// process, or a process group (negative). `sig` 0 only checks.
+    /// process, the caller's group (0), a process group (negative), or every
+    /// process it may signal (-1). `sig` 0 only checks.
     fn kill(&self, p: &Process, target: i64, sig: u64) -> Result<i64, i64>;
-    /// `wait4(pid, options)`: a child that changed state, or None (WNOHANG
-    /// and nothing to report).
-    fn wait4(&self, p: &Process, pid: i64, options: u64) -> Result<Option<Waited>, i64>;
+    /// `tgkill(tgid, tid, sig)` (`tkill` without a `tgid`) for a thread the
+    /// caller's process doesn't have: one of another process.
+    fn tgkill(&self, p: &Process, tgid: Option<i64>, tid: i64, sig: u64) -> Result<i64, i64>;
+    /// `wait4(pid, options)` by thread `t`: a child that changed state, or
+    /// None (WNOHANG and nothing to report).
+    fn wait4(&self, p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64>;
     /// `waitid(idtype, id, options)`: likewise.
-    fn waitid(&self, p: &Process, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64>;
+    fn waitid(&self, p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64>;
     /// The foreground process group of the terminal open as `host_fd`.
     fn tcgetpgrp(&self, p: &Process, host_fd: RawFd) -> Result<i64, i64>;
     /// Make `pgrp` the foreground group of the terminal open as `host_fd`.
@@ -78,6 +82,17 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     /// The process's umask changed to `mask` (the runtime applies it to the
     /// modes of what the guest creates; a kernel may mirror it).
     fn umask_changed(&self, p: &Process, mask: u32);
+    /// Whether the host process is this Linux process alone, so that its
+    /// signal dispositions, and its threads' masks for the job-control
+    /// signals, are mirrored onto the host's (and the host's own default
+    /// actions act for it). Not when a host runs many processes: signals
+    /// are all in memory then.
+    fn host_signals(&self) -> bool {
+        true
+    }
+    /// Whether `execve` may run Mac programs (`Action::ExecHost`): only when
+    /// the host process is the Linux process alone, and can become one.
+    fn mac_programs(&self) -> bool;
 }
 
 /// Each Linux process is a host process: pids, groups, sessions, `wait` and
@@ -107,16 +122,39 @@ impl Kernel for HostKernel {
         ok(unsafe { libc::setsid() } as i64)
     }
 
-    fn kill(&self, _p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
-        let darwin = if sig == 0 { 0 } else { signal::to_darwin(sig).ok_or(errno::EINVAL)? };
-        ok(unsafe { libc::kill(target as i32, darwin) } as i64)
+    fn kill(&self, p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
+        match target {
+            // The caller's group: the Mac process group holds processes that
+            // aren't Linux ones (the runtime itself, a spare), so the caller
+            // only.
+            0 => signal::kill_self(p, sig),
+            -1 => {
+                // Every process the user owns: on a Mac that's the whole login
+                // session.
+                p.unimplemented("kill(-1, ...) (signalling every process)".into());
+                Err(errno::EPERM)
+            }
+            _ => {
+                let darwin = if sig == 0 { 0 } else { signal::to_darwin(sig).ok_or(errno::EINVAL)? };
+                ok(unsafe { libc::kill(target as i32, darwin) } as i64)
+            }
+        }
     }
 
-    fn wait4(&self, p: &Process, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
+    fn tgkill(&self, p: &Process, tgid: Option<i64>, tid: i64, sig: u64) -> Result<i64, i64> {
+        // Another process's thread: its process is the best we can do (its
+        // tids aren't the host's).
+        if tgid.is_none() && tid == p.pid {
+            return Err(errno::ESRCH);
+        }
+        self.kill(p, tid, sig)
+    }
+
+    fn wait4(&self, p: &Process, _t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
         process::host_wait4(p, pid, options)
     }
 
-    fn waitid(&self, p: &Process, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
+    fn waitid(&self, p: &Process, _t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
         process::host_waitid(p, idtype, id, options)
     }
 
@@ -157,6 +195,10 @@ impl Kernel for HostKernel {
         // The host process is the Linux process: what it creates (and a Mac
         // program it becomes) gets the mask from the host too.
         unsafe { libc::umask(mask as libc::mode_t) };
+    }
+
+    fn mac_programs(&self) -> bool {
+        process::mac_programs_allowed()
     }
 }
 

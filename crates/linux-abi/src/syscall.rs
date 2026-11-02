@@ -28,14 +28,14 @@ pub(crate) use epoll::{new_instance as new_epoll, rewatch};
 pub(crate) use inotify::{inotify_copy, inotify_pending, inotify_read};
 pub(crate) use kfd::{eventfd_copy, timerfd_copy};
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
-pub use signalfd::SignalFd;
+pub use signalfd::{HostSignalWait, SignalFd};
 pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
 pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, Waited, RUSAGE_SIZE};
 pub use timer::set_interrupt;
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
 pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
-pub use signal::{set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
+pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -186,6 +186,13 @@ impl Process {
             umask: AtomicU32::new(0o022),
             itimers: Mutex::default(),
         }
+    }
+
+    /// Run against `kernel` from now on (a host's process table, when it
+    /// runs many processes).
+    pub fn set_kernel(&mut self, kernel: Arc<dyn Kernel>) {
+        self.inbox.mirror_host.store(kernel.host_signals(), Ordering::Relaxed);
+        self.kernel = kernel;
     }
 
     /// The file mode creation mask.
@@ -409,8 +416,8 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
             Ok(action) => return action,
             Err(e) => Err(e),
         },
-        nr::WAIT4 => process::wait4(p, mem, a0 as i32 as i64 as u64, a1, a2, a3),
-        nr::WAITID => process::waitid(p, mem, a0, a1, a2, a3, a4),
+        nr::WAIT4 => process::wait4(p, t, mem, a0 as i32 as i64 as u64, a1, a2, a3),
+        nr::WAITID => process::waitid(p, t, mem, a0, a1, a2, a3, a4),
         // Advice only.
         nr::FADVISE64 | nr::READAHEAD => p.fds.host(a0).map(|_| 0),
         // Linux xattr names ("user.", "security."...) don't map onto Darwin's;

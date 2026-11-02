@@ -69,25 +69,30 @@ pub struct Fork {
     pub tls: Option<u64>,
     /// CLONE_VFORK: the parent waits until the child execs or exits.
     pub vfork: bool,
-    parent_tid: Option<u64>,
-    child_tid: Option<u64>,
+    /// CLONE_PARENT_SETTID: where in the parent to store the child's pid.
+    pub parent_tid: Option<u64>,
+    /// CLONE_CHILD_SETTID: likewise, in the child.
+    pub child_tid: Option<u64>,
+    /// The signal the parent gets when the child ends (`flags & CSIGNAL`,
+    /// SIGCHLD as a rule; 0 for none).
+    pub exit_signal: u64,
 }
 
 impl Fork {
     pub fn encode(&self, e: &mut Encoder) {
-        e.u64(self.stack).bool(self.vfork);
+        e.u64(self.stack).bool(self.vfork).u64(self.exit_signal);
         for v in [self.tls, self.parent_tid, self.child_tid] {
             e.bool(v.is_some()).u64(v.unwrap_or(0));
         }
     }
 
     pub fn decode(d: &mut Decoder) -> Result<Self, Truncated> {
-        let (stack, vfork) = (d.u64()?, d.bool()?);
+        let (stack, vfork, exit_signal) = (d.u64()?, d.bool()?, d.u64()?);
         let mut opt = || -> Result<Option<u64>, Truncated> {
             let (some, v) = (d.bool()?, d.u64()?);
             Ok(some.then_some(v))
         };
-        Ok(Fork { stack, vfork, tls: opt()?, parent_tid: opt()?, child_tid: opt()? })
+        Ok(Fork { stack, vfork, exit_signal, tls: opt()?, parent_tid: opt()?, child_tid: opt()? })
     }
 }
 
@@ -269,6 +274,38 @@ impl Process {
         Ok((p, t))
     }
 
+    /// A child forked by thread `t` in the same host process (many processes
+    /// in one VM), as pid `pid`, and its one thread: what
+    /// [`Process::encode_for_fork`] would pass on, but open files shared
+    /// rather than sent (one open file description each, as on Linux:
+    /// see [`FdTable::fork`]), and the same kernel.
+    pub fn fork_in_host(&self, t: &Thread, pid: i64) -> (Process, Thread) {
+        let mut p = Process::new("/");
+        p.pid = pid;
+        p.set_kernel(self.kernel.clone());
+        p.fds = self.fds.fork(&p.inbox);
+        // The rest as a 1:1 fork carries it, through the same encoding.
+        let mut e = Encoder::default();
+        self.fs.encode(&mut e);
+        self.signals().encode(&t.signals, &mut e);
+        self.file_maps().encode(&mut e);
+        let mut d = Decoder(&e.0);
+        let decoded = (|| -> Result<_, Truncated> { Ok((Filesystem::decode(&mut d)?, signal::Signals::decode(&mut d)?, super::mem::FileMaps::decode(&mut d)?)) })();
+        let (fs, (signals, thread_signals), file_maps) = decoded.expect("a fork's own encoding");
+        p.fs = fs;
+        *p.signals() = signals;
+        *p.file_maps() = file_maps;
+        p.set_exe(self.exe());
+        *p.rlimits.get_mut().unwrap() = *self.rlimits.lock().unwrap_or_else(|e| e.into_inner());
+        p.dumpable.store(self.dumpable.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.no_new_privs.store(self.no_new_privs.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.umask.store(self.umask(), Ordering::Relaxed);
+        let mut child = Thread::main(&p);
+        child.signals = thread_signals;
+        child.comm = t.comm.clone();
+        (p, child)
+    }
+
     /// In the parent, once the child `pid` exists: CLONE_PARENT_SETTID, and
     /// keep its control socket for `wait`.
     /// `seen` is anything already read from the socket (while waiting for a
@@ -416,6 +453,7 @@ pub(super) fn clone(p: &Process, flags: u64, stack: u64, ptid: u64, tls: u64, ct
         vfork,
         parent_tid: (flags & CLONE_PARENT_SETTID != 0 && ptid != 0).then_some(ptid),
         child_tid: (flags & CLONE_CHILD_SETTID != 0 && ctid != 0).then_some(ctid),
+        exit_signal: flags & 0xff,
     }))
 }
 
@@ -490,7 +528,7 @@ fn is_mach_o(head: &[u8]) -> bool {
     }
 }
 
-fn mac_programs_allowed() -> bool {
+pub(super) fn mac_programs_allowed() -> bool {
     std::env::var_os("MACWL_MAC_PROGRAMS").is_some_and(|v| v == "1")
 }
 
@@ -539,7 +577,7 @@ fn load_program(p: &Process, path: Vec<u8>, argv: Vec<Vec<u8>>, search: &[u8], d
     let mut head = Vec::with_capacity(256);
     std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 256), &mut head).map_err(|e| errno::from_io(&e))?;
     if is_mach_o(&head) {
-        return if mac_programs_allowed() { Ok(Program::Mac(host, argv)) } else { Err(errno::ENOEXEC) };
+        return if p.kernel.mac_programs() { Ok(Program::Mac(host, argv)) } else { Err(errno::ENOEXEC) };
     }
     let data = head;
 
@@ -726,11 +764,11 @@ const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
 const WALL_ETC: u64 = 0xe000_0000;
 
-pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, pid: u64, status: u64, options: u64, rusage: u64) -> Result<i64, i64> {
+pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, pid: u64, status: u64, options: u64, rusage: u64) -> Result<i64, i64> {
     if options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL_ETC) != 0 {
         return Err(errno::EINVAL);
     }
-    let Some(got) = p.kernel.wait4(p, pid as i64, options)? else { return Ok(0) };
+    let Some(got) = p.kernel.wait4(p, t, pid as i64, options)? else { return Ok(0) };
     if status != 0 {
         mem.write_pod(status, &got.status)?;
     }
@@ -779,7 +817,7 @@ pub(super) fn host_wait4(p: &Process, pid: i64, options: u64) -> Result<Option<W
 }
 
 /// `waitid(idtype, id, infop, options, rusage)`.
-pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, mem: &M, idtype: u64, id: u64, infop: u64, options: u64, rusage: u64) -> Result<i64, i64> {
+pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, idtype: u64, id: u64, infop: u64, options: u64, rusage: u64) -> Result<i64, i64> {
     const WSTOPPED: u64 = 2;
     const WEXITED: u64 = 4;
     const WNOWAIT: u64 = 0x0100_0000;
@@ -793,7 +831,7 @@ pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, mem: &M, idtype: u64,
         return Err(errno::EINVAL);
     }
     let mut out = [0u8; 128];
-    if let Some(child) = p.kernel.waitid(p, idtype, id, options)? {
+    if let Some(child) = p.kernel.waitid(p, t, idtype, id, options)? {
         let fields: [(usize, i32); 5] = [(0, SIGCHLD), (8, child.code), (16, child.pid as i32), (20, child.uid as i32), (24, child.status)];
         for (off, v) in fields {
             out[off..off + 4].copy_from_slice(&v.to_le_bytes());

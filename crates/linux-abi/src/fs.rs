@@ -311,6 +311,27 @@ impl FdTable {
         host
     }
 
+    /// A forked child's table, in the same host process: the same open files
+    /// (one open file description each, shared, as on Linux: offsets,
+    /// epoll sets, eventfd counts), except signalfds, which read the
+    /// signals of the process reading them, so the child gets its own,
+    /// for the process with `inbox`.
+    pub fn fork(&self, inbox: &std::sync::Arc<crate::syscall::Inbox>) -> FdTable {
+        let slots = self
+            .slots()
+            .iter()
+            .map(|slot| {
+                let s = slot.as_ref()?;
+                let FileKind::SignalFd(signalfd) = &s.file.kind else { return Some(s.clone()) };
+                // Without a copy (no kqueue to be had) the child just doesn't
+                // have it.
+                let entry = crate::syscall::signalfd_copy(inbox, signalfd.mask(), nonblocking(&s.file)).ok()?.cloexec(s.cloexec);
+                Some(entry.open())
+            })
+            .collect();
+        FdTable { slots: Mutex::new(slots) }
+    }
+
     /// The inverse of [`FdTable::encode`], taking host fds from `fds`, for
     /// the process with `inbox` (its signalfds).
     pub fn decode(d: &mut Decoder, fds: &mut impl Iterator<Item = OwnedFd>, inbox: &std::sync::Arc<crate::syscall::Inbox>) -> Result<Self, Truncated> {

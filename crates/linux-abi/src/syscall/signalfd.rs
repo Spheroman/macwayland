@@ -91,6 +91,35 @@ fn new_signalfd(inbox: &Arc<Inbox>, mask: u64, nonblock: bool) -> Result<FdEntry
     Ok(entry)
 }
 
+/// A host thread's wait for host signals caught for an inbox of its own (a
+/// host of many processes routes them itself: see
+/// [`Inbox::receive_host_signals`]). A signalfd of no process, underneath.
+#[derive(Debug)]
+pub struct HostSignalWait {
+    kq: FdEntry,
+    inbox: Arc<Inbox>,
+}
+
+impl HostSignalWait {
+    pub fn new(inbox: &Arc<Inbox>) -> Result<Self, i64> {
+        Ok(HostSignalWait { kq: new_signalfd(inbox, 0, false)?, inbox: inbox.clone() })
+    }
+
+    /// Wait until host signals come, and take them (Linux numbering, bit
+    /// n-1 for signal n).
+    pub fn wait(&self) -> u64 {
+        loop {
+            let got = self.inbox.take_host_pending();
+            if got != 0 {
+                return got;
+            }
+            // The trigger stays set until taken: a signal between the look
+            // and the wait ends the wait at once.
+            let _ = kfd::wait(self.kq.host.as_raw_fd());
+        }
+    }
+}
+
 /// A forked child's copy of a signalfd, for the child's `inbox`.
 pub(crate) fn signalfd_copy(inbox: &Arc<Inbox>, mask: u64, nonblock: bool) -> Result<FdEntry, i64> {
     new_signalfd(inbox, mask, nonblock)
@@ -128,6 +157,7 @@ fn siginfo(info: &SigInfo) -> [u8; SIGINFO_SIZE] {
         put(32, &(overrun as u32).to_le_bytes());
         put(48, &value.to_le_bytes()); // ssi_ptr
     }
+    put(40, &info.status.to_le_bytes()); // ssi_status (SIGCHLD)
     put(72, &info.addr.to_le_bytes());
     b
 }

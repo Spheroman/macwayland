@@ -17,7 +17,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
 };
@@ -62,6 +62,9 @@ pub struct Inbox {
     pub(super) kqueues: [AtomicI32; 32],
     /// Its threads' wakers, for waking them all (a timer expired).
     wakers: Mutex<Vec<Weak<Waker>>>,
+    /// Whether its threads' masks are mirrored onto their host threads
+    /// ([`super::Kernel::host_signals`]).
+    pub(super) mirror_host: AtomicBool,
 }
 
 impl Default for Inbox {
@@ -71,6 +74,7 @@ impl Default for Inbox {
             fired: Mutex::default(),
             kqueues: [const { AtomicI32::new(-1) }; 32],
             wakers: Mutex::default(),
+            mirror_host: AtomicBool::new(true),
         }
     }
 }
@@ -96,6 +100,31 @@ impl Inbox {
     /// Whether a timer's signal is waiting to be taken in.
     pub(super) fn any_fired(&self) -> bool {
         !self.fired.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// Take the host signals caught for this inbox (bit n-1 for Linux
+    /// signal n).
+    pub fn take_host_pending(&self) -> u64 {
+        self.host_pending.swap(0, Ordering::AcqRel)
+    }
+
+    /// Host signals are for this inbox from now on: a host of many
+    /// processes keeps one of its own and routes what lands in it (see
+    /// [`super::HostSignalWait`]). It must live as long as the host process.
+    pub fn receive_host_signals(self: &Arc<Self>) {
+        HOST_TARGET.store(Arc::as_ptr(self).cast_mut(), Ordering::Release);
+    }
+}
+
+/// Catch the Linux signals `signals` on the host (for whatever inbox
+/// receives host signals), whatever any guest's disposition: for a host of
+/// many processes, which keeps no process's dispositions on the host.
+pub fn catch_host_signals(signals: &[u64]) {
+    for &sig in signals {
+        let Some(darwin) = to_darwin(sig) else { continue };
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = host_handler as *const () as libc::sighandler_t;
+        unsafe { libc::sigaction(darwin, &sa, std::ptr::null_mut()) };
     }
 }
 
@@ -193,12 +222,21 @@ pub struct SigInfo {
     pub addr: u64,
     /// For a timer's signal: its id, overrun count, and `sigev_value`.
     pub timer: Option<(i32, i32, u64)>,
+    /// SIGCHLD's `si_status`: the child's exit code, or the signal that
+    /// ended, stopped or continued it.
+    pub status: i32,
 }
 
 impl SigInfo {
-    /// From another process (or ourselves, with `kill`).
-    pub fn user(signo: u64, code: i32) -> Self {
-        SigInfo { signo, code, pid: std::process::id() as i32, uid: unsafe { libc::getuid() }, ..Default::default() }
+    /// From process `pid` (another, or ourselves, with `kill`).
+    pub fn user(signo: u64, code: i32, pid: i64) -> Self {
+        SigInfo { signo, code, pid: pid as i32, uid: unsafe { libc::getuid() }, ..Default::default() }
+    }
+
+    /// SIGCHLD from child `pid`: `code` CLD_EXITED, CLD_KILLED, CLD_STOPPED,
+    /// ...
+    pub fn child(pid: i64, code: i32, status: i32) -> Self {
+        SigInfo { signo: 17, code, pid: pid as i32, uid: unsafe { libc::getuid() }, status, ..Default::default() }
     }
 
     /// A fault at `addr`.
@@ -219,6 +257,7 @@ impl SigInfo {
         } else {
             b[16..20].copy_from_slice(&self.pid.to_le_bytes());
             b[20..24].copy_from_slice(&self.uid.to_le_bytes());
+            b[24..28].copy_from_slice(&self.status.to_le_bytes());
         }
         b
     }
@@ -404,6 +443,35 @@ impl Process {
         super::signalfd::notify(&self.inbox);
     }
 
+    /// A signal for the process (`tid` None) or one of its threads, from
+    /// outside its own calls: another process of the host, or the kernel
+    /// (SIGCHLD). It waits in the inbox until a thread takes it in (as it
+    /// returns to the guest, or in a wait for signals, which it ends), and
+    /// the threads are woken to look. Dropped at once if ignored, as Linux
+    /// does when it's sent.
+    pub fn post(&self, tid: Option<i64>, info: SigInfo) {
+        if self.signals().drops(info.signo, 0) {
+            return;
+        }
+        self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner()).push((tid, info));
+        self.signal_added();
+        match tid {
+            Some(tid) => self.wake_thread(tid),
+            None => self.wake_all_threads(),
+        }
+    }
+
+    /// What SIGCHLD's disposition says about children: whether they're
+    /// reaped as they end, rather than left for `wait` (SIG_IGN or
+    /// SA_NOCLDWAIT), and whether their stops are reported with a SIGCHLD
+    /// (not with SA_NOCLDSTOP).
+    pub fn child_policy(&self) -> (bool, bool) {
+        const SA_NOCLDSTOP: u64 = 1;
+        const SA_NOCLDWAIT: u64 = 2;
+        let a = self.signals().actions[17 - 1];
+        (a.handler == SIG_IGN || a.flags & SA_NOCLDWAIT != 0, a.flags & SA_NOCLDSTOP == 0)
+    }
+
     /// Take in signals that arrived from outside: host signals, and expired
     /// timers' (for the process, thread `tid`, or another thread).
     pub(super) fn take_external(&self, s: &mut Signals, ts: &ThreadSignals, tid: i64) {
@@ -477,7 +545,11 @@ impl Process {
                 SIG_DFL => {
                     if stops_by_default(sig) {
                         // Job control: the process stops, as Linux would.
+                        // (Not holding its signals: stopping tells the
+                        // parent, whose signals the kernel may take.)
+                        drop(s);
                         self.kernel.stop(self);
+                        s = self.signals();
                     }
                     continue;
                 }
@@ -514,8 +586,12 @@ impl Process {
         Delivery::Handler(start_handler(&mut s, &mut t.signals, sig, action, action.handler, info))
     }
 
-    /// Make the host's signal dispositions match the guest's, if they changed.
+    /// Make the host's signal dispositions match the guest's, if they changed
+    /// (and the host process is this Linux process alone).
     pub fn sync_host_signals(&self) {
+        if !self.inbox.mirror_host.load(Ordering::Relaxed) {
+            return;
+        }
         let mut s = self.signals();
         if !std::mem::take(&mut s.host_stale) {
             return;
@@ -565,6 +641,9 @@ impl Thread {
     }
 
     fn sync_host_mask_from(&mut self, host_blocked: u64) {
+        if !self.inbox.mirror_host.load(Ordering::Relaxed) {
+            return;
+        }
         self.signals.host_blocked = host_blocked;
         let want = self.signals.blocked & JOB_CONTROL;
         if want == self.signals.host_blocked {
@@ -749,25 +828,25 @@ fn stops_by_default(sig: u64) -> bool {
     matches!(sig, 19..=22)
 }
 
-/// `kill(target, sig)`: to this process (or its group), the signal is made
-/// pending, for a thread to deliver as its call returns; to another process
-/// (or group), it's the host's `kill`, with the number translated.
+/// `kill(target, sig)`: to this process, the signal is made pending, for a
+/// thread to deliver as its call returns; to anything else (another process,
+/// a group, every process), it's the kernel's to route.
 pub(super) fn kill(p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
     if sig > NSIG {
         return Err(errno::EINVAL);
     }
-    if target == -1 {
-        // Every process the user owns: on a Mac that's the whole login session.
-        p.unimplemented("kill(-1, ...) (signalling every process)".into());
-        return Err(errno::EPERM);
-    }
-    if target != p.pid && target != 0 {
+    if target != p.pid {
         return p.kernel.kill(p, target, sig);
     }
+    kill_self(p, sig)
+}
+
+/// `kill` of the caller's own process.
+pub(super) fn kill_self(p: &Process, sig: u64) -> Result<i64, i64> {
     if sig != 0 {
         let mut s = p.signals();
         if !s.drops(sig, 0) {
-            s.pending.add(SigInfo::user(sig, SI_USER));
+            s.pending.add(SigInfo::user(sig, SI_USER, p.pid));
             drop(s);
             p.signal_added();
         }
@@ -781,14 +860,14 @@ pub(super) fn tkill(p: &Process, t: &mut Thread, tgid: Option<i64>, tid: i64, si
         return Err(errno::EINVAL);
     }
     if tgid.is_some_and(|g| g != p.pid) {
-        return kill(p, tid, sig); // another process's thread: the best we can do
+        return p.kernel.tgkill(p, tgid, tid, sig); // another process's thread
     }
     let target = if tid == t.tid { Some(t.signals.pending.clone()) } else { p.thread_pending(tid) };
     let Some(pending) = target else {
-        return if tgid.is_none() && tid != p.pid { kill(p, tid, sig) } else { Err(errno::ESRCH) };
+        return if tgid.is_none() { p.kernel.tgkill(p, None, tid, sig) } else { Err(errno::ESRCH) };
     };
     if sig != 0 && !p.signals().drops(sig, if tid == t.tid { t.signals.blocked } else { 0 }) {
-        pending.lock().unwrap_or_else(|e| e.into_inner()).add(SigInfo::user(sig, SI_TKILL));
+        pending.lock().unwrap_or_else(|e| e.into_inner()).add(SigInfo::user(sig, SI_TKILL, p.pid));
         p.signal_added();
         if tid != t.tid {
             p.wake_thread(tid);

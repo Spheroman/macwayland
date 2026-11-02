@@ -1567,3 +1567,32 @@ fn memfd_seals() {
     let dup = t.ok(nr::DUP, &[fd]);
     assert_eq!(t.ok(nr::FCNTL, &[dup, GET_SEALS]), SEAL | SHRINK | GROW | WRITE);
 }
+
+/// A fork inside the host (many processes in one VM): open files shared
+/// (one offset), dispositions copied; signals posted from another process
+/// taken in, ignored ones dropped; SIGCHLD's disposition read for the
+/// kernel.
+#[test]
+fn a_fork_in_the_host_shares_open_files() {
+    let mut t = T::new();
+    let fd = t.open("f", O_RDWR | O_CREAT);
+    t.write_str(fd, "abcdef");
+    t.ok(nr::LSEEK, &[fd, 0, 0]);
+    let ign = t.put(&[1u64.to_le_bytes(), [0; 8], [0; 8], [0; 8]].concat());
+    t.ok(nr::RT_SIGACTION, &[12, ign, 0, 8]); // SIGUSR2 ignored
+    let (child, mut cth) = t.p.fork_in_host(&t.th, 4242);
+    assert_eq!((child.pid, cth.tid), (4242, 4242));
+    let b = t.buf(3);
+    assert_eq!(dispatch(&child, &mut cth, &t.m, nr::READ, [fd, b, 3, 0, 0, 0]), Action::Return(3));
+    assert_eq!(t.get(b, 3), b"abc");
+    assert_eq!(t.ok(nr::LSEEK, &[fd, 0, 1]), 3, "one open file description: the offset moved for the parent too");
+    assert_eq!(dispatch(&child, &mut cth, &t.m, nr::CLOSE, [fd, 0, 0, 0, 0, 0]), Action::Return(0));
+    assert_eq!(t.read_n(fd, 3), b"def", "closed in the child only");
+
+    child.post(None, SigInfo::user(12, signal::SI_USER, 77));
+    child.post(None, SigInfo::user(10, signal::SI_USER, 77));
+    assert_eq!(child.next_delivery(&mut cth), Some(Delivery::Kill(10)), "SIGUSR2 ignored (copied), SIGUSR1 kills");
+    assert_eq!(child.child_policy(), (false, true));
+    t.ok(nr::RT_SIGACTION, &[17, ign, 0, 8]);
+    assert_eq!(t.p.child_policy(), (true, true), "SIGCHLD ignored: children reaped as they end");
+}
