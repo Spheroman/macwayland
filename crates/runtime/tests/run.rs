@@ -4,7 +4,7 @@
 //! They need the hypervisor entitlement; `cargo test` signs via the runner in
 //! .cargo/config.toml.
 
-use std::{io::Read, os::fd::OwnedFd, sync::Mutex};
+use std::{io::Read, os::{fd::OwnedFd, unix::ffi::OsStrExt}, sync::Mutex};
 
 use linux_abi::{fs::FdEntry, Process};
 use macwl_runtime::Exit;
@@ -467,4 +467,80 @@ fn threads() {
     let out = macwl_run().arg(&path).arg(&path).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "threads ok\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success());
+}
+
+/// Live (not zombie) processes running the executable at `path`.
+fn live_processes_of(path: &std::path::Path) -> Vec<i32> {
+    let mut pids = vec![0i32; 1 << 16];
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), (pids.len() * 4) as i32) };
+    pids.truncate(n.max(0) as usize);
+    pids.retain(|&pid| {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = size_of::<libc::proc_bsdinfo>() as i32;
+        if unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) } != size {
+            return false;
+        }
+        const SZOMB: u32 = 5;
+        let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        info.pbi_status != SZOMB && len > 0 && std::path::Path::new(std::ffi::OsStr::from_bytes(&buf[..len as usize])) == path
+    });
+    pids
+}
+
+/// Every Mac process (and so its VM) goes as soon as its Linux process has
+/// ended: hundreds of children that exit, exit_group from a thread while
+/// others are blocked, are killed (with and without a spare and a child of
+/// their own), exec, daemonize (fork, setsid, fork) or outlive their parent,
+/// none of them waited for: see guest/procstress.c. Runs a copy of
+/// `macwl-run`, so that its processes, spares included, can be told from
+/// other tests'.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn processes_go_when_they_end() {
+    use std::io::{BufRead, BufReader};
+    let path = format!("{}/../../target/guest/procstress", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let bin = macwl_run().get_program().to_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("macwl-run");
+    std::fs::copy(bin, &copy).unwrap();
+    let copy = std::fs::canonicalize(copy).unwrap();
+    let mut child = std::process::Command::new(&copy)
+        .arg(&path)
+        .arg(&path)
+        .arg("300")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let main = child.id() as i32;
+    let mut announced = Vec::new();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    for line in lines.by_ref() {
+        let line = line.unwrap();
+        if line == "check" {
+            break;
+        }
+        announced.push(line.strip_prefix("pid ").and_then(|p| p.parse::<i32>().ok()).unwrap_or_else(|| panic!("unexpected output {line:?}")));
+    }
+    assert_eq!(announced.len(), 300 + 300 / 10 * 4, "every child and grandchild announced itself");
+    // Daemons may still be finishing; give them a moment. What's left is
+    // the parent, with its zombies, and its spare.
+    let wait_until = |what: &str, ok: &dyn Fn(&[i32]) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let live = live_processes_of(&copy);
+            if ok(&live) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}: still live: {live:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    wait_until("ended children", &|live| live.len() == 2 && live.contains(&main) && !announced.iter().any(|p| live.contains(p)));
+    drop(child.stdin.take());
+    assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procstress ok"));
+    assert!(child.wait().unwrap().success());
+    wait_until("after the parent", &|live| live.is_empty());
 }
