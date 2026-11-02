@@ -325,6 +325,22 @@ impl Host<'_> {
         for task in ended {
             proc.abi.unregister_thread(task.thread.tid);
         }
+        if self.table.is_some() && proc.abi.thread_count() > 0 {
+            // Its threads were woken, but a wakeup can land just before a
+            // thread's host call sleeps, and be lost; a host lives while its
+            // processes do, so keep waking them until they've all gone.
+            let proc = Arc::downgrade(proc);
+            std::thread::spawn(move || {
+                while let Some(proc) = proc.upgrade()
+                    && !proc.finished.load(Ordering::Acquire)
+                    && proc.abi.thread_count() > 0
+                {
+                    proc.abi.wake_all_threads();
+                    drop(proc);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+        }
         self.check_finished(proc);
     }
 

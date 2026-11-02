@@ -236,6 +236,17 @@ from a static Linux binary.
    hierarchical (session, process, thread), blocked threads wait in
    kqueues rather than a host thread each, and `/proc` is accurate per
    process, with `macwl-run --ps` on the Mac side.
+   Steps 1–2 done (2026-11-02); **step 3 in progress** (2026-11-02): behind
+   `MACWL_ONE_VM=1` a `macwl-run` is a host for every process it starts:
+   fork copy on write in the VM (65–70 µs for fork + exit + wait, from
+   2.2 ms; 185 µs at 200 MB), vfork sharing the address space, the
+   process table in memory (zombies, `wait4`/`waitid`, SIGCHLD, stops,
+   groups, sessions, `kill` to pids, groups and -1, `tgkill` across
+   processes), pids from per-user ranges, 300 processes alive in one host,
+   arm64 Wine booting and running `cmd.exe`. Left of step 3: `/proc/<pid>`
+   from the table, `CLONE_VM` without vfork, a subreaper, per-process
+   `CLOCK_PROCESS_CPUTIME_ID`. Terminals (step 4), clients (5) and Mac
+   programs (6: refused with ENOEXEC under the flag) follow.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return

@@ -1,7 +1,9 @@
 # Processes in one VM: a host per session
 
 Status: design (2026-11-02), open questions decided (2026-11-02, see
-"Decisions"); steps 1 and 2 done (2026-11-02). ROADMAP items 6 and 13; extends the thread
+"Decisions"); steps 1 and 2 done (2026-11-02); step 3 in progress
+(2026-11-02: processes in one VM work behind `MACWL_ONE_VM=1`, see step 3
+for what's left). ROADMAP items 6 and 13; extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
 
@@ -783,6 +785,91 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    `processes`, `signals` (non-interactive parts), `procstress`,
    `manythreads` and `threads` with several processes, under the flag;
    `ps -ef`, `top -b -n 1` and `htop` (by hand) inside a session.
+   (In progress, 2026-11-02.) Done, behind `MACWL_ONE_VM=1`
+   (`crates/runtime/src/host.rs`):
+   - **The host's CPU loop.** Tasks carry their process (`Proc`: its
+     `linux_abi::Process`, address space, exit, parked tasks, CPU time);
+     a CPU about to run another process's task writes `TTBR0_EL1` only
+     (vCPUs remember the address space by a serial number, as ASIDs and
+     roots come back). Address spaces that have gone are flushed by ASID
+     by whichever CPU next looks, between tasks. 1:1 mode is the same
+     loop with one process.
+   - **Fork copy on write** (`AddressSpace::fork`): page tables copied,
+     every pool frame read-only and marked (a software bit) in both, held
+     once more; the parent's ASID flushed before the child is queued; a
+     write fault or a system call writing guest memory makes the page
+     the writer's own (a copy, or in place once no one else holds it).
+     Shared windows became the VM's, counted by the address spaces using
+     them. vfork shares the address space and parks the parent's task off
+     its CPU until the child execs or exits. Open files are shared, one
+     open file description each (`FdTable::fork`); signalfds are copied.
+   - **The table** (`Table`, and `TableKernel`, the `linux_abi::Kernel` of
+     every process in a host): parents, groups, sessions with Linux's
+     `setpgid`/`setsid` rules, zombies, `wait4`/`waitid` in memory (WNOHANG,
+     WUNTRACED, WCONTINUED, WNOWAIT, groups; the waiter sleeps on its
+     thread's waker, and gives up for a signal or for its CPU), SIGCHLD
+     with `si_status` (SA_NOCLDSTOP; SIG_IGN and SA_NOCLDWAIT reap),
+     orphans to init, stops parking a process's tasks until SIGCONT (or
+     SIGKILL), `getrusage` and `wait4`'s rusage from per-process CPU time
+     the CPUs and workers count. Every signal between processes goes
+     through `Table::deliver` (pid, group, all, thread), with the
+     sender's pid in `siginfo`; entries are a `Kind` (local or zombie
+     now; Mac and remote stand-ins later).
+   - **pids** from a `PidAllocator`: ranges of 4096 from 100000, handed
+     out through `$TMPDIR/macwl-$UID/pids` under `flock`; tids from the
+     same.
+   - **The host process never execs**: the kernel says no Mac programs, so
+     such an `execve` fails with ENOEXEC in the dispatcher, and the CPU
+     loop refuses an `ExecHost` too (`one_vm_refuses_mac_programs`, with
+     `MACWL_MAC_PROGRAMS=1`).
+   - Signals from the Mac side (Ctrl-C in the terminal, a `kill` of the
+     host) go to the first process's group, or to every process once it
+     has gone; SIGTSTP stops the host whole until step 4. The host lives
+     while it has processes (wineserver keeps it a few seconds after
+     `wine` ends) and exits with the first one's status.
+   - Found on the way: a wakeup for a process ending can land just before
+     one of its threads' host calls sleeps, and be lost; in 1:1 the Mac
+     process's exit covered it, in a host the process never finished (a
+     `procstress` run hung once in a few dozen). An ending process's
+     threads are now woken every 5 ms until they've gone. And a thread
+     writing a page in a loop while another forks again and again faulted
+     on it more than the three repeats a fault is allowed: a page made the
+     writer's own no longer counts as a repeat.
+   Choices the design left open, taken by the rule (2026-11-02):
+   - **Pid reuse**: a host takes pids in turn across its ranges and asks
+     for another range when three quarters of what it has are in use,
+     else goes round its ranges again (skipping live pids): no reuse soon
+     after a pid is freed, and a long-lived host doesn't hoard ranges.
+   - **Stops park tasks**, off their CPUs (rather than blocking them in
+     place), and so does a vfork parent: neither holds a CPU, so a host
+     with one CPU still runs the child.
+   - **Signals a process ignores** (SIG_IGN, or a default of ignore) end
+     none of its waits, as on Linux where they're dropped as they're sent;
+     they stay pending for `sigtimedwait` and signalfd.
+   - **Mac-side signals go to the first process's group**, as a terminal
+     sends its foreground job: `bash -c 'sleep 100'` ends on Ctrl-C.
+   Measured (M5 Pro, `forkbench`, 50 rounds, mean after the first, two
+   runs): fork + exit + wait 0 MB 65–69 µs (1:1: 2.2 ms), 200 MB 183–186 µs
+   (2.6 ms); fork + exec 0 MB 120–124 µs (2.2 ms), 200 MB 230–233 µs
+   (2.7 ms); `posix_spawn` 0 MB 100–109 µs (2.2 ms), 200 MB 97–98 µs (2.7
+   ms). The estimates said 0.05–0.25 ms and ~0.5 ms with dynamic loading:
+   met, 32x for a small fork. 300 processes alive at once in one host,
+   one Mac process. arm64 Wine: `wineboot -i` exits 0 with 801 files in
+   system32, `wine cmd.exe /c 'echo hi & ver'` prints both (2 s to the
+   output from a cold host, against 0.9 s in 1:1; the host then waits
+   about 4 s for wineserver and services to go). Tests: runtime 35 unit and
+   28 integration, all of them in both modes (`MACWL_ONE_VM=1 cargo test`),
+   among them `one_vm_copy_on_write`, `one_vm_zombies_and_wait`,
+   `one_vm_signals_and_groups`, `one_vm_more_processes_than_vms`,
+   `one_vm_refuses_mac_programs` (`guest/procs.c`); linux-abi 60.
+   Left of step 3: `/proc/<pid>` from the table (`/proc/self` only so
+   far), `ps`/`top` inside a session; `CLONE_VM` without vfork; a
+   subreaper (`PR_SET_CHILD_SUBREAPER`); `CLOCK_PROCESS_CPUTIME_ID` per
+   process (still the host's) and user/system time apart; a timer's
+   signal still interrupts every thread of the host, not only its
+   process's; `catch_unwind` around `dispatch`; why Wine's start is
+   slower than in 1:1 (more CPUs don't change it: not contention for
+   CPUs).
 
    3a. **Blocked tasks wait in kqueues** (decided), so a host's blocked
    threads cost no host thread each and `kern.num_taskthreads` no longer
