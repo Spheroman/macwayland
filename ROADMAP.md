@@ -247,8 +247,13 @@ from a static Linux binary.
    system apart, `/proc/<pid>` for every process (procps `ps`, `top`,
    `pgrep`, `pidof` work), a runtime panic in a call ending only its
    process (SIGSYS), 300 processes alive in one host, arm64 Wine booting
-   and running `cmd.exe` within 2-4% of 1:1. Terminals (step 4), clients
-   (5) and Mac programs (6: refused with ENOEXEC under the flag) follow.
+   and running `cmd.exe` within 2-4% of 1:1. Step 3a done (2026-11-02):
+   blocked threads park in kqueues or in memory, not a host thread each
+   (300 blocked guest threads: 22–23 host threads); host threads are
+   budgeted (1024) with a watchdog on their real count, and timers share
+   one thread; real-time signals queue; eventfd wakeups 3x faster and a
+   50 µs sleep 56 µs (was 1.1 ms). Terminals (step 4), clients (5) and Mac
+   programs (6: refused with ENOEXEC under the flag) follow.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return

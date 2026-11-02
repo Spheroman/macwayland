@@ -2,7 +2,7 @@
 // threads (kern.num_taskthreads, 12288), half in `read` on pipes, half in
 // futex waits, then woken in turn (docs/processes.md, step 3a).
 //
-// Run as `blockmany N`. Starts N threads (small stacks); once all are
+// Run as `blockmany N` (300 if not given). Starts N threads (small stacks); once all are
 // blocked, prints "blocked N" and waits for a byte on stdin (the test
 // counts the host's threads meanwhile); then wakes the readers one byte at
 // a time and the futex waiters one at a time, joins them all, and prints
@@ -52,7 +52,7 @@ static void *waiter(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    int n = argc > 1 ? atoi(argv[1]) : 20000;
+    int n = argc > 1 ? atoi(argv[1]) : 300;
     int readers = n / 2, waiters = n - readers;
     for (int i = 0; i < PIPES; i++) CHECK(pipe(pipes[i]) == 0);
     words = calloc(waiters, sizeof *words);

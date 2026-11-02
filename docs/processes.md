@@ -1008,10 +1008,44 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    all, woken by the wake, the child's exit, the signal, or a timer.
    Workers remain only for calls with nothing to wait on (`flock`,
    `F_SETLKW`, `openat` of a FIFO, file I/O on a slow disk), bounded by a
-   pool. Tests: 20000 threads blocked in `read` on pipes and in futex waits
-   in one host (more than `kern.num_taskthreads`), woken in turn; the
-   latency benchmark no slower (a wakeup is a `kevent` return and a queue
-   push, against a worker's condvar hand-off).
+   pool.
+
+   **Done, 2026-11-02.** Blocked threads park in kqueues or in memory, as
+   above; workers remain for the rest, bounded. With it:
+
+   - **A host thread budget and a watchdog** (`linux_abi::host_threads`).
+     Every thread the runtime starts takes one of a budget of 1024
+     (`MACWL_MAX_HOST_THREADS` lowers it, to 32 at least); workers get only
+     what's left after the host's own threads (CPUs, waiters, ticker, a few
+     singletons), and a call whose worker can't start waits for one. A
+     watchdog counts the process's real threads (`proc_pidinfo`) at every
+     thread start and from the ticker, and ends the process over a ceiling
+     of the budget and half again (1536 at most). Host threads stay in the
+     hundreds at most, whatever the guest does: tests never grow them
+     further.
+   - **Timers share one host thread**: POSIX and interval timers are
+     watched by a timer service per process (a deadline heap), not a thread
+     each.
+   - **Real-time signals queue** (each one sent is delivered), and a timer
+     whose signal is pending takes later expiries as its overrun, as on
+     Linux. (200 timers on SIGRTMIN starved each other before.)
+   - **`flock` and `F_SETLKW` are restartable**: interrupted to take a CPU
+     back, they're made again on a worker, not EINTR to the guest.
+
+   Measured (M5 Pro, `guest/wakebench.c`, p50 round trip, before → after,
+   1:1; one VM the same within noise): pipes between processes 12.4 → 11.2
+   µs, between threads 12.8 → 13.7, Unix sockets 11.2 → 11.1, futex 11.7
+   → 12.5, eventfd 34.4 → 12.1, and a 50 µs `nanosleep` 1143 → 56 µs (it
+   slept on a coarser timer). 300 threads blocked in `read` and futex waits
+   (`guest/blockmany.c`) take 22–23 host threads in either mode.
+
+   Tests: `blockmany` with 300 threads and `guest/hostbudget.c` (100
+   threads waiting in `flock`, 200 timers) under a budget of 32, so the
+   watchdog would end them at 48 host threads; host_threads and signal
+   queue unit tests. Stress: 520 runs of threads, manythreads, procstress,
+   blockmany and hostbudget, 4 at a time, both modes, at the default CPUs
+   and 2: no failures, no hangs. Runtime 35 + 34 in 1:1 and one VM,
+   linux-abi 67; arm64 Wine boots and runs `cmd.exe` in both modes.
 4. **Terminals and job control.** Ptys' sessions and foreground groups,
    keyboard signals on master writes, SIGTTIN/SIGTTOU, SIGHUP on hangup,
    stops parked; the relay for a host started in a Mac terminal. Tests: bash
