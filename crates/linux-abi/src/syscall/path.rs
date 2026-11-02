@@ -12,6 +12,7 @@ use std::{
 
 use super::{ok, path_arg, Process};
 use crate::{
+    memory::ByRef,
     abi::{self, at, fcntl, o, Dirent64, Stat, Timespec, DIRENT64_NAME_OFFSET},
     errno,
     fs::{DirEntry, DirSnapshot, FdEntry, Resolved, Target},
@@ -82,7 +83,7 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
             let guest = if p.fs.is_host_root() { host_fd_path(fd).unwrap_or(r.guest) } else { r.guest };
             FdEntry::new(unsafe { OwnedFd::from_raw_fd(fd) }).path(guest)
         }
-        Target::Proc(rest) => proc::open(p, mem, &rest)?,
+        Target::Proc(rest) => proc::open(p, &ByRef(mem), &rest)?,
         Target::Shm(name) => {
             let fd = shm::open_named(&name, abi::open_flags_to_darwin(flags), mode as u32 & !p.umask())?;
             FdEntry::new(fd).path(r.guest)
@@ -114,7 +115,22 @@ pub(super) fn host_fd_path(fd: i32) -> Option<Vec<u8>> {
 }
 
 pub(super) fn fstat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64) -> Result<i64, i64> {
-    write_stat(mem, buf, &shm::fstat(p.fds.host(fd)?)?)
+    write_stat(mem, buf, &fd_stat(p, fd)?)
+}
+
+/// `stat` of an open fd: its host file's, or (a `/proc` directory, whose
+/// listing it holds) a directory's.
+fn fd_stat(p: &Process, fd: u64) -> Result<libc::stat, i64> {
+    let entry = p.fds.get(fd)?;
+    if entry.dir.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|d| d.fixed) {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_mode = libc::S_IFDIR | 0o555;
+        st.st_nlink = 2;
+        st.st_uid = unsafe { libc::getuid() };
+        st.st_gid = unsafe { libc::getgid() };
+        return Ok(st);
+    }
+    shm::fstat(p.fds.host(fd)?)
 }
 
 pub(super) fn fstatat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64, buf: u64, flags: u64) -> Result<i64, i64> {
@@ -132,7 +148,7 @@ fn stat_at<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64,
     let follow = flags & at::SYMLINK_NOFOLLOW == 0;
     let r = if name.is_empty() && flags & at::EMPTY_PATH != 0 {
         if dirfd as i64 != at::FDCWD {
-            return shm::fstat(p.fds.host(dirfd)?);
+            return fd_stat(p, dirfd);
         }
         let cwd = p.fs.cwd().to_vec();
         p.fs.resolve(&p.fds, dirfd, &cwd, true)?
@@ -147,7 +163,7 @@ fn stat_at<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64,
             Ok(st)
         }
         Target::Shm(name) => shm::fstat(shm::open_named(&name, libc::O_RDONLY, 0)?.as_raw_fd()),
-        Target::Proc(rest) => proc::stat(p, &rest),
+        Target::Proc(rest) => proc::stat(p, &ByRef(mem), &rest, follow),
     }
 }
 
@@ -261,7 +277,7 @@ pub(super) fn readlinkat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u
     }
     let target = match resolve(p, mem, dirfd, path, false)?.target {
         Target::Host(h) => crate::fs::host_readlink(&h)?,
-        Target::Proc(rest) => proc::readlink(p, &rest)?,
+        Target::Proc(rest) => proc::readlink(p, &ByRef(mem), &rest)?,
         Target::Shm(_) => return Err(errno::EINVAL), // never a link
     };
     let n = target.len().min(size as usize);
@@ -285,7 +301,7 @@ pub(super) fn faccessat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u6
             }
             ok(unsafe { libc::faccessat(libc::AT_FDCWD, h.as_ptr(), mode as i32, hf) } as i64).map(|_| 0)
         }
-        Target::Proc(rest) => proc::exists(p, &rest).map(|_| 0),
+        Target::Proc(rest) => proc::exists(p, &ByRef(mem), &rest).map(|_| 0),
         Target::Shm(name) => {
             let want = if mode & 2 != 0 { libc::O_RDWR } else { libc::O_RDONLY };
             shm::open_named(&name, want, 0).map(|_| 0)
@@ -462,7 +478,7 @@ fn snapshot(host: i32) -> Result<DirSnapshot, i64> {
         entries.push(DirEntry { ino: ent.d_ino, kind: ent.d_type, name });
     }
     unsafe { libc::closedir(dir) };
-    Ok(DirSnapshot { entries, next: 0 })
+    Ok(DirSnapshot { entries, next: 0, fixed: false })
 }
 
 pub(super) fn getdents64<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, buf: u64, count: u64) -> Result<i64, i64> {

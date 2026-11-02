@@ -68,6 +68,9 @@ pub enum FileKind {
     /// A signalfd (a host kqueue with a user event, triggered as signals
     /// become pending).
     SignalFd(crate::syscall::SignalFd),
+    /// A pidfd for this pid: its host fd reads as ready once the process
+    /// has ended (see `syscall::pidfd`).
+    PidFd(i64),
 }
 
 /// One fd an epoll instance watches.
@@ -86,11 +89,13 @@ pub struct FdEntry {
     pub cloexec: bool,
     pub path: Option<Vec<u8>>,
     pub kind: FileKind,
+    /// A directory listing it has from the start (`/proc`'s directories).
+    pub dir: Option<DirSnapshot>,
 }
 
 impl FdEntry {
     pub fn new(host: OwnedFd) -> Self {
-        FdEntry { host, cloexec: false, path: None, kind: FileKind::Plain }
+        FdEntry { host, cloexec: false, path: None, kind: FileKind::Plain, dir: None }
     }
 
     pub fn cloexec(mut self, cloexec: bool) -> Self {
@@ -103,8 +108,19 @@ impl FdEntry {
         self
     }
 
+    pub fn path_opt(mut self, path: Option<Vec<u8>>) -> Self {
+        self.path = path;
+        self
+    }
+
+    /// A directory whose listing is `listing`.
+    pub fn dir(mut self, listing: DirSnapshot) -> Self {
+        self.dir = Some(listing);
+        self
+    }
+
     fn open(self) -> Slot {
-        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(None), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default() };
+        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(self.dir), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default() };
         Slot { file: Arc::new(file), cloexec: self.cloexec }
     }
 }
@@ -115,6 +131,9 @@ impl FdEntry {
 pub struct DirSnapshot {
     pub entries: Vec<DirEntry>,
     pub next: usize,
+    /// A listing made rather than read (`/proc`'s): rewinding starts it over
+    /// rather than reading the host directory again.
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +200,11 @@ impl FdTable {
         slots[fd] = Some(entry.open());
     }
 
+    /// A new fd for an open file another process has (`pidfd_getfd`).
+    pub fn insert_file(&self, file: Arc<OpenFile>, cloexec: bool) -> i64 {
+        Self::place(&mut self.slots(), 0, Slot { file, cloexec })
+    }
+
     /// `dup`: a new fd ≥ `min` for `fd`'s open file.
     pub fn dup_from(&self, fd: u64, min: usize, cloexec: bool) -> Result<i64, i64> {
         let mut slots = self.slots();
@@ -211,6 +235,11 @@ impl FdTable {
         let raw = file.host.as_raw_fd();
         IN_FLIGHT.with(|f| f.borrow_mut().push(file));
         Ok(raw)
+    }
+
+    /// The open fds' numbers, in order.
+    pub fn numbers(&self) -> Vec<u64> {
+        self.slots().iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| i as u64).collect()
     }
 
     pub fn cloexec(&self, fd: u64) -> Result<bool, i64> {
@@ -307,6 +336,11 @@ impl FdTable {
                         e.u64(5).u64(signalfd.mask()).bool(nonblocking(&s.file));
                         host.push(libc::STDERR_FILENO);
                     }
+                    // And pidfds: the child watches the same process.
+                    FileKind::PidFd(pid) => {
+                        e.u64(6).i64(*pid).bool(nonblocking(&s.file));
+                        host.push(libc::STDERR_FILENO);
+                    }
                     FileKind::Inotify(inotify) => {
                         let watches = inotify.state();
                         e.u64(4).u64(watches.len() as u64);
@@ -370,6 +404,11 @@ impl FdTable {
                     drop(host);
                     let (mask, nonblock) = (d.u64()?, d.bool()?);
                     crate::syscall::signalfd_copy(inbox, mask, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
+                } else if kind == 6 {
+                    drop(host);
+                    let (pid, nonblock) = (d.i64()?, d.bool()?);
+                    let host = crate::syscall::pidfd::host_exit_watch(pid).map_err(|_| Truncated)?;
+                    crate::syscall::pidfd::entry(pid, host, nonblock)
                 } else if kind == 4 {
                     drop(host);
                     let watches = (0..d.count(24)?)
@@ -385,7 +424,7 @@ impl FdTable {
                     drop(host);
                     crate::syscall::new_epoll().map_err(|_| Truncated)?.cloexec(cloexec)
                 } else {
-                    FdEntry { host, cloexec, path, kind: FileKind::Plain }
+                    FdEntry { host, cloexec, path, kind: FileKind::Plain, dir: None }
                 };
                 let slot = entry.open();
                 slot.file.pos.store(pos, Ordering::Relaxed);

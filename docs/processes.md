@@ -1,9 +1,9 @@
 # Processes in one VM: a host per session
 
 Status: design (2026-11-02), open questions decided (2026-11-02, see
-"Decisions"); steps 1 and 2 done (2026-11-02); step 3 in progress
-(2026-11-02: processes in one VM work behind `MACWL_ONE_VM=1`, see step 3
-for what's left). ROADMAP items 6 and 13; extends the thread
+"Decisions"); steps 1, 2 and 3 done (2026-11-02: processes in one VM work
+behind `MACWL_ONE_VM=1`; step 4, terminals, is next). ROADMAP items 6 and
+13; extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
 
@@ -785,7 +785,7 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    `processes`, `signals` (non-interactive parts), `procstress`,
    `manythreads` and `threads` with several processes, under the flag;
    `ps -ef`, `top -b -n 1` and `htop` (by hand) inside a session.
-   (In progress, 2026-11-02.) Done, behind `MACWL_ONE_VM=1`
+   (Done, 2026-11-02.) Behind `MACWL_ONE_VM=1`
    (`crates/runtime/src/host.rs`):
    - **The host's CPU loop.** Tasks carry their process (`Proc`: its
      `linux_abi::Process`, address space, exit, parked tasks, CPU time);
@@ -827,14 +827,93 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
      has gone; SIGTSTP stops the host whole until step 4. The host lives
      while it has processes (wineserver keeps it a few seconds after
      `wine` ends) and exits with the first one's status.
-   - Found on the way: a wakeup for a process ending can land just before
-     one of its threads' host calls sleeps, and be lost; in 1:1 the Mac
-     process's exit covered it, in a host the process never finished (a
-     `procstress` run hung once in a few dozen). An ending process's
-     threads are now woken every 5 ms until they've gone. And a thread
-     writing a page in a loop while another forks again and again faulted
-     on it more than the three repeats a fault is allowed: a page made the
-     writer's own no longer counts as a repeat.
+   - Found on the way: a thread writing a page in a loop while another
+     forks again and again faulted on it more than the three repeats a
+     fault is allowed: a page made the writer's own no longer counts as a
+     repeat.
+   - **No wakeup is lost in a host call.** A thread blocked in a host call
+     is reached by an interrupt (SIGEMT to its host thread); one that
+     landed after the thread looked and before the call slept was lost.
+     In 1:1 the Mac process's exit covered it; in a host an ending process
+     never finished (sampled: a CPU in `read_host`'s `read` of a pipe no
+     one writes; 2 of 120 hunt runs hung). As in `mn-threads.md`'s fixes,
+     the mark comes first and the sleep checks for it: a waker changes what
+     the thread should look at, writes the thread's waker pipe, then
+     interrupts it; a thread waiting in a host call looks (a signal it
+     would act on, its process ending, its CPU wanted) and then sleeps in
+     `poll` on what it waits for **and** that pipe
+     (`linux-abi/src/syscall/block.rs`), so a wake after the look ends the
+     sleep however it's timed. Reads and writes of pipes, sockets and
+     terminals wait there for readiness before the call (a socket's
+     SO_RCVTIMEO/SO_SNDTIMEO bounding the wait); `accept`, `recv*`,
+     `send*`, `ppoll`, `pselect6`, `epoll_wait` (on its kqueue),
+     eventfd/timerfd/signalfd/inotify reads, `nanosleep` and
+     `clock_nanosleep`; in one VM `rt_sigtimedwait`'s timed wait is
+     Darwin's `pselect` with the old mask (a timed `sigsuspend` in one
+     step, where it was 10 ms steps; in 1:1 a host signal can land on
+     another thread of the process, so there it still looks every 10 ms:
+     without, `wineboot` stalled 5 to 25 s in 3 runs of 8). No polling: the 5 ms re-waking of an ending
+     process's threads that stood in for this is gone. Hunt (procstress,
+     procs wait/groups/cow and threads, four of each at a time, any run
+     alive after 30 s sampled): 0 hung of 1000, at 18 and 2 CPUs. Unit test
+     `a_blocked_call_wakes_without_an_interrupt` wakes a read, a sleep, a
+     poll and an eventfd read by the pipe alone. Still with only the
+     interrupt: `flock`, `F_SETLKW` and a FIFO's `open` (nothing to poll),
+     `connect`, and a read that loses a race for data another reader took
+     after `poll` said ready (it blocks as before, interruptibly).
+   - **Two older races** the hunt turned up: the flush path resumed a vCPU
+     stopped by a kick in the program at a stale ELR_EL1 (an old pc), and
+     starting the path over part-way through saved the borrowed ASID in
+     place of the guest's x0 (procs cow failed 1 run in 100 with a
+     spinning thread's pointer 0 or 1 << 48; 0 in 400 after); and a child
+     whose parent ignores SIGCHLD was reaped after the table's lock had
+     been let go once, so the parent's `waitpid` could report it rather
+     than ECHILD.
+   - **Timers signal their own process.** A timer's expiry (`setitimer`,
+     `timer_create`, `alarm`) kicked every vCPU and interrupted every CPU
+     and worker of the host: another process's `nanosleep` ended with
+     EINTR. Threads' handles (pending set, waker, how to reach them on a
+     CPU or worker) now live in the process's `Inbox`, which a timer's
+     thread holds, and an alert reaches those threads alone (test
+     `one_vm_timers_are_their_process_alone`).
+   - **Containment.** A Rust panic in a system call, on a CPU or a worker,
+     is caught (`contained`): logged, the call's files let go, and the
+     process ends with SIGSYS; its parent's `wait` says so and the host
+     carries on. A panic elsewhere in running a task (a fault, a fork) is
+     caught around the CPU's turn and ends the task's process as any
+     runtime error there does. A Mac program a process was about to
+     become is forgotten after a panic, so no panic leads to a host exec.
+     Debug builds answer call 0x4d570001 (`MACWL_TEST_PANIC`) with a panic
+     (test `one_vm_contains_a_runtime_error`).
+   - **`/proc` from the table** (Visibility): `/proc` lists every process
+     of the host; `/proc/<pid>/{stat,status,statm,cmdline,environ,comm,
+     maps,mounts,mountinfo,exe,cwd}`, `fd/` and `task/<tid>/` for each,
+     from the table (`Kernel::proc_status`: parents, groups, state, CPU
+     times, start time) and from the process itself
+     (`Kernel::with_process`: its fds, cwd, regions, and its memory, from
+     which `cmdline` and `environ` are read where the loader put them, as
+     Linux does). `comm` is the base name of the path `execve` was given,
+     or what the main thread set (PR_SET_NAME). Zombies show `Z`, with
+     their name. Also `/proc/stat` (the Mac's CPUs' ticks, `btime`,
+     process counts) and `/proc/sys/kernel/pid_max`. procps 4.0.7 (nixpkgs
+     aarch64-linux) works inside a host: `ps aux`, `ps -ef`, `top -b -n1`,
+     `pgrep`, `pidof` and `kill $(pidof sleep)`. In 1:1 mode `/proc` lists
+     the process itself (its directories can be listed now too). Test
+     `one_vm_proc_of_every_process`.
+   - **The rest of the process model**: `clone` with CLONE_VM alone (no
+     vfork) shares the parent's address space (one VM only; 1:1 says
+     EINVAL as before); `PR_SET_CHILD_SUBREAPER`: orphans go to the
+     nearest live ancestor that is one, and an orphaned zombie is
+     reported to it as its own; CPU time per process with user and system
+     apart (`getrusage`, `wait4`'s rusage, `times`, `/proc/<pid>/stat`),
+     and `CLOCK_PROCESS_CPUTIME_ID` (and `clock_getcpuclockid` of another
+     process) from it; pidfds (`pidfd_open`, ready in `poll`/`epoll` once
+     the process has ended; `pidfd_send_signal`; `pidfd_getfd`, which
+     shares the other process's open file; `waitid(P_PIDFD)`); `capget`
+     (no capabilities) and `capset` (only dropping none), `prctl`'s
+     PR_CAPBSET_READ (every capability to 40, EINVAL past) and
+     PR_CAP_AMBIENT (empty), `get_mempolicy` (one node), `setsockopt`
+     SO_REUSEPORT. Test `one_vm_process_model`.
    Choices the design left open, taken by the rule (2026-11-02):
    - **Pid reuse**: a host takes pids in turn across its ranges and asks
      for another range when three quarters of what it has are in use,
@@ -862,14 +941,57 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    among them `one_vm_copy_on_write`, `one_vm_zombies_and_wait`,
    `one_vm_signals_and_groups`, `one_vm_more_processes_than_vms`,
    `one_vm_refuses_mac_programs` (`guest/procs.c`); linux-abi 60.
-   Left of step 3: `/proc/<pid>` from the table (`/proc/self` only so
-   far), `ps`/`top` inside a session; `CLONE_VM` without vfork; a
-   subreaper (`PR_SET_CHILD_SUBREAPER`); `CLOCK_PROCESS_CPUTIME_ID` per
-   process (still the host's) and user/system time apart; a timer's
-   signal still interrupts every thread of the host, not only its
-   process's; `catch_unwind` around `dispatch`; why Wine's start is
-   slower than in 1:1 (more CPUs don't change it: not contention for
-   CPUs).
+   **Wine in one VM against 1:1.** The figures first compared weren't
+   like for like. A one-VM host's time ends when wineserver and its
+   services have gone, ~8 s after `wineboot` itself ends (the host's
+   lifetime rule), where 1:1's `macwl-run` ends with `wineboot`: the
+   ~14 s against ~5 s. And a 1:1 `wine` often met a wineserver the last
+   one left running (in 1:1 they outlive `wine`, sometimes for minutes:
+   0.56 s to `hi`), or a prefix whose registry wineserver never wrote
+   (killed before it saved: ~0.9 s to `hi` in both modes, as Wine then
+   skips work). Measured like for like (cold: no host or wineserver left
+   from before; the same complete prefix; to `wineboot`'s own end and to
+   `hi`), before this round: one VM 5.65-5.70 s and 2.01-2.15 s, 1:1
+   5.45-5.49 s and 1.94-2.08 s. Sampling the host found two costs of the
+   runtime's, both modes': `signal_ready` walking 64 dispositions on
+   every blocking call (its busiest function, 426 samples in 2 s against
+   897 in the guest), and an unmap's check of every shared window against
+   every region (194). Both are gone, and a swap every blocking call made
+   on a line all of a process's threads read is now a load. After: one VM
+   5.59-5.63 s and 1.89-1.90 s, 1:1 5.40-5.45 s and 1.78-1.88 s. One VM
+   is still 2-4% behind; nothing of the runtime's own shows above 1% in
+   the samples (the guest and Wine's own file system calls are the rest),
+   and 36 CPUs don't change it. Where the rest goes (one run queue and 10
+   ms slices for every process's threads, TLB reach with 18 vCPUs
+   switching between processes) is for the scheduler, `mn-threads.md`
+   step 5. A warm one-VM `wine` needs the host to outlive it for the next
+   `macwl-run` to join: clients, step 5.
+   Choices taken by the rule (2026-11-02, second round):
+   - **Every host wait sleeps on the thread's waker pipe too**, rather
+     than re-sending interrupts until the thread is seen to have gone (or
+     a per-call signal mask, which no blocking `read` has): it closes the
+     race for every wait with something to poll, at one `poll` on the way
+     into a read that would block.
+   - **A timer reaches its process's threads through their handles**, not
+     by kicking the host's vCPUs and filtering afterwards.
+   - **CPU time is counted where it's spent**: each vCPU run timed as user
+     time (runs in progress included, so a spinning thread's clock moves),
+     system time from the host thread's CPU time less those runs, taken
+     every millisecond as the vCPU stops, rather than once per task's turn
+     (which left a thread that never yields at zero).
+   - **`cmdline` and `environ` are read from the process's memory**, as
+     Linux does (a program that rewrites its `argv` shows the change),
+     rather than from copies kept at `execve`; other processes' state is
+     reached through `Kernel::with_process`, by the same code as
+     `/proc/self`.
+   - **pidfds are host fds that become ready**: a socket pair whose far end
+     the table drops as the process ends (one VM), a kqueue watching the
+     Mac process's exit (1:1), so `poll` and `epoll` work on them
+     unchanged.
+   Left for later steps: the loader's own mappings of a program aren't
+   named in `maps`; per-thread signal masks show as 0 in `status`; `htop`
+   (it needs a terminal: step 4); CLONE_FILES, CLONE_FS and CLONE_SIGHAND
+   without vfork; the calls above that still wait with only the interrupt.
 
    3a. **Blocked tasks wait in kqueues** (decided), so a host's blocked
    threads cost no host thread each and `kern.num_taskthreads` no longer

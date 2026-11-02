@@ -697,6 +697,7 @@ pub(super) fn recvmsg<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M,
 fn host_option(level: u64, name: u64) -> Option<(i32, i32)> {
     Some(match (level as i32, name) {
         (SOL_SOCKET, SO_REUSEADDR) => (libc::SOL_SOCKET, libc::SO_REUSEADDR),
+        (SOL_SOCKET, SO_REUSEPORT) => (libc::SOL_SOCKET, libc::SO_REUSEPORT),
         (SOL_SOCKET, SO_TYPE) => (libc::SOL_SOCKET, libc::SO_TYPE),
         (SOL_SOCKET, SO_ERROR) => (libc::SOL_SOCKET, libc::SO_ERROR),
         (SOL_SOCKET, SO_BROADCAST) => (libc::SOL_SOCKET, libc::SO_BROADCAST),

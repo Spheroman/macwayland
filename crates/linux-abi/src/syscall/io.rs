@@ -26,7 +26,7 @@ fn read_host(p: &Process, t: &Thread, fd: u64, data: &mut [u8], off: Option<u64>
         FileKind::TimerFd(timer) => return kfd::timerfd_read(p, t, &entry, timer, data),
         FileKind::Inotify(_) => return super::inotify_read(p, t, &entry, data),
         FileKind::SignalFd(signalfd) => return super::signalfd_read(p, t, &entry, signalfd, data),
-        FileKind::Epoll(_) => return Err(errno::EINVAL),
+        FileKind::Epoll(_) | FileKind::PidFd(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
     let host = entry.host.as_raw_fd();
@@ -53,7 +53,7 @@ fn write_host(p: &Process, t: &Thread, fd: u64, data: &[u8], off: Option<u64>) -
     let entry = p.fds.get(fd)?;
     match &entry.kind {
         FileKind::EventFd(state) => return kfd::eventfd_write(&entry, state, data),
-        FileKind::TimerFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::SignalFd(_) => return Err(errno::EINVAL),
+        FileKind::TimerFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::SignalFd(_) | FileKind::PidFd(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
     let host = entry.host.as_raw_fd();
@@ -145,7 +145,11 @@ pub(super) fn lseek(p: &Process, fd: u64, off: i64, whence: u64) -> Result<i64, 
             if off != 0 || whence != libc::SEEK_SET {
                 return Err(errno::EINVAL);
             }
-            *dir = None;
+            match dir.as_mut() {
+                // A listing made, not read (/proc's): from the top again.
+                Some(d) if d.fixed => d.next = 0,
+                _ => *dir = None,
+            }
             return Ok(0);
         }
     }

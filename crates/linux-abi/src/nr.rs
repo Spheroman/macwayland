@@ -164,6 +164,13 @@ pub const GETTIMEOFDAY: u64 = 169;
 pub const SYSINFO: u64 = 179;
 pub const MADVISE: u64 = 233;
 pub const CLOCK_NANOSLEEP: u64 = 115;
+pub const CAPGET: u64 = 90;
+pub const TIMES: u64 = 153;
+pub const CAPSET: u64 = 91;
+pub const GET_MEMPOLICY: u64 = 236;
+pub const PIDFD_SEND_SIGNAL: u64 = 424;
+pub const PIDFD_OPEN: u64 = 434;
+pub const PIDFD_GETFD: u64 = 438;
 /// Not Linux's: a call debug builds answer by panicking, to test that a
 /// runtime error in one process's call ends that process alone.
 pub const MACWL_TEST_PANIC: u64 = 0x4d57_0001;

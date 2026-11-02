@@ -202,6 +202,7 @@ fn main() -> ExitCode {
     };
     let elf = match read_program(&process, &opts.args[0]) {
         Ok((elf, exe)) => {
+            process.set_comm(opts.args[0].as_bytes().rsplit(|&b| b == b'/').next().unwrap_or_default());
             process.set_exe(exe);
             elf
         }

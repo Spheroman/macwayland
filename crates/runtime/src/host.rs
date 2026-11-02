@@ -32,11 +32,12 @@ use std::{
 
 use linux_abi::{
     errno,
-    syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostSignalWait, Inbox, Kernel, SigInfo, Thread, Waited, Waker, RUSAGE_SIZE},
+    syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostSignalWait, Inbox, Kernel, ProcStatus, SigInfo, Thread, Waited, Waker, RUSAGE_SIZE},
     GuestMemory, Process,
 };
 
 use crate::{
+    cputime::Times,
     flush_tlb_now, hv, load, memory::{Machine, Space}, place, run_cpu, sched::{self, Sched, Start, Task}, signal, Error, Exit, Host, Proc,
     Scope,
 };
@@ -234,8 +235,16 @@ struct Entry {
     report: Option<i32>,
     /// Its threads waiting in `wait4`/`waitid` for a child to change.
     waiters: Vec<Arc<Waker>>,
-    /// CPU time of its reaped children (and theirs), in ns.
-    children_cpu: u64,
+    /// CPU time of its reaped children (and theirs).
+    children_cpu: Times,
+    /// `PR_SET_CHILD_SUBREAPER`: orphaned descendants become its children
+    /// rather than init's.
+    subreaper: bool,
+    /// The far ends of its pidfds' host sockets: dropped as it ends, which
+    /// makes every pidfd for it read as ready.
+    pidfds: Vec<std::os::fd::OwnedFd>,
+    /// When it started, in ns since the machine booted.
+    start_ns: u64,
 }
 
 /// What a table entry is. Steps 6 and 9 add stand-ins: a Mac program
@@ -245,7 +254,7 @@ enum Kind {
     Local(Arc<Proc>),
     /// Ended, waiting for its parent's `wait`: its wait status and the CPU
     /// time it and its reaped children used.
-    Zombie { status: i32, cpu_ns: u64 },
+    Zombie { status: i32, cpu: Times, comm: Vec<u8> },
 }
 
 /// Where a signal goes (see [`Table::deliver`]).
@@ -345,6 +354,7 @@ impl Table {
     /// A new process `pid`, child of `ppid` (1: init), in the group and
     /// session given.
     fn insert(&self, pid: i64, ppid: i64, pgid: i64, sid: i64, proc: Arc<Proc>, exit_signal: u64) {
+        let start_ns = proc.abi.started_ns;
         let mut s = self.state();
         s.procs.insert(
             pid,
@@ -358,7 +368,10 @@ impl Table {
                 execd: false,
                 report: None,
                 waiters: Vec::new(),
-                children_cpu: 0,
+                children_cpu: Times::default(),
+                subreaper: false,
+                pidfds: Vec::new(),
+                start_ns,
             },
         );
         if let Some(parent) = s.procs.get_mut(&ppid) {
@@ -395,10 +408,10 @@ impl Table {
     /// pid is free again, and its CPU time goes to its parent's children.
     fn reap(&self, s: &mut State, pid: i64) {
         let Some(e) = s.procs.remove(&pid) else { return };
-        let Kind::Zombie { cpu_ns, .. } = e.kind else { panic!("reaping a process that runs") };
+        let Kind::Zombie { cpu, .. } = e.kind else { panic!("reaping a process that runs") };
         if let Some(parent) = s.procs.get_mut(&e.ppid) {
             parent.children.remove(&pid);
-            parent.children_cpu += cpu_ns + e.children_cpu;
+            parent.children_cpu += cpu + e.children_cpu;
         }
         self.pids.free(pid);
     }
@@ -520,7 +533,7 @@ impl Table {
 
     /// Wait (thread `t` of `p`) for a child in `which` to change as `want`
     /// says: its pid, wait status, and CPU time.
-    fn wait(&self, p: &Process, t: &Thread, which: Which, want: Want) -> Result<Option<(i64, i32, u64)>, i64> {
+    fn wait(&self, p: &Process, t: &Thread, which: Which, want: Want) -> Result<Option<(i64, i32, Times)>, i64> {
         loop {
             {
                 let mut s = self.state();
@@ -544,8 +557,8 @@ impl Table {
                     let e = s.procs.get_mut(&c).unwrap();
                     let cpu = e.children_cpu
                         + match &e.kind {
-                            Kind::Zombie { cpu_ns, .. } => *cpu_ns,
-                            Kind::Local(proc) => proc.cpu_ns.load(Ordering::Relaxed),
+                            Kind::Zombie { cpu, .. } => *cpu,
+                            Kind::Local(proc) => proc.cpu.times(),
                         };
                     match e.kind {
                         Kind::Zombie { status, .. } if want.exited => {
@@ -714,8 +727,8 @@ impl Kernel for TableKernel {
             p => Which::Pid(p),
         };
         let want = Want { exited: true, stopped: options & WUNTRACED != 0, continued: options & WCONTINUED != 0, nohang: options & WNOHANG != 0, nowait: false };
-        let Some((pid, status, cpu_ns)) = self.table()?.wait(p, t, which, want)? else { return Ok(None) };
-        Ok(Some(Waited { pid, status, rusage: rusage_of(cpu_ns, 0) }))
+        let Some((pid, status, cpu)) = self.table()?.wait(p, t, which, want)? else { return Ok(None) };
+        Ok(Some(Waited { pid, status, rusage: rusage_of(cpu, 0) }))
     }
 
     fn waitid(&self, p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
@@ -763,24 +776,106 @@ impl Kernel for TableKernel {
         let table = self.table()?;
         let s = table.state();
         let e = s.procs.get(&p.pid).ok_or(errno::ESRCH)?;
-        let (cpu_ns, rss) = match (who, &e.kind) {
+        let (cpu, rss) = match (who, &e.kind) {
             // RUSAGE_SELF and RUSAGE_THREAD (no per-thread figures yet).
-            (0 | 1, Kind::Local(proc)) => (proc.cpu_ns.load(Ordering::Relaxed), proc.space().lock().frames_in_use() * 4),
+            (0 | 1, Kind::Local(proc)) => (proc.cpu.times(), proc.space().lock().frames_in_use() * 4),
             (-1, _) => (e.children_cpu, 0),
-            (0 | 1, Kind::Zombie { .. }) => (0, 0),
+            (0 | 1, Kind::Zombie { .. }) => (Times::default(), 0),
             _ => return Err(errno::EINVAL),
         };
-        Ok(rusage_of(cpu_ns, rss))
+        Ok(rusage_of(cpu, rss))
     }
 
-    fn cpu_clock(&self, p: &Process, _user_only: bool) -> CpuClock {
-        // The scheduler counts CPU time, not user and system apart.
-        let cpu = self.table().ok().and_then(|t| t.local(p.pid)).map(|proc| proc.cpu_ns.clone()).unwrap_or_default();
-        Box::new(move || std::time::Duration::from_nanos(cpu.load(Ordering::Relaxed)))
+    fn cpu_clock(&self, p: &Process, user_only: bool) -> CpuClock {
+        let cpu = self.table().ok().and_then(|t| t.local(p.pid)).map(|proc| proc.cpu.clone()).unwrap_or_default();
+        Box::new(move || {
+            let t = cpu.times();
+            std::time::Duration::from_nanos(if user_only { t.user } else { t.total() })
+        })
     }
 
     fn umask_changed(&self, _p: &Process, _mask: u32) {
         // Applied by the runtime per process; the host's own stays 0.
+    }
+
+    fn pidfd(&self, _p: &Process, pid: i64) -> Result<std::os::fd::OwnedFd, i64> {
+        let table = self.table()?;
+        let mut s = table.state();
+        let e = s.procs.get_mut(&pid).ok_or(errno::ESRCH)?;
+        // A socket pair: its far end closes as the process ends, and the
+        // near one (the pidfd's) reads as ready from then on.
+        let (near, far) = std::os::unix::net::UnixStream::pair().map_err(|e| errno::from_io(&e))?;
+        if matches!(e.kind, Kind::Local(_)) {
+            e.pidfds.push(far.into());
+        }
+        Ok(near.into())
+    }
+
+    fn process_file(&self, _p: &Process, pid: i64, fd: u64) -> Result<Arc<linux_abi::fs::OpenFile>, i64> {
+        // Any process of the session's user may (as ptrace's same-user rule).
+        self.table()?.local(pid).ok_or(errno::ESRCH)?.abi.fds.get(fd)
+    }
+
+    fn set_child_subreaper(&self, p: &Process, on: bool) -> Result<(), i64> {
+        let table = self.table()?;
+        table.state().procs.get_mut(&p.pid).ok_or(errno::ESRCH)?.subreaper = on;
+        Ok(())
+    }
+
+    fn shares_memory(&self) -> bool {
+        true
+    }
+
+    fn pids(&self, _p: &Process) -> Vec<i64> {
+        self.table().map(|t| t.state().procs.keys().copied().collect()).unwrap_or_default()
+    }
+
+    fn proc_status(&self, _p: &Process, pid: i64) -> Result<ProcStatus, i64> {
+        let table = self.table()?;
+        let s = table.state();
+        let e = s.procs.get(&pid).ok_or(errno::ESRCH)?;
+        let (state, threads, cpu, comm) = match &e.kind {
+            Kind::Local(proc) => {
+                let state = if proc.stopped.load(Ordering::Acquire) {
+                    b'T'
+                } else if proc.cpu.in_guest() {
+                    b'R'
+                } else {
+                    b'S'
+                };
+                (state, proc.abi.thread_count().max(1) as u64, proc.cpu.times(), proc.abi.comm())
+            }
+            Kind::Zombie { cpu, comm, .. } => (b'Z', 0, *cpu, comm.clone()),
+        };
+        Ok(ProcStatus {
+            comm,
+            ppid: e.ppid,
+            pgid: e.pgid,
+            sid: e.sid,
+            state,
+            threads,
+            user_ns: cpu.user,
+            sys_ns: cpu.sys,
+            children_user_ns: e.children_cpu.user,
+            children_sys_ns: e.children_cpu.sys,
+            start_ns: e.start_ns,
+        })
+    }
+
+    fn with_process(&self, _p: &Process, pid: i64, f: &mut dyn FnMut(&Process, &dyn GuestMemory)) -> Result<(), i64> {
+        let proc = self.table()?.local(pid).ok_or(errno::ESRCH)?;
+        let space = proc.space.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or(errno::ESRCH)?;
+        f(&proc.abi, &*space);
+        Ok(())
+    }
+
+    fn process_cpu_time(&self, _p: &Process, pid: i64) -> Result<Option<std::time::Duration>, i64> {
+        let proc = self.table()?.local(pid).ok_or(errno::EINVAL)?;
+        Ok(Some(std::time::Duration::from_nanos(proc.cpu.times().total())))
+    }
+
+    fn child_subreaper(&self, p: &Process) -> Result<bool, i64> {
+        Ok(self.table()?.state().procs.get(&p.pid).ok_or(errno::ESRCH)?.subreaper)
     }
 
     fn host_signals(&self) -> bool {
@@ -794,12 +889,14 @@ impl Kernel for TableKernel {
     }
 }
 
-/// A Linux `struct rusage` with `cpu_ns` of user time and `rss_kb` of
-/// resident memory.
-fn rusage_of(cpu_ns: u64, rss_kb: u64) -> [u8; RUSAGE_SIZE] {
+/// A Linux `struct rusage` with `cpu`'s user and system time and `rss_kb`
+/// of resident memory.
+fn rusage_of(cpu: Times, rss_kb: u64) -> [u8; RUSAGE_SIZE] {
     let mut out = [0u8; RUSAGE_SIZE];
-    out[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
-    out[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
+    for (at, ns) in [(0, cpu.user), (16, cpu.sys)] {
+        out[at..at + 8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
+        out[at + 8..at + 16].copy_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
+    }
     out[32..40].copy_from_slice(&(rss_kb as i64).to_le_bytes()); // ru_maxrss
     out
 }
@@ -830,6 +927,7 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     profile_mark("load start");
     let machine = Machine::new()?;
     let program = load(&machine, elf, argv, envp, &process)?;
+    process.set_arg_area(program.args, program.env);
     let vm = hv::Vm::new()?;
     let space = Arc::new(Space::new(program.space));
     {
@@ -913,8 +1011,9 @@ pub(crate) fn fork<'scope, 'env>(
     f: &Fork,
 ) -> Result<Result<i64, i64>, Error> {
     let Some(pid) = table.pids.alloc() else { return Ok(Err(errno::EAGAIN)) };
-    let child_space = if f.vfork {
-        // The child runs in the parent's memory until it execs or exits.
+    let child_space = if f.vm {
+        // The child runs in the parent's memory: until it execs or exits
+        // (vfork), or for good (CLONE_VM alone).
         proc.space()
     } else {
         let forked = space.lock().fork();
@@ -1031,21 +1130,61 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
         *table.first_exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(exit);
     }
     vfork_done(sh, proc);
-    let cpu_ns = proc.cpu_ns.load(Ordering::Relaxed);
-    let (parent, exit_signal) = {
+    let cpu = proc.cpu.times();
+    let (parent, exit_signal, adopted, _pidfds) = {
         let mut s = table.state();
         let Some(e) = s.procs.get_mut(&pid) else { return };
-        e.kind = Kind::Zombie { status, cpu_ns };
+        e.kind = Kind::Zombie { status, cpu, comm: proc.abi.comm() };
         let (ppid, exit_signal) = (e.ppid, e.exit_signal);
         let children = std::mem::take(&mut e.children);
-        // Orphans are init's, which reaps them (and those already zombies).
+        // Its pidfds read as ready from now on (once the lock is let go).
+        let pidfds = std::mem::take(&mut e.pidfds);
+        // Orphans go to the nearest ancestor that's a subreaper, else to
+        // init, which reaps them (and those already zombies).
+        let reaper = {
+            let mut a = ppid;
+            loop {
+                match s.procs.get(&a) {
+                    Some(ae) if a != 1 && ae.subreaper && matches!(ae.kind, Kind::Local(_)) => break a,
+                    Some(ae) if a != 1 => a = ae.ppid,
+                    _ => break 1,
+                }
+            }
+        };
+        let mut zombies = Vec::new();
         for c in children {
             let Some(ce) = s.procs.get_mut(&c) else { continue };
-            ce.ppid = 1;
-            if matches!(ce.kind, Kind::Zombie { .. }) {
-                table.reap(&mut s, c);
+            ce.ppid = reaper;
+            let zombie = matches!(ce.kind, Kind::Zombie { .. });
+            if reaper == 1 {
+                if zombie {
+                    table.reap(&mut s, c);
+                }
+            } else {
+                s.procs.get_mut(&reaper).unwrap().children.insert(c);
+                if zombie {
+                    zombies.push(c);
+                }
             }
         }
+        // A subreaper adopting zombies hears of them as their parent would
+        // have (or reaps them at once, if it doesn't care).
+        let adopted = match s.procs.get(&reaper).and_then(local_of) {
+            Some(r) if !zombies.is_empty() => {
+                let reaps = r.abi.child_policy().0;
+                let mut told = Vec::new();
+                for z in zombies {
+                    if reaps {
+                        table.reap(&mut s, z);
+                    } else if let Some(Entry { kind: Kind::Zombie { status, .. }, exit_signal, .. }) = s.procs.get(&z) {
+                        told.push((z, *status, *exit_signal));
+                    }
+                }
+                let waiters = std::mem::take(&mut s.procs.get_mut(&reaper).unwrap().waiters);
+                Some((r, told, waiters))
+            }
+            _ => None,
+        };
         let parent = if ppid == 1 { None } else { s.procs.get(&ppid).and_then(local_of) };
         // Reaped at once by init, or by a parent that doesn't care (SIGCHLD
         // ignored, SA_NOCLDWAIT): decided before the table is let go, or the
@@ -1053,8 +1192,21 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
         if parent.as_ref().is_none_or(|p| p.abi.child_policy().0) {
             table.reap(&mut s, pid);
         }
-        (parent, exit_signal)
+        (parent, exit_signal, adopted, pidfds)
     };
+    if let Some((reaper, told, waiters)) = adopted {
+        for w in waiters {
+            w.wake();
+        }
+        for (z, status, signo) in told {
+            if signo != 0 {
+                let (code, si_status) = child_info(status);
+                let mut info = SigInfo::child(z, code, si_status);
+                info.signo = signo;
+                reaper.abi.post(None, info);
+            }
+        }
+    }
     if let Some(parent) = parent {
         let waiters = {
             let mut s = table.state();

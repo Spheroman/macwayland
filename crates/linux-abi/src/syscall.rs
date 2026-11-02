@@ -18,6 +18,7 @@ mod mem;
 mod misc;
 mod net;
 mod path;
+pub(crate) mod pidfd;
 mod process;
 mod signal;
 mod signalfd;
@@ -32,7 +33,7 @@ pub(crate) use kfd::{eventfd_copy, timerfd_copy};
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::{HostSignalWait, SignalFd};
 pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
-pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, Waited, RUSAGE_SIZE};
+pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, ProcStatus, Waited, RUSAGE_SIZE};
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
 pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
@@ -105,6 +106,15 @@ pub struct Process {
     umask: AtomicU32,
     /// Interval timers (`setitimer`).
     itimers: Mutex<timer::ITimers>,
+    /// Where its arguments and environment strings are in its memory
+    /// (start and end of each), as the loader laid them out: what
+    /// `/proc/<pid>/cmdline` and `environ` read, as Linux's do.
+    arg_area: Mutex<[u64; 4]>,
+    /// When it started, in ns since the machine booted (`/proc/<pid>/stat`).
+    pub started_ns: u64,
+    /// Its name (`/proc/<pid>/comm`): its program's, or what its main
+    /// thread called itself (PR_SET_NAME).
+    comm: Mutex<Vec<u8>>,
 }
 
 /// What other threads need of a thread: where to put signals for it, and how
@@ -182,6 +192,9 @@ impl Process {
             inbox: Arc::default(),
             umask: AtomicU32::new(0o022),
             itimers: Mutex::default(),
+            arg_area: Mutex::default(),
+            comm: Mutex::default(),
+            started_ns: (crate::hostinfo::uptime() * 1e9) as u64,
         }
     }
 
@@ -235,6 +248,46 @@ impl Process {
     pub fn new_tid(&self) -> i64 {
         let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         0x1000_0000 + (self.pid % 0x8000) * 0x1000 + (n % 0x1000)
+    }
+
+    /// Its program's arguments and environment are at `[args.0, args.1)`
+    /// and `[env.0, env.1)` (set as a program starts).
+    pub fn set_arg_area(&self, args: (u64, u64), env: (u64, u64)) {
+        *self.arg_area.lock().unwrap_or_else(|e| e.into_inner()) = [args.0, args.1, env.0, env.1];
+    }
+
+    /// Where its arguments and environment strings are: start and end of
+    /// each.
+    pub fn arg_area(&self) -> [u64; 4] {
+        *self.arg_area.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Its name, at most 15 bytes (Linux's TASK_COMM_LEN less the NUL).
+    pub fn set_comm(&self, name: &[u8]) {
+        *self.comm.lock().unwrap_or_else(|e| e.into_inner()) = name[..name.len().min(15)].to_vec();
+    }
+
+    /// Its name: as set, else its executable's base name.
+    pub fn comm(&self) -> Vec<u8> {
+        let comm = self.comm.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !comm.is_empty() {
+            return comm;
+        }
+        let exe = self.exe();
+        let name = exe.rsplit(|&b| b == b'/').next().unwrap_or_default();
+        name[..name.len().min(15)].to_vec()
+    }
+
+    /// Its threads' ids (those registered).
+    pub fn thread_ids(&self) -> Vec<i64> {
+        self.inbox.threads().keys().copied().collect()
+    }
+
+    /// The signals its threads block (none known here: masks are each
+    /// thread's own), ignore, and catch, as `/proc/<pid>/status` shows them.
+    pub fn signal_masks(&self) -> (u64, u64, u64) {
+        let s = self.signals();
+        (0, s.ignored_now(), s.caught())
     }
 
     /// Guest path of the running executable.
@@ -420,8 +473,9 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         // until they do, files look like they're on a filesystem without them.
         nr::SETXATTR..=nr::FREMOVEXATTR => Err(errno::EOPNOTSUPP),
         nr::FUTEX => futex::futex(p, t, mem, a0, a1, a2, a3, a4, a5),
-        nr::CLOCK_GETTIME => misc::clock_gettime(mem, a0, a1, false),
-        nr::CLOCK_GETRES => misc::clock_gettime(mem, a0, a1, true),
+        nr::CLOCK_GETTIME => misc::clock_gettime(p, mem, a0, a1, false),
+        nr::CLOCK_GETRES => misc::clock_gettime(p, mem, a0, a1, true),
+        nr::TIMES => misc::times(p, mem, a0),
         nr::GETTIMEOFDAY => misc::gettimeofday(mem, a0, a1),
         nr::GETRUSAGE => misc::getrusage(p, mem, a0, a1),
         nr::SYSINFO => misc::sysinfo(mem, a0),
@@ -435,6 +489,12 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::GETRANDOM => misc::getrandom(mem, a0, a1),
         nr::PRLIMIT64 => misc::prlimit64(p, mem, a0, a1, a2, a3),
         nr::PRCTL => misc::prctl(p, t, mem, a0, a1, a2),
+        nr::CAPGET => misc::capget(mem, a0, a1),
+        nr::CAPSET => misc::capset(mem, a0, a1),
+        nr::GET_MEMPOLICY => misc::get_mempolicy(mem, a0, a1, a2, a3, a4),
+        nr::PIDFD_OPEN => pidfd::pidfd_open(p, a0, a1),
+        nr::PIDFD_SEND_SIGNAL => pidfd::pidfd_send_signal(p, a0, a1, a2, a3),
+        nr::PIDFD_GETFD => pidfd::pidfd_getfd(p, a0, a1, a2),
 
         nr::RT_SIGACTION => signal::rt_sigaction(p, mem, a0, a1, a2, a3),
         nr::RT_SIGPROCMASK => signal::rt_sigprocmask(t, mem, a0, a1, a2, a3),

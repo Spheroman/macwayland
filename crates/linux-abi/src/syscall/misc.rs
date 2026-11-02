@@ -30,7 +30,26 @@ pub(super) fn clock_now(id: u64) -> Result<std::time::Duration, i64> {
     Ok(std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
 }
 
-pub(super) fn clock_gettime<M: GuestMemory + ?Sized>(mem: &M, id: u64, out: u64, res: bool) -> Result<i64, i64> {
+pub(super) fn clock_gettime<M: GuestMemory + ?Sized>(p: &Process, mem: &M, id: u64, out: u64, res: bool) -> Result<i64, i64> {
+    // A process's CPU clock: this one's (CLOCK_PROCESS_CPUTIME_ID), or
+    // another's (`clock_getcpuclockid`: ~pid << 3, 2 for its CPU time),
+    // where the kernel counts it.
+    let id = id as i32 as i64;
+    let pid = match id {
+        _ if id == clock::PROCESS_CPUTIME_ID as i64 => Some(p.pid),
+        _ if id < 0 && id & 7 == 2 => Some(!(id >> 3)),
+        _ => None,
+    };
+    if let Some(pid) = pid {
+        let t = if res { Some(std::time::Duration::from_nanos(1)) } else { p.kernel.process_cpu_time(p, pid)? };
+        if let Some(t) = t {
+            if out != 0 {
+                mem.write_pod(out, &Timespec { tv_sec: t.as_secs() as i64, tv_nsec: t.subsec_nanos() as i64 })?;
+            }
+            return Ok(0);
+        }
+    }
+    let id = id as u64;
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let f = if res { libc::clock_getres } else { libc::clock_gettime };
     ok(unsafe { f(host_clock(id)?, &mut ts) } as i64)?;
@@ -146,6 +165,26 @@ pub(super) fn getrusage<M: GuestMemory + ?Sized>(p: &Process, mem: &M, who: u64,
     Ok(0)
 }
 
+/// `times(buf)`: the process's and its reaped children's user and system
+/// time, in clock ticks (100 a second, Linux's USER_HZ), and the ticks since
+/// boot.
+pub(super) fn times<M: GuestMemory + ?Sized>(p: &Process, mem: &M, buf: u64) -> Result<i64, i64> {
+    const HZ: i64 = 100;
+    // A `struct rusage`'s user and system timevals, as ticks.
+    let ticks = |ru: &[u8; super::RUSAGE_SIZE]| -> [i64; 2] {
+        let v = |at: usize| i64::from_le_bytes(ru[at..at + 8].try_into().unwrap());
+        [v(0) * HZ + v(8) * HZ / 1_000_000, v(16) * HZ + v(24) * HZ / 1_000_000]
+    };
+    if buf != 0 {
+        let [u, s] = ticks(&p.kernel.rusage(p, 0)?);
+        let [cu, cs] = ticks(&p.kernel.rusage(p, -1)?);
+        mem.write_pod(buf, &[u, s, cu, cs])?;
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    ok(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } as i64)?;
+    Ok(ts.tv_sec * HZ + ts.tv_nsec * HZ / 1_000_000_000)
+}
+
 fn sysctl_u64(name: &std::ffi::CStr) -> u64 {
     let (mut v, mut len) = (0u64, 8usize);
     unsafe { libc::sysctlbyname(name.as_ptr(), (&mut v as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0) };
@@ -241,6 +280,9 @@ pub(super) fn prctl<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &
     const PR_GET_NAME: u64 = 16;
     const PR_CAPBSET_READ: u64 = 23;
     const PR_SET_MM: u64 = 35;
+    const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    const PR_CAP_AMBIENT: u64 = 47;
     const PR_SET_NO_NEW_PRIVS: u64 = 38;
     const PR_GET_NO_NEW_PRIVS: u64 = 39;
     const PR_SET_VMA: u64 = 0x5356_4d41;
@@ -249,14 +291,16 @@ pub(super) fn prctl<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &
         PR_SET_NAME => {
             let mut name = mem.read_cstr(a2)?;
             name.truncate(TASK_COMM_LEN - 1);
+            // The main thread's name is the process's (/proc/<pid>/comm).
+            if t.tid == p.pid {
+                p.set_comm(&name);
+            }
             t.comm = name;
             Ok(0)
         }
         PR_GET_NAME => {
             if t.comm.is_empty() {
-                let exe = p.exe();
-                let exe = exe.rsplit(|&b| b == b'/').next().unwrap_or_default();
-                t.comm = exe[..exe.len().min(TASK_COMM_LEN - 1)].to_vec();
+                t.comm = p.comm();
             }
             let mut out = [0u8; TASK_COMM_LEN];
             out[..t.comm.len()].copy_from_slice(&t.comm);
@@ -281,7 +325,29 @@ pub(super) fn prctl<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &
         }
         // No capabilities: an unprivileged process's bounding set still
         // lists them all, but nothing here grants any.
-        PR_CAPBSET_READ if a2 <= 40 => Ok(1),
+        PR_CAPBSET_READ if a2 <= CAP_LAST_CAP => Ok(1),
+        // Past the last capability: how libcap finds where they end.
+        PR_CAPBSET_READ => Err(errno::EINVAL),
+        // The ambient set is empty and stays so (raising needs the
+        // capability permitted and inheritable, and none is).
+        PR_CAP_AMBIENT => {
+            const IS_SET: u64 = 1;
+            const RAISE: u64 = 2;
+            const LOWER: u64 = 3;
+            const CLEAR_ALL: u64 = 4;
+            match a2 {
+                IS_SET | LOWER if a3 <= CAP_LAST_CAP => Ok(0),
+                IS_SET | LOWER | RAISE => Err(if a3 <= CAP_LAST_CAP { errno::EPERM } else { errno::EINVAL }),
+                CLEAR_ALL if a3 == 0 => Ok(0),
+                _ => Err(errno::EINVAL),
+            }
+        }
+        PR_SET_CHILD_SUBREAPER => p.kernel.set_child_subreaper(p, a2 != 0).map(|()| 0),
+        PR_GET_CHILD_SUBREAPER => {
+            let on = p.kernel.child_subreaper(p)?;
+            mem.write_pod(a2, &(on as i32))?;
+            Ok(0)
+        }
         // Rewriting the process's memory layout fields (glibc offers it the
         // stack's address) needs CAP_SYS_RESOURCE, which nothing has here.
         PR_SET_MM => Err(errno::EPERM),
@@ -293,6 +359,76 @@ pub(super) fn prctl<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &
             Err(errno::EINVAL)
         }
     }
+}
+
+/// Linux 6.x's highest capability number (CAP_CHECKPOINT_RESTORE).
+const CAP_LAST_CAP: u64 = 40;
+
+/// `capget(header, data)`: no capabilities at all, effective, permitted or
+/// inheritable, for any process (as an unprivileged Linux process has). A
+/// version the caller doesn't know is told the one to use, with EINVAL.
+pub(super) fn capget<M: GuestMemory + ?Sized>(mem: &M, header: u64, data: u64) -> Result<i64, i64> {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    const V3: u32 = 0x2008_0522;
+    let version: u32 = mem.read_pod(header)?;
+    let words = match version {
+        V1 => 1,
+        V2 | V3 => 2,
+        _ => {
+            mem.write_pod(header, &V3)?;
+            return if data == 0 { Ok(0) } else { Err(errno::EINVAL) };
+        }
+    };
+    if data != 0 {
+        // Each word: effective, permitted, inheritable (u32 each).
+        mem.write(data, &vec![0u8; 12 * words])?;
+    }
+    Ok(0)
+}
+
+/// `capset`: dropping what isn't there is fine; anything else needs a
+/// capability no process has.
+pub(super) fn capset<M: GuestMemory + ?Sized>(mem: &M, header: u64, data: u64) -> Result<i64, i64> {
+    let version: u32 = mem.read_pod(header)?;
+    let words = match version {
+        0x1998_0330 => 1,
+        0x2007_1026 | 0x2008_0522 => 2,
+        _ => return Err(errno::EINVAL),
+    };
+    let mut caps = vec![0u8; 12 * words];
+    mem.read(data, &mut caps)?;
+    if caps.iter().all(|&b| b == 0) { Ok(0) } else { Err(errno::EPERM) }
+}
+
+/// `get_mempolicy(mode, nodemask, maxnode, addr, flags)`, as a machine
+/// with one NUMA node (node 0) and the default policy everywhere.
+pub(super) fn get_mempolicy<M: GuestMemory + ?Sized>(mem: &M, mode: u64, nodemask: u64, maxnode: u64, _addr: u64, flags: u64) -> Result<i64, i64> {
+    const MPOL_F_NODE: u64 = 1;
+    const MPOL_F_ADDR: u64 = 2;
+    const MPOL_F_MEMS_ALLOWED: u64 = 4;
+    if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 || (flags & MPOL_F_MEMS_ALLOWED != 0 && flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0) {
+        return Err(errno::EINVAL);
+    }
+    if mode != 0 {
+        // MPOL_DEFAULT; with MPOL_F_NODE, the node (of the address, or the
+        // caller's): 0 either way.
+        mem.write_pod(mode, &0i32)?;
+    }
+    if nodemask != 0 {
+        if maxnode == 0 {
+            return Err(errno::EINVAL);
+        }
+        // Node 0, in a mask of `maxnode` bits (as unsigned longs). The
+        // default policy's mask is empty; the nodes allowed are {0}.
+        let longs = maxnode.div_ceil(64).min(1024) as usize;
+        let mut out = vec![0u8; longs * 8];
+        if flags & MPOL_F_MEMS_ALLOWED != 0 {
+            out[0] = 1;
+        }
+        mem.write(nodemask, &out)?;
+    }
+    Ok(0)
 }
 
 /// Linux's defaults: [soft, hard] for each `RLIMIT_*`.

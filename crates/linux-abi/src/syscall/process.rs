@@ -69,6 +69,9 @@ pub struct Fork {
     pub tls: Option<u64>,
     /// CLONE_VFORK: the parent waits until the child execs or exits.
     pub vfork: bool,
+    /// CLONE_VM: the child runs in the parent's address space (with vfork,
+    /// or on its own: [`Kernel::shares_memory`]).
+    pub vm: bool,
     /// CLONE_PARENT_SETTID: where in the parent to store the child's pid.
     pub parent_tid: Option<u64>,
     /// CLONE_CHILD_SETTID: likewise, in the child.
@@ -92,7 +95,7 @@ impl Fork {
             let (some, v) = (d.bool()?, d.u64()?);
             Ok(some.then_some(v))
         };
-        Ok(Fork { stack, vfork, exit_signal, tls: opt()?, parent_tid: opt()?, child_tid: opt()? })
+        Ok(Fork { stack, vfork, vm: vfork, exit_signal, tls: opt()?, parent_tid: opt()?, child_tid: opt()? })
     }
 }
 
@@ -119,6 +122,10 @@ pub struct Exec {
     pub envp: Vec<Vec<u8>>,
     /// Guest path of the executable, for `/proc/self/exe`.
     pub exe: Vec<u8>,
+    /// The name it runs under (`/proc/<pid>/comm`, what `pgrep` matches):
+    /// the base name of the path `execve` was given, as Linux takes it
+    /// (`sleep` for coreutils' multi-call binary linked as `sleep`).
+    pub comm: Vec<u8>,
 }
 
 /// A Mac program to run in place of this one: see [`exec_host`].
@@ -296,10 +303,12 @@ impl Process {
         *p.signals() = signals;
         *p.file_maps() = file_maps;
         p.set_exe(self.exe());
+        p.set_comm(&self.comm());
         *p.rlimits.get_mut().unwrap() = *self.rlimits.lock().unwrap_or_else(|e| e.into_inner());
         p.dumpable.store(self.dumpable.load(Ordering::Relaxed), Ordering::Relaxed);
         p.no_new_privs.store(self.no_new_privs.load(Ordering::Relaxed), Ordering::Relaxed);
         p.umask.store(self.umask(), Ordering::Relaxed);
+        *p.arg_area.get_mut().unwrap() = self.arg_area();
         let mut child = Thread::main(&p);
         child.signals = thread_signals;
         child.comm = t.comm.clone();
@@ -342,7 +351,8 @@ impl Process {
     /// The core replaced the program (other threads gone, `t` the one left):
     /// close-on-exec fds close, handlers reset, and a vforking parent may run
     /// on.
-    pub fn exec_done(&self, t: &mut Thread, exe: Vec<u8>) {
+    pub fn exec_done(&self, t: &mut Thread, exe: Vec<u8>, comm: &[u8]) {
+        self.set_comm(comm);
         self.fds.close_on_exec();
         self.file_maps().clear();
         self.signals().reset_on_exec(&mut t.signals);
@@ -440,10 +450,15 @@ pub(super) fn clone(p: &Process, flags: u64, stack: u64, ptid: u64, tls: u64, ct
         return Err(errno::EINVAL);
     }
     let vfork = flags & CLONE_VFORK != 0;
-    // Sharing memory, files or handlers with a child in another process only
-    // works out when the child is about to exec (posix_spawn's vfork), so
+    // A child sharing the parent's memory without vfork: where processes
+    // share a VM, it runs in the same address space (CLONE_VM alone);
+    // a Mac process can't share another's.
+    let vm = flags & CLONE_VM != 0;
+    let shares_memory = vm && !vfork && p.kernel.shares_memory();
+    // Sharing files or handlers with a child in another process only works
+    // out when the child is about to exec (posix_spawn's vfork), so
     // approximate that case with a copy.
-    if flags & (CLONE_VM | CLONE_FILES | CLONE_FS | CLONE_SIGHAND) != 0 && !vfork {
+    if flags & (CLONE_VM | CLONE_FILES | CLONE_FS | CLONE_SIGHAND) != 0 && !vfork && !(shares_memory && flags & (CLONE_FILES | CLONE_FS | CLONE_SIGHAND) == 0) {
         p.unimplemented(format!("clone sharing state without CLONE_VFORK (flags {flags:#x})"));
         return Err(errno::EINVAL);
     }
@@ -451,6 +466,7 @@ pub(super) fn clone(p: &Process, flags: u64, stack: u64, ptid: u64, tls: u64, ct
         stack,
         tls: (flags & CLONE_SETTLS != 0).then_some(tls),
         vfork,
+        vm: vm || vfork,
         parent_tid: (flags & CLONE_PARENT_SETTID != 0 && ptid != 0).then_some(ptid),
         child_tid: (flags & CLONE_CHILD_SETTID != 0 && ctid != 0).then_some(ctid),
         exit_signal: flags & 0xff,
@@ -511,8 +527,9 @@ pub(super) fn execve<M: GuestMemory + ?Sized>(p: &Process, mem: &M, path: u64, a
     let argv = read_args(mem, argv, &mut total)?;
     let envp = read_args(mem, envp, &mut total)?;
     let search = envp.iter().find_map(|e| e.strip_prefix(b"PATH=")).unwrap_or(b"/bin:/usr/bin").to_vec();
+    let comm = path.rsplit(|&b| b == b'/').next().unwrap_or_default().to_vec();
     Ok(match load_program(p, path, argv, &search, 0)? {
-        Program::Linux(exec) => Action::Exec(Exec { envp, ..exec }),
+        Program::Linux(exec) => Action::Exec(Exec { envp, comm, ..exec }),
         Program::Mac(path, argv) => Action::ExecHost(HostExec { path, argv, envp }),
     })
 }
@@ -615,7 +632,7 @@ fn load_program(p: &Process, path: Vec<u8>, argv: Vec<Vec<u8>>, search: &[u8], d
     std::io::Read::read_to_end(&mut file, &mut data).map_err(|e| errno::from_io(&e))?;
     let canonical = std::fs::canonicalize(host_path).map_err(|e| errno::from_io(&e))?;
     let exe = p.fs.guest_path_of_host(canonical.as_os_str().as_bytes());
-    Ok(Program::Linux(Exec { elf: data, argv, envp: Vec::new(), exe }))
+    Ok(Program::Linux(Exec { elf: data, argv, envp: Vec::new(), exe, comm: Vec::new() }))
 }
 
 /// Whether macOS's ncurses (5.7) would find a terminfo entry for `term` it
@@ -827,6 +844,9 @@ pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, 
     {
         return Err(errno::EINVAL);
     }
+    const P_PIDFD: u64 = 3;
+    // A pidfd names the child: as P_PID for it.
+    let (idtype, id) = if idtype == P_PIDFD { (1, super::pidfd::pid_of(p, id)? as u64) } else { (idtype, id) };
     if idtype > 2 {
         return Err(errno::EINVAL);
     }

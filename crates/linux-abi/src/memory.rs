@@ -88,6 +88,51 @@ pub trait GuestMemory {
     fn regions(&self) -> Vec<Region> {
         Vec::new()
     }
+
+    /// How many 4 KiB pages it has in memory (its resident set).
+    fn resident_pages(&self) -> u64 {
+        0
+    }
+}
+
+/// Any [`GuestMemory`], sized, so that `&ByRef(mem)` can be a `&dyn
+/// GuestMemory` whatever `mem` is.
+pub(crate) struct ByRef<'a, M: ?Sized>(pub &'a M);
+
+impl<M: GuestMemory + ?Sized> GuestMemory for ByRef<'_, M> {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), Fault> {
+        self.0.read(addr, buf)
+    }
+    fn write(&self, addr: u64, data: &[u8]) -> Result<(), Fault> {
+        self.0.write(addr, data)
+    }
+    fn brk(&self, addr: u64) -> u64 {
+        self.0.brk(addr)
+    }
+    fn mmap_anonymous(&self, addr_hint: u64, len: u64, prot: u64, flags: u64) -> i64 {
+        self.0.mmap_anonymous(addr_hint, len, prot, flags)
+    }
+    fn mmap_shared(&self, addr_hint: u64, len: u64, prot: u64, flags: u64, host_fd: Option<RawFd>, offset: u64) -> i64 {
+        self.0.mmap_shared(addr_hint, len, prot, flags, host_fd, offset)
+    }
+    fn mmap_file(&self, addr_hint: u64, len: u64, prot: u64, flags: u64, host_fd: RawFd, offset: u64) -> i64 {
+        self.0.mmap_file(addr_hint, len, prot, flags, host_fd, offset)
+    }
+    fn munmap(&self, addr: u64, len: u64) -> i64 {
+        self.0.munmap(addr, len)
+    }
+    fn mprotect(&self, addr: u64, len: u64, prot: u64) -> i64 {
+        self.0.mprotect(addr, len, prot)
+    }
+    fn discard(&self, addr: u64, len: u64) -> i64 {
+        self.0.discard(addr, len)
+    }
+    fn regions(&self) -> Vec<Region> {
+        self.0.regions()
+    }
+    fn resident_pages(&self) -> u64 {
+        self.0.resident_pages()
+    }
 }
 
 /// Helpers built on [`GuestMemory`] for the dispatcher.

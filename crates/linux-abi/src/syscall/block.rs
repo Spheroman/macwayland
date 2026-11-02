@@ -124,6 +124,25 @@ pub(super) fn ready_fd(p: &Process, t: &Thread, host: i32, can_block: bool, even
         return Ok(());
     }
     pf.revents = 0;
-    poll(p, t, &mut vec![pf], None).map(|_| ())
+    // A socket's receive or send timeout (SO_RCVTIMEO, SO_SNDTIMEO) bounds
+    // the wait, which then says EAGAIN, as the call would have.
+    let deadline = socket_timeout(host, events).map(|d| Instant::now() + d);
+    match poll(p, t, &mut vec![pf], deadline)? {
+        Ok(_) => Ok(()),
+        Err(Woken::TimedOut) => Err(errno::EAGAIN),
+    }
+}
+
+/// A socket's timeout for waits for `events` (POLLIN: SO_RCVTIMEO; else
+/// SO_SNDTIMEO), if it's a socket and has one.
+fn socket_timeout(host: i32, events: i16) -> Option<std::time::Duration> {
+    let opt = if events & libc::POLLIN != 0 { libc::SO_RCVTIMEO } else { libc::SO_SNDTIMEO };
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    if unsafe { libc::getsockopt(host, libc::SOL_SOCKET, opt, (&raw mut tv).cast(), &mut len) } != 0 {
+        return None; // not a socket
+    }
+    let d = std::time::Duration::new(tv.tv_sec.max(0) as u64, tv.tv_usec.max(0) as u32 * 1000);
+    (!d.is_zero()).then_some(d)
 }
 

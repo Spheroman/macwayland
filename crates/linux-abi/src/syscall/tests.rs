@@ -1291,7 +1291,7 @@ fn fork_state_round_trips() {
     assert!(q.fds.cloexec(fd).unwrap());
     assert_eq!(q.fds.get(fd).unwrap().path, t.p.fds.get(fd).unwrap().path);
     // SIGPIPE stays ignored; exec drops close-on-exec fds and keeps SIG_IGN.
-    q.exec_done(&mut qt, b"/bin/other".to_vec());
+    q.exec_done(&mut qt, b"/bin/other".to_vec(), b"other");
     assert!(q.fds.get(fd).is_err());
     let old = t.buf(32);
     let mut a = [0; 6];

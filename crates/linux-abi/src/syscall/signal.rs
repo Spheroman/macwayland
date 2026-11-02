@@ -430,6 +430,16 @@ impl Signals {
         }
     }
 
+    /// The signals ignored by SIG_IGN.
+    pub(super) fn ignored_now(&self) -> u64 {
+        self.ignored()
+    }
+
+    /// The signals with a handler.
+    pub(super) fn caught(&self) -> u64 {
+        (1..=NSIG).filter(|&sig| !matches!(self.actions[sig as usize - 1].handler, SIG_DFL | SIG_IGN)).fold(0, |m, sig| m | bit(sig))
+    }
+
     /// The signals set to be ignored (bit n-1 for signal n).
     pub(super) fn ignored(&self) -> u64 {
         (1..=NSIG).filter(|&sig| self.actions[sig as usize - 1].handler == SIG_IGN).fold(0, |m, sig| m | bit(sig))
@@ -440,6 +450,11 @@ impl Signals {
     }
 
     fn take_host_pending(&mut self, inbox: &Inbox) {
+        // Looked at first: a swap writes the line every thread of the
+        // process reads, on every blocking call, though it's nearly always 0.
+        if inbox.host_pending.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let from_host = inbox.host_pending.swap(0, Ordering::AcqRel);
         for sig in (1..=NSIG).filter(|&sig| from_host & bit(sig) != 0) {
             self.pending.add(SigInfo { signo: sig, code: SI_USER, ..Default::default() });

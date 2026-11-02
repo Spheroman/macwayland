@@ -219,8 +219,9 @@ from a static Linux binary.
      could give up its VM and create a new one when it wakes (its page
      tables and memory are host-side, so only the vCPUs' registers need
      saving), making the cap 128 *running* processes.
-   Not yet: threads in a forked process (item 5), `CLONE_VM` without vfork,
-   pidfds, `kill(-1)` (refused: on a Mac that's the whole login session).
+   Not yet in 1:1 mode: threads in a forked process (item 5), `CLONE_VM`
+   without vfork, `pidfd_getfd`, `kill(-1)` (refused: on a Mac that's the
+   whole login session); one VM has them (below).
    **Next: many processes in one VM** (design: `docs/processes.md`). A
    *host* (one Mac process, one VM) runs every Linux process of a session,
    each with its own page tables and ASID: a switch between processes
@@ -236,17 +237,18 @@ from a static Linux binary.
    hierarchical (session, process, thread), blocked threads wait in
    kqueues rather than a host thread each, and `/proc` is accurate per
    process, with `macwl-run --ps` on the Mac side.
-   Steps 1–2 done (2026-11-02); **step 3 in progress** (2026-11-02): behind
-   `MACWL_ONE_VM=1` a `macwl-run` is a host for every process it starts:
-   fork copy on write in the VM (65–70 µs for fork + exit + wait, from
-   2.2 ms; 185 µs at 200 MB), vfork sharing the address space, the
-   process table in memory (zombies, `wait4`/`waitid`, SIGCHLD, stops,
-   groups, sessions, `kill` to pids, groups and -1, `tgkill` across
-   processes), pids from per-user ranges, 300 processes alive in one host,
-   arm64 Wine booting and running `cmd.exe`. Left of step 3: `/proc/<pid>`
-   from the table, `CLONE_VM` without vfork, a subreaper, per-process
-   `CLOCK_PROCESS_CPUTIME_ID`. Terminals (step 4), clients (5) and Mac
-   programs (6: refused with ENOEXEC under the flag) follow.
+   Steps 1–3 done (2026-11-02): behind `MACWL_ONE_VM=1` a `macwl-run` is
+   a host for every process it starts: fork copy on write in the VM
+   (65–70 µs for fork + exit + wait, from 2.2 ms; 185 µs at 200 MB), vfork
+   and CLONE_VM sharing the address space, the process table in memory
+   (zombies, `wait4`/`waitid`, SIGCHLD, stops, groups, sessions, a
+   subreaper, `kill` to pids, groups and -1, `tgkill` across processes,
+   pidfds), pids from per-user ranges, CPU time per process with user and
+   system apart, `/proc/<pid>` for every process (procps `ps`, `top`,
+   `pgrep`, `pidof` work), a runtime panic in a call ending only its
+   process (SIGSYS), 300 processes alive in one host, arm64 Wine booting
+   and running `cmd.exe` within 2-4% of 1:1. Terminals (step 4), clients
+   (5) and Mac programs (6: refused with ENOEXEC under the flag) follow.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return

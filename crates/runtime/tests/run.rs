@@ -610,6 +610,29 @@ fn one_vm_timers_are_their_process_alone() {
     procs_in_one_vm("timers");
 }
 
+/// The rest of the process model in one VM: CLONE_VM without vfork, a
+/// child subreaper (orphans and an orphaned zombie adopted), pidfds (poll
+/// for the end, pidfd_send_signal, pidfd_getfd, waitid(P_PIDFD)), CPU time
+/// per process with user and system apart (a sleeping child's CPU clock
+/// stays near zero while its parent spins; a spinning thread counts as it
+/// goes; system calls are system time; times()), capget, PR_CAPBSET_READ,
+/// PR_CAP_AMBIENT, get_mempolicy, SO_REUSEPORT.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_process_model() {
+    procs_in_one_vm("model");
+}
+
+/// `/proc` in one VM, from the process table and each process: the
+/// listing, another process's stat, status, statm, cmdline (read from its
+/// memory), environ, comm, maps, fd/ and its links, exe, cwd, task/; a
+/// zombie's state; /proc/self; /proc/stat.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_proc_of_every_process() {
+    procs_in_one_vm("procfs");
+}
+
 /// Containment in one VM: a runtime error (a panic, here from a call debug
 /// builds of the runtime answer with one) in one process's system call ends
 /// that process with SIGSYS, whether its main thread or another made the

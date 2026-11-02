@@ -37,6 +37,27 @@ pub struct ChildInfo {
 /// `sizeof(struct rusage)` on arm64 Linux: two timevals and fourteen longs.
 pub const RUSAGE_SIZE: usize = 144;
 
+/// What `/proc/<pid>` says of a process that the process table knows (the
+/// rest comes from the process itself: see [`Kernel::with_process`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcStatus {
+    /// Its name (`comm`), which a zombie keeps.
+    pub comm: Vec<u8>,
+    pub ppid: i64,
+    pub pgid: i64,
+    pub sid: i64,
+    /// `R` running, `S` sleeping, `T` stopped, `Z` zombie.
+    pub state: u8,
+    pub threads: u64,
+    /// CPU time, in ns: its own, and its reaped children's.
+    pub user_ns: u64,
+    pub sys_ns: u64,
+    pub children_user_ns: u64,
+    pub children_sys_ns: u64,
+    /// When it started, in ns since the machine booted.
+    pub start_ns: u64,
+}
+
 /// A clock reading a process's CPU time, from any thread.
 pub type CpuClock = Box<dyn Fn() -> Duration + Send + Sync>;
 
@@ -93,6 +114,73 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     /// Whether `execve` may run Mac programs (`Action::ExecHost`): only when
     /// the host process is the Linux process alone, and can become one.
     fn mac_programs(&self) -> bool;
+    /// A host fd that reads as ready once process `pid` has ended, for a
+    /// pidfd (`pidfd_open`). Here: a kqueue watching the Mac process.
+    fn pidfd(&self, _p: &Process, pid: i64) -> Result<std::os::fd::OwnedFd, i64> {
+        super::pidfd::host_exit_watch(pid)
+    }
+    /// Another process's open file `fd` (`pidfd_getfd`): out of reach of a
+    /// Mac process.
+    fn process_file(&self, _p: &Process, _pid: i64, _fd: u64) -> Result<std::sync::Arc<crate::fs::OpenFile>, i64> {
+        Err(errno::ENOSYS)
+    }
+    /// `PR_SET_CHILD_SUBREAPER`: orphaned descendants become the caller's,
+    /// not init's. A Mac process can't be one: only turning it off works.
+    fn set_child_subreaper(&self, _p: &Process, on: bool) -> Result<(), i64> {
+        if on { Err(errno::EINVAL) } else { Ok(()) }
+    }
+    /// Process `pid`'s CPU time (user and system), for its CPU clock; None:
+    /// the host's own clock for this process says (1:1, where the host
+    /// process is the Linux one), and other processes' are out of reach.
+    fn process_cpu_time(&self, p: &Process, pid: i64) -> Result<Option<Duration>, i64> {
+        if pid == p.pid { Ok(None) } else { Err(errno::EINVAL) }
+    }
+    /// The processes `/proc` lists: every one the kernel has (in 1:1 mode,
+    /// the caller alone: others are Mac processes).
+    fn pids(&self, p: &Process) -> Vec<i64> {
+        vec![p.pid]
+    }
+    /// What the process table says of `pid` (for `/proc/<pid>`).
+    fn proc_status(&self, p: &Process, pid: i64) -> Result<ProcStatus, i64> {
+        if pid != p.pid {
+            return Err(errno::ESRCH);
+        }
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let mut cru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+            libc::getrusage(libc::RUSAGE_CHILDREN, &mut cru);
+        }
+        let ns = |t: libc::timeval| t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1000;
+        Ok(ProcStatus {
+            comm: p.comm(),
+            ppid: unsafe { libc::getppid() } as i64,
+            pgid: unsafe { libc::getpgrp() } as i64,
+            sid: unsafe { libc::getsid(0) } as i64,
+            state: b'R',
+            threads: p.thread_count().max(1) as u64,
+            user_ns: ns(ru.ru_utime),
+            sys_ns: ns(ru.ru_stime),
+            children_user_ns: ns(cru.ru_utime),
+            children_sys_ns: ns(cru.ru_stime),
+            start_ns: p.started_ns,
+        })
+    }
+    /// Run `f` with another process's state and memory, for its `/proc`
+    /// files: ESRCH if it isn't one the kernel runs (a zombie, or in 1:1
+    /// mode any other).
+    fn with_process(&self, _p: &Process, _pid: i64, _f: &mut dyn FnMut(&Process, &dyn crate::memory::GuestMemory)) -> Result<(), i64> {
+        Err(errno::ESRCH)
+    }
+    /// Whether a child can share its parent's address space without vfork
+    /// (`clone` with CLONE_VM alone): when the processes share a VM.
+    fn shares_memory(&self) -> bool {
+        false
+    }
+    /// `PR_GET_CHILD_SUBREAPER`.
+    fn child_subreaper(&self, _p: &Process) -> Result<bool, i64> {
+        Ok(false)
+    }
 }
 
 /// Each Linux process is a host process: pids, groups, sessions, `wait` and

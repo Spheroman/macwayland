@@ -10,6 +10,7 @@
 //! Status: single-threaded programs, static or dynamically linked. See ROADMAP.md, Track B.
 
 pub mod hv;
+mod cputime;
 mod fork;
 mod host;
 pub mod loader;
@@ -27,7 +28,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -159,6 +160,7 @@ pub fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: Process) -> Resu
     profile::mark("load start");
     let machine = Machine::new()?;
     let program = load(&machine, elf, argv, envp, &process)?;
+    process.set_arg_area(program.args, program.env);
     profile::mark("loaded");
     let thread = Thread::main(&process);
     execute(program.space, Start::Fresh { entry: program.entry, sp: program.sp }, process, thread)
@@ -176,6 +178,9 @@ struct Loaded {
     space: AddressSpace,
     entry: u64,
     sp: u64,
+    /// Where its argument and environment strings are (for /proc).
+    args: (u64, u64),
+    env: (u64, u64),
 }
 
 /// Load a program into a new address space of `machine`.
@@ -190,7 +195,12 @@ fn load(machine: &Arc<Machine>, elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], proc
     let sp = loader::build_stack(&mut space, &image, interp.as_ref(), argv, envp)?;
     // A dynamically linked program starts in its dynamic linker.
     let entry = interp.as_ref().unwrap_or(&image).entry;
-    Ok(Loaded { space, entry, sp })
+    // The strings are one block ending at the top of the stack, argv's then
+    // envp's (see build_stack).
+    let len = |v: &[&[u8]]| v.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
+    let arg_start = memory::STACK_TOP - len(argv) - len(envp);
+    let env_start = arg_start + len(argv);
+    Ok(Loaded { space, entry, sp, args: (arg_start, env_start), env: (env_start, memory::STACK_TOP) })
 }
 
 /// Why [`run_loop`] stopped.
@@ -233,8 +243,9 @@ pub(crate) struct Proc {
     stopped: AtomicBool,
     /// Tasks set aside while it's stopped, or while a vfork child runs.
     parked: Mutex<Parked>,
-    /// CPU time its threads have used, in ns (one VM: getrusage, wait4).
-    cpu_ns: Arc<AtomicU64>,
+    /// CPU time its threads have used, user and system (one VM: getrusage,
+    /// wait4, CPU clocks and timers, /proc).
+    cpu: Arc<cputime::CpuTime>,
     /// A vfork child's parent, whose task waits until it execs or exits.
     vfork_parent: Mutex<Option<Arc<Proc>>>,
 }
@@ -260,7 +271,7 @@ impl Proc {
             finished: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             parked: Mutex::default(),
-            cpu_ns: Arc::default(),
+            cpu: Arc::default(),
             vfork_parent: Mutex::new(None),
         })
     }
@@ -523,7 +534,9 @@ fn run_cpu<'scope, 'env>(
         // and it ran nowhere else since.
         let warm = holds == Some((task.proc.abi.pid, task.thread.tid)) && task.last_cpu == Some(cpu.slot);
         let mut after = None;
-        let cpu_time = sh.table.is_some().then(thread_cpu_ns);
+        if sh.table.is_some() {
+            cputime::turn_starts();
+        }
         let step = || {
             let space = task.proc.space();
             {
@@ -580,8 +593,10 @@ fn run_cpu<'scope, 'env>(
             }
         };
         sh.sched.done(cpu.slot);
-        if let Some(t0) = cpu_time {
-            task.proc.cpu_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Ordering::Relaxed);
+        if sh.table.is_some() {
+            // The turn's CPU time less its runs in the guest: the runtime's
+            // work for the process.
+            cputime::take_stock(&task.proc.cpu, true);
         }
         holds = Some((task.proc.abi.pid, task.thread.tid));
         match step {
@@ -634,14 +649,7 @@ fn run_cpu<'scope, 'env>(
     result
 }
 
-/// The CPU time the calling host thread has used, in ns (a CPU's: what its
-/// tasks used, including the hypervisor's running of their guest code).
-fn thread_cpu_ns() -> u64 {
-    unsafe extern "C" {
-        fn clock_gettime_nsec_np(clock: libc::clockid_t) -> u64;
-    }
-    unsafe { clock_gettime_nsec_np(libc::CLOCK_THREAD_CPUTIME_ID) }
-}
+use cputime::thread_cpu_ns;
 
 /// Run a task on a CPU until it ends, the process ends, or it gives the CPU
 /// up. `configured` is the serial of the address space the vCPU is set up
@@ -814,7 +822,7 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
             strace_line(format_args!("{}{}({a}) = Return({ret}) (worker)", who(sh, process, thread), linux_abi::nr::name(nr)));
         }
         if let Some(t0) = cpu_time {
-            proc.cpu_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Ordering::Relaxed);
+            proc.cpu.add_sys(thread_cpu_ns().saturating_sub(t0));
         }
         drop(space);
         task.location.set_nowhere();
@@ -1062,7 +1070,13 @@ fn run_loop<'scope, 'env>(
             vcpu.set_reg(reg::CPSR, 0x3c5)?; // EL1h, interrupts masked
             vcpu.set_reg(reg::PC, memory::VECTOR_FLUSH_PATH)?;
         }
-        let exit = vcpu.run()?;
+        // Time in the guest is the process's user time (one VM).
+        let ran = sh.table.is_some().then(|| proc.cpu.entering_guest(slot));
+        let exit = vcpu.run();
+        if let Some(since) = ran {
+            proc.cpu.left_guest(slot, since);
+        }
+        let exit = exit?;
         match exit.reason {
             hv::EXIT_REASON_EXCEPTION => {}
             // Kicked by a host signal: handled at the top of the loop. (If it
@@ -1257,7 +1271,8 @@ fn run_loop<'scope, 'env>(
                     match load(sh.machine, &exec.elf, &argv, &envp, process) {
                         Ok(program) => {
                             profile::mark("exec: loaded");
-                            process.exec_done(thread, exec.exe);
+                            process.exec_done(thread, exec.exe, &exec.comm);
+                            process.set_arg_area(program.args, program.env);
                             return Ok(Next::Exec(program));
                         }
                         Err(e) => -exec_errno(&e),

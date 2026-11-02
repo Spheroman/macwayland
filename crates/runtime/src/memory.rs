@@ -1097,6 +1097,10 @@ impl GuestMemory for Space {
     fn mprotect(&self, addr: u64, len: u64, p: u64) -> i64 {
         self.lock().mprotect(addr, len, p)
     }
+    fn resident_pages(&self) -> u64 {
+        self.lock().frames_in_use()
+    }
+
     fn regions(&self) -> Vec<linux_abi::Region> {
         self.lock().regions()
     }
