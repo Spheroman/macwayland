@@ -4,14 +4,14 @@
 //! macOS has no per-process timers like Linux's, so each armed timer is a
 //! host thread that sleeps until its deadline. On expiry it queues the
 //! signal (with Linux's timer `siginfo`: id, overrun, `sigev_value`) for the
-//! process or one thread, in the process's [`Inbox`], then gets the guest's
-//! attention the way a host signal does: kicking the vCPUs, waking threads
-//! asleep in the runtime, and interrupting a blocking host call.
+//! process or one thread, in the process's [`Inbox`], then gets the
+//! attention of that process's threads (and no other's): kicking their vCPUs
+//! out of the guest, waking them asleep in the runtime, and interrupting
+//! their blocking host calls.
 
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicPtr, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -36,15 +36,6 @@ const TIMER_ABSTIME: u64 = 1;
 const SIGALRM: u64 = 14;
 /// `si_code` for timer signals.
 pub const SI_TIMER: i32 = -2;
-
-/// How the core breaks every guest thread out of a blocking host call.
-static INTERRUPT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Set the function that breaks every guest thread out of a blocking host
-/// call, for timers to get a sleeping thread's attention.
-pub fn set_interrupt(interrupt: fn()) {
-    INTERRUPT.store(interrupt as *mut (), Ordering::Release);
-}
 
 #[derive(Debug)]
 struct State {
@@ -214,15 +205,6 @@ fn run(timer: Arc<PosixTimer>) {
             signal::alert(&timer.inbox);
             s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
         }
-    }
-}
-
-/// Interrupt blocking host calls in this process, if the core said how.
-pub(super) fn interrupt_host() {
-    let interrupt = INTERRUPT.load(Ordering::Acquire);
-    if !interrupt.is_null() {
-        let interrupt: fn() = unsafe { std::mem::transmute(interrupt) };
-        interrupt();
     }
 }
 

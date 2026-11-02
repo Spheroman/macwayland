@@ -62,6 +62,12 @@ pub struct Inbox {
     pub(super) kqueues: [AtomicI32; 32],
     /// Its threads' wakers, for waking them all (a timer expired).
     wakers: Mutex<Vec<Weak<Waker>>>,
+    /// Its registered threads: where signals for one of them go, and how to
+    /// get each one's attention wherever it is (in the guest, in a host call
+    /// on a CPU or a worker). Here rather than in the process, so that a
+    /// timer's thread, which holds only the inbox, reaches its own process's
+    /// threads and no one else's.
+    threads: Mutex<BTreeMap<i64, super::ThreadHandle>>,
     /// Whether its threads' masks are mirrored onto their host threads
     /// ([`super::Kernel::host_signals`]).
     pub(super) mirror_host: AtomicBool,
@@ -74,6 +80,7 @@ impl Default for Inbox {
             fired: Mutex::default(),
             kqueues: [const { AtomicI32::new(-1) }; 32],
             wakers: Mutex::default(),
+            threads: Mutex::default(),
             mirror_host: AtomicBool::new(true),
         }
     }
@@ -89,11 +96,21 @@ impl Inbox {
         w
     }
 
-    /// Wake every thread of the process sleeping in the runtime (to look at
-    /// signals).
-    fn wake_all(&self) {
+    pub(super) fn threads(&self) -> std::sync::MutexGuard<'_, BTreeMap<i64, super::ThreadHandle>> {
+        self.threads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Get the attention of every thread of the process, and only its: those
+    /// asleep in the runtime (their wakers), in the guest or blocked in a
+    /// host call (their own wake, which kicks their vCPU or interrupts their
+    /// host thread).
+    pub(super) fn wake_threads(&self) {
         for w in self.wakers.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()) {
             w.wake();
+        }
+        for h in self.threads().values() {
+            h.waker.wake();
+            (h.wake)();
         }
     }
 
@@ -412,16 +429,12 @@ impl Signals {
 }
 
 /// A signal arrived from outside a system call (a timer) for the process
-/// with `inbox`: get its threads' attention, as a host signal's handler does.
+/// with `inbox`: get its threads' attention, and no other process's (many
+/// share a host: kicking every vCPU and interrupting every host thread, as a
+/// host signal's handler does, would interrupt them all).
 pub(super) fn alert(inbox: &Inbox) {
     super::signalfd::notify(inbox);
-    let kick = KICK.load(Ordering::Acquire);
-    if !kick.is_null() {
-        let kick: fn() = unsafe { std::mem::transmute(kick) };
-        kick();
-    }
-    inbox.wake_all();
-    super::timer::interrupt_host();
+    inbox.wake_threads();
 }
 
 impl Process {

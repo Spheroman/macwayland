@@ -158,7 +158,6 @@ static HOST_THREADS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 /// the guest. Returns its slot, for [`remove_vcpu`].
 pub(crate) fn add_vcpu(id: u64) -> Option<usize> {
     linux_abi::syscall::set_kick(kick);
-    linux_abi::syscall::set_interrupt(interrupt_all);
     let slot = VCPUS.iter().position(|slot| slot.compare_exchange(u64::MAX, id, Ordering::AcqRel, Ordering::Relaxed).is_ok())?;
     HOST_THREADS[slot].store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
     Some(slot)
@@ -170,21 +169,6 @@ pub(crate) fn interrupt_slot(slot: usize) {
     if t != 0 {
         unsafe { libc::pthread_kill(t as libc::pthread_t, INTERRUPT) };
     }
-}
-
-/// Worker threads (host threads making guest system calls without a vCPU),
-/// for [`interrupt_all`] (0: free slot). Past this many, a worker isn't
-/// interrupted for a timer's signal (its call ends in its own time).
-static WORKERS: [AtomicUsize; 512] = [const { AtomicUsize::new(0) }; 512];
-
-/// This host thread is a worker. Returns its slot, for [`remove_worker`].
-pub(crate) fn add_worker() -> Option<usize> {
-    let me = unsafe { libc::pthread_self() } as usize;
-    WORKERS.iter().position(|slot| slot.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_ok())
-}
-
-pub(crate) fn remove_worker(slot: usize) {
-    WORKERS[slot].store(0, Ordering::Release);
 }
 
 /// Make the vCPU in `slot` exit the guest (not its host thread's call).
@@ -211,17 +195,6 @@ pub(crate) fn wake_slot(slot: usize) {
 pub(crate) fn remove_vcpu(slot: usize) {
     HOST_THREADS[slot].store(0, Ordering::Release);
     VCPUS[slot].store(u64::MAX, Ordering::Release);
-}
-
-/// Break every guest thread out of the host call it's blocked in (for a
-/// timer's signal).
-fn interrupt_all() {
-    for t in HOST_THREADS.iter().chain(&WORKERS) {
-        let t = t.load(Ordering::Acquire);
-        if t != 0 {
-            unsafe { libc::pthread_kill(t as libc::pthread_t, INTERRUPT) };
-        }
-    }
 }
 
 /// Called from host signal handlers: make every vCPU exit (if running, at

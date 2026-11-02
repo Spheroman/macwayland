@@ -31,14 +31,13 @@ pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::{HostSignalWait, SignalFd};
 pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
 pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, Waited, RUSAGE_SIZE};
-pub use timer::set_interrupt;
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
 pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
 pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     os::fd::{AsFd, OwnedFd},
     path::PathBuf,
     sync::{
@@ -81,9 +80,6 @@ pub struct Process {
     children: Mutex<process::Children>,
     /// If this process was forked: the control socket to its parent.
     parent_ctl: Option<OwnedFd>,
-    /// The process's threads other than the caller's own view of itself, for
-    /// signals sent to one of them.
-    threads: Mutex<BTreeMap<i64, ThreadHandle>>,
     /// Threads waiting in `futex`.
     futexes: futex::Futexes,
     /// `exit_group` (or a fatal signal, or `execve`) is ending every thread.
@@ -112,9 +108,9 @@ pub struct Process {
 /// What other threads need of a thread: where to put signals for it, and how
 /// to get its attention.
 pub struct ThreadHandle {
-    pending: Arc<Mutex<signal::Pending>>,
-    waker: Arc<Waker>,
-    wake: Box<dyn Fn() + Send + Sync>,
+    pub(crate) pending: Arc<Mutex<signal::Pending>>,
+    pub(crate) waker: Arc<Waker>,
+    pub(crate) wake: Box<dyn Fn() + Send + Sync>,
 }
 
 impl std::fmt::Debug for ThreadHandle {
@@ -174,7 +170,6 @@ impl Process {
             no_new_privs: AtomicBool::new(false),
             children: Mutex::default(),
             parent_ctl: None,
-            threads: Mutex::default(),
             futexes: futex::Futexes::default(),
             exiting: AtomicBool::new(false),
             tids: std::sync::atomic::AtomicI64::new(0),
@@ -254,24 +249,21 @@ impl Process {
     /// called from other threads at any time) gets it to look.
     pub fn register_thread(&self, t: &Thread, wake: Box<dyn Fn() + Send + Sync>) {
         let handle = ThreadHandle { pending: t.signals.pending.clone(), waker: t.waker.clone(), wake };
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).insert(t.tid, handle);
+        self.inbox.threads().insert(t.tid, handle);
     }
 
     pub fn unregister_thread(&self, tid: i64) {
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).remove(&tid);
+        self.inbox.threads().remove(&tid);
     }
 
     /// How many threads are registered.
     pub fn thread_count(&self) -> usize {
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inbox.threads().len()
     }
 
     /// Wake every registered thread (to look at signals, or to exit).
     pub fn wake_all_threads(&self) {
-        for h in self.threads.lock().unwrap_or_else(|e| e.into_inner()).values() {
-            h.waker.wake();
-            (h.wake)();
-        }
+        self.inbox.wake_threads();
     }
 
     /// Start ending every thread (`exit_group`, a fatal signal, `execve`).
@@ -293,11 +285,11 @@ impl Process {
     }
 
     fn thread_pending(&self, tid: i64) -> Option<Arc<Mutex<signal::Pending>>> {
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).get(&tid).map(|h| h.pending.clone())
+        self.inbox.threads().get(&tid).map(|h| h.pending.clone())
     }
 
     fn wake_thread(&self, tid: i64) {
-        if let Some(h) = self.threads.lock().unwrap_or_else(|e| e.into_inner()).get(&tid) {
+        if let Some(h) = self.inbox.threads().get(&tid) {
             h.waker.wake();
             (h.wake)();
         }

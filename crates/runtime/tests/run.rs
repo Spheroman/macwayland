@@ -600,6 +600,16 @@ fn one_vm_signals_and_groups() {
     procs_in_one_vm("groups");
 }
 
+/// A process's timers in one VM (setitimer, timer_create, alarm) signal it
+/// and no other process: another process of the host, meanwhile sleeping,
+/// polling and waiting for a signal in short steps, sees none of them end
+/// early.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_timers_are_their_process_alone() {
+    procs_in_one_vm("timers");
+}
+
 /// More live Linux processes than a Mac has VMs (128): 300 at once in one
 /// host, which stays one Mac process meanwhile.
 #[test]

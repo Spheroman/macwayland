@@ -10,11 +10,14 @@
 //            WCONTINUED), SIGCHLD's si_code, reaping by SIG_IGN, orphans
 //   groups   process groups and sessions, kill to a group, to 0 and to a
 //            pid, the sender in siginfo, tgkill of another process's thread
+//   timers   a process's interval and POSIX timers and alarm() signal it
+//            alone: another process's sleeps and waits aren't interrupted
 //   execmac  execve of a Mac program: prints its errno
 //
 // Prints "procs TEST ok".
 #define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -23,6 +26,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -414,6 +418,91 @@ static void groups(void) {
     CHECK(WEXITSTATUS(wait_status(t)) == 0);
 }
 
+// ---- timers ----
+
+static atomic_int alrms, usr1_timer;
+static void on_alrm(int sig) { (void)sig; atomic_fetch_add(&alrms, 1); }
+static void on_usr1_timer(int sig) { (void)sig; atomic_fetch_add(&usr1_timer, 1); }
+
+// A process with no timers sleeps and waits for ms milliseconds in short
+// steps, none of which may end early: a timer of another process's must not
+// interrupt it. Exits 0 if none did.
+static void undisturbed(long ms) {
+    int p[2];
+    CHECK(pipe(p) == 0);
+    for (long done = 0; done < ms; done += 30) {
+        struct timespec ts = { 0, 10 * 1000000 };
+        if (nanosleep(&ts, 0) != 0) {
+            dprintf(2, "nanosleep: errno %d\n", errno);
+            _exit(2);
+        }
+        struct pollfd pf = { p[0], POLLIN, 0 };
+        int n = poll(&pf, 1, 10);
+        if (n != 0) {
+            dprintf(2, "poll: %d errno %d\n", n, errno);
+            _exit(3);
+        }
+        struct timespec t2 = { 0, 10 * 1000000 };
+        siginfo_t si;
+        sigset_t none;
+        sigemptyset(&none);
+        sigaddset(&none, SIGUSR2);
+        sigprocmask(SIG_BLOCK, &none, 0);
+        n = sigtimedwait(&none, &si, &t2);
+        if (n != -1 || errno != EAGAIN) {
+            dprintf(2, "sigtimedwait: %d errno %d\n", n, errno);
+            _exit(4);
+        }
+    }
+    _exit(0);
+}
+
+static void timers(void) {
+    struct sigaction sa = { 0 };
+    sa.sa_handler = on_alrm;
+    CHECK(sigaction(SIGALRM, &sa, 0) == 0);
+    sa.sa_handler = on_usr1_timer;
+    CHECK(sigaction(SIGUSR1, &sa, 0) == 0);
+
+    // An interval timer and a POSIX timer, every millisecond, while another
+    // process sleeps and polls.
+    pid_t quiet = fork();
+    CHECK(quiet >= 0);
+    if (quiet == 0) undisturbed(600);
+    struct itimerval it = { { 0, 1000 }, { 0, 1000 } };
+    CHECK(setitimer(ITIMER_REAL, &it, 0) == 0);
+    struct sigevent ev = { 0 };
+    ev.sigev_notify = SIGEV_SIGNAL;
+    ev.sigev_signo = SIGUSR1;
+    timer_t t;
+    CHECK(timer_create(CLOCK_MONOTONIC, &ev, &t) == 0);
+    struct itimerspec spec = { { 0, 1000000 }, { 0, 1000000 } };
+    CHECK(timer_settime(t, 0, &spec, 0) == 0);
+    int st;
+    pid_t got;
+    while ((got = waitpid(quiet, &st, 0)) < 0 && errno == EINTR) {}
+    CHECK(got == quiet);
+    struct itimerval off = { { 0, 0 }, { 0, 0 } };
+    CHECK(setitimer(ITIMER_REAL, &off, 0) == 0);
+    CHECK(timer_delete(t) == 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        dprintf(2, "the other process was disturbed: status %#x\n", st);
+        _exit(1);
+    }
+    // The timers' signals came here, often.
+    CHECK(atomic_load(&alrms) > 50 && atomic_load(&usr1_timer) > 50);
+
+    // alarm(): one SIGALRM, for this process only.
+    quiet = fork();
+    CHECK(quiet >= 0);
+    if (quiet == 0) undisturbed(400);
+    int before = atomic_load(&alrms);
+    alarm(1);
+    while (atomic_load(&alrms) == before) pause();
+    while ((got = waitpid(quiet, &st, 0)) < 0 && errno == EINTR) {}
+    CHECK(got == quiet && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
 int main(int argc, char **argv) {
     self = argv[0];
     CHECK(argc >= 2);
@@ -429,6 +518,8 @@ int main(int argc, char **argv) {
         wait_tests();
     } else if (!strcmp(test, "groups")) {
         groups();
+    } else if (!strcmp(test, "timers")) {
+        timers();
     } else if (!strcmp(test, "execmac")) {
         char *args[] = { "/usr/bin/true", 0 };
         execv("/usr/bin/true", args);

@@ -769,7 +769,6 @@ fn finish_call(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &mut T
 /// then whatever comes), each task then waiting for a CPU again with the
 /// result, until the host ends.
 fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope, 'env>, first: Job) {
-    let slot = signal::add_worker();
     let strace = strace_on();
     let mut next = Some(first);
     while let Some(Job { mut task, ctx, nr, args, mut wait }) = next.take().or_else(|| sh.sched.next_job()) {
@@ -820,9 +819,6 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
         if let Some(table) = &sh.table {
             host::place_ready(sh, scope, table);
         }
-    }
-    if let Some(slot) = slot {
-        signal::remove_worker(slot);
     }
 }
 
