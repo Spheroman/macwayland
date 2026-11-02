@@ -16,15 +16,12 @@
 
 use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    sync::{
-        Mutex,
-        atomic::{AtomicI32, Ordering},
-    },
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 
 use super::{
     kfd, ok,
-    signal::{SigInfo, ThreadSignals},
+    signal::{Inbox, SigInfo, ThreadSignals},
     Process,
 };
 use crate::{
@@ -40,15 +37,10 @@ const UNREADABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
 /// `sizeof(struct signalfd_siginfo)`.
 const SIGINFO_SIZE: usize = 128;
 
-/// The kqueues of this process's signalfds (their own copies), for host
-/// signal handlers to trigger: a fixed table, as a handler can't take a
-/// lock. -1 is free.
-static KQUEUES: [AtomicI32; 32] = [const { AtomicI32::new(-1) }; 32];
-
-/// A signal was made pending: wake every signalfd's readers. Safe to call
-/// from a signal handler.
-pub(super) fn notify() {
-    for slot in &KQUEUES {
+/// A signal was made pending for the process with `inbox`: wake its
+/// signalfds' readers. Safe to call from a signal handler.
+pub(super) fn notify(inbox: &Inbox) {
+    for slot in &inbox.kqueues {
         let kq = slot.load(Ordering::Acquire);
         if kq >= 0 {
             // EBADF if it was just closed (or another kqueue, now at that
@@ -58,18 +50,20 @@ pub(super) fn notify() {
     }
 }
 
-/// A signalfd: the signals it reads, and its kqueue's slot in [`KQUEUES`].
+/// A signalfd: the signals it reads, and its kqueue's slot in its process's
+/// [`Inbox`].
 #[derive(Debug)]
 pub struct SignalFd {
     mask: Mutex<u64>,
-    /// The kqueue's copy that [`KQUEUES`] points to.
+    /// The kqueue's copy that the inbox's slot points to.
     kq: OwnedFd,
+    inbox: Arc<Inbox>,
     slot: usize,
 }
 
 impl Drop for SignalFd {
     fn drop(&mut self) {
-        KQUEUES[self.slot].store(-1, Ordering::Release);
+        self.inbox.kqueues[self.slot].store(-1, Ordering::Release);
     }
 }
 
@@ -80,25 +74,26 @@ impl SignalFd {
     }
 }
 
-fn new_signalfd(mask: u64, nonblock: bool) -> Result<FdEntry, i64> {
+fn new_signalfd(inbox: &Arc<Inbox>, mask: u64, nonblock: bool) -> Result<FdEntry, i64> {
     let kq = kfd::new_kqueue(nonblock)?;
     kfd::change(kq.as_raw_fd(), kfd::user_event(libc::EV_ADD | libc::EV_CLEAR, 0))?;
     let own = ok(unsafe { libc::dup(kq.as_raw_fd()) } as i64)? as RawFd;
     let own = unsafe { OwnedFd::from_raw_fd(own) };
-    let slot = KQUEUES
+    let slot = inbox
+        .kqueues
         .iter()
         .position(|s| s.compare_exchange(-1, own.as_raw_fd(), Ordering::AcqRel, Ordering::Acquire).is_ok())
         .ok_or(errno::EMFILE)?;
     // Anything already pending is there to read.
     kfd::change(kq.as_raw_fd(), kfd::user_event(0, libc::NOTE_TRIGGER))?;
     let mut entry = FdEntry::new(kq);
-    entry.kind = FileKind::SignalFd(SignalFd { mask: Mutex::new(mask), kq: own, slot });
+    entry.kind = FileKind::SignalFd(SignalFd { mask: Mutex::new(mask), kq: own, inbox: inbox.clone(), slot });
     Ok(entry)
 }
 
-/// A forked child's copy of a signalfd.
-pub(crate) fn signalfd_copy(mask: u64, nonblock: bool) -> Result<FdEntry, i64> {
-    new_signalfd(mask, nonblock)
+/// A forked child's copy of a signalfd, for the child's `inbox`.
+pub(crate) fn signalfd_copy(inbox: &Arc<Inbox>, mask: u64, nonblock: bool) -> Result<FdEntry, i64> {
+    new_signalfd(inbox, mask, nonblock)
 }
 
 /// `signalfd4(fd, mask, sizemask, flags)`: a new signalfd (fd -1), or a new
@@ -116,7 +111,7 @@ pub(super) fn signalfd4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, 
         kfd::change(signalfd.kq.as_raw_fd(), kfd::user_event(0, libc::NOTE_TRIGGER))?;
         return Ok(fd as i64);
     }
-    let entry = new_signalfd(mask, flags & O_NONBLOCK != 0)?;
+    let entry = new_signalfd(&p.inbox, mask, flags & O_NONBLOCK != 0)?;
     Ok(p.fds.insert(entry.cloexec(flags & O_CLOEXEC != 0)))
 }
 

@@ -311,8 +311,9 @@ impl FdTable {
         host
     }
 
-    /// The inverse of [`FdTable::encode`], taking host fds from `fds`.
-    pub fn decode(d: &mut Decoder, fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Self, Truncated> {
+    /// The inverse of [`FdTable::encode`], taking host fds from `fds`, for
+    /// the process with `inbox` (its signalfds).
+    pub fn decode(d: &mut Decoder, fds: &mut impl Iterator<Item = OwnedFd>, inbox: &std::sync::Arc<crate::syscall::Inbox>) -> Result<Self, Truncated> {
         let n = d.count(8)?;
         let mut slots = Vec::with_capacity(n);
         let mut epolls = Vec::new();
@@ -336,7 +337,7 @@ impl FdTable {
                 } else if kind == 5 {
                     drop(host);
                     let (mask, nonblock) = (d.u64()?, d.bool()?);
-                    crate::syscall::signalfd_copy(mask, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
+                    crate::syscall::signalfd_copy(inbox, mask, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
                 } else if kind == 4 {
                     drop(host);
                     let watches = (0..d.count(24)?)

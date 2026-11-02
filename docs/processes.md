@@ -706,6 +706,23 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    groups, sessions, terminal groups), implemented with host calls as now;
    per-process `umask`, interval timers, `getrusage`; `FIRED`, `KQUEUES`,
    `WAKERS`, `HOST_PENDING` keyed by process. Tests: all existing.
+   (Done, 2026-11-02.) `linux_abi::Kernel` (`syscall/kernel.rs`):
+   `getppid`, `getpgid`/`setpgid`, `getsid`/`setsid`, `kill` of other
+   processes and groups, `wait4`, `waitid`, `tcgetpgrp`/`tcsetpgrp`, a stop
+   signal's default action, `getrusage`, CPU clocks, umask changes; each
+   `Process` holds one (`HostKernel`: the host calls, as before). Each
+   process has an `Inbox` for what reaches it from outside its calls (host
+   signals, timer expiries, its signalfds' kqueues, its threads' wakers);
+   host signal handlers find the inbox of the process host signals are for
+   (`Process::receive_host_signals`). The umask is the process's, applied
+   to `openat` with O_CREAT, `mkdirat`, `/dev/shm` objects and Unix socket
+   `bind` (`HostKernel` also mirrors it onto the host, so Mac programs and
+   anything else the host creates still get it), and carried across fork.
+   Interval timers run on the timer threads as POSIX timers do, per
+   process, ITIMER_VIRTUAL and ITIMER_PROF on the kernel's CPU clock; their
+   signals now carry `SI_KERNEL`, as Linux's do (before, a host SIGALRM
+   arrived as `SI_USER`). `CLOCK_PROCESS_CPUTIME_ID` is still the host's,
+   for step 3.
 2. **One pool and ASIDs, still one process per VM.** `Pool` (40-bit IPA,
    512 GiB reserved, bookkeeping growing as used, reference counts, 64 KiB
    chunks) split from `AddressSpace` (page tables, VMAs, ASID, nG on user

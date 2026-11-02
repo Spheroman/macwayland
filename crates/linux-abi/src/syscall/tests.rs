@@ -1513,7 +1513,7 @@ fn inotify_goes_to_a_forked_child() {
     let mut e = crate::wire::Encoder::default();
     let host = t.p.fds.encode(&mut e);
     let mut fds = host.iter().map(|&h| unsafe { OwnedFd::from_raw_fd(libc::dup(h)) });
-    let child = crate::fs::FdTable::decode(&mut crate::wire::Decoder(&e.0), &mut fds).unwrap();
+    let child = crate::fs::FdTable::decode(&mut crate::wire::Decoder(&e.0), &mut fds, &t.p.inbox).unwrap();
     let file = child.get(fd).unwrap();
     std::fs::write(t.root().join("d/new"), "x").unwrap();
     let mut buf = [0u8; 64];

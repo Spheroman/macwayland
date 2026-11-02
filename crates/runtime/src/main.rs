@@ -133,6 +133,10 @@ fn setup(opts: &Options) -> Result<Process, String> {
             process.fs.set_cwd(cwd.into_os_string().into_encoded_bytes());
         }
     }
+    // The guest starts with the umask it was run with. (Read by setting it:
+    // there's no other way, and nothing else runs yet.)
+    let umask = unsafe { libc::umask(0o022) };
+    process.set_umask(umask as u32);
     Ok(process)
 }
 

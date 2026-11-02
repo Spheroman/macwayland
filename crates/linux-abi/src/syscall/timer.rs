@@ -1,11 +1,12 @@
-//! POSIX timers (`timer_create` and friends): a signal when a timer expires.
+//! POSIX timers (`timer_create` and friends) and interval timers
+//! (`setitimer`): a signal when a timer expires.
 //!
 //! macOS has no per-process timers like Linux's, so each armed timer is a
 //! host thread that sleeps until its deadline. On expiry it queues the
 //! signal (with Linux's timer `siginfo`: id, overrun, `sigev_value`) for the
-//! process or one thread, then gets the guest's attention the way a host
-//! signal does: kicking the vCPUs, waking threads asleep in the runtime, and
-//! interrupting a blocking host call.
+//! process or one thread, in the process's [`Inbox`], then gets the guest's
+//! attention the way a host signal does: kicking the vCPUs, waking threads
+//! asleep in the runtime, and interrupting a blocking host call.
 
 use std::{
     collections::BTreeMap,
@@ -16,7 +17,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{misc, signal, Process, Thread};
+use super::{
+    kernel::CpuClock,
+    misc,
+    signal::{self, Inbox},
+    Process, Thread,
+};
 use crate::{
     abi::Timespec,
     errno,
@@ -30,10 +36,6 @@ const TIMER_ABSTIME: u64 = 1;
 const SIGALRM: u64 = 14;
 /// `si_code` for timer signals.
 pub const SI_TIMER: i32 = -2;
-
-/// Expired timers' signals, waiting to be taken into a process's (or a
-/// thread's) pending set: (thread, siginfo).
-pub(super) static FIRED: Mutex<Vec<(Option<i64>, signal::SigInfo)>> = Mutex::new(Vec::new());
 
 /// How the core breaks every guest thread out of a blocking host call.
 static INTERRUPT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
@@ -65,6 +67,8 @@ pub(super) struct PosixTimer {
     tid: Option<i64>,
     state: Mutex<State>,
     wake: Condvar,
+    /// Where its signals go: its process's.
+    inbox: Arc<Inbox>,
 }
 
 /// A process's timers, by id.
@@ -100,7 +104,8 @@ pub(super) fn timer_create<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem
     mem.write_pod(id_out, &id)?;
     ts.next += 1;
     let state = State { deadline: None, interval: Duration::ZERO, overrun: 0, deleted: false, running: false };
-    ts.timers.insert(id, Arc::new(PosixTimer { id, clock, signo, value, notify, tid, state: Mutex::new(state), wake: Condvar::new() }));
+    let timer = PosixTimer { id, clock, signo, value, notify, tid, state: Mutex::new(state), wake: Condvar::new(), inbox: p.inbox.clone() };
+    ts.timers.insert(id, Arc::new(timer));
     Ok(0)
 }
 
@@ -194,7 +199,7 @@ fn run(timer: Arc<PosixTimer>) {
         }
         if timer.notify != SIGEV_NONE {
             let info = signal::SigInfo { signo: timer.signo, code: SI_TIMER, timer: Some((timer.id, expiries - 1, timer.value)), ..Default::default() };
-            let mut fired = FIRED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fired = timer.inbox.fired.lock().unwrap_or_else(|e| e.into_inner());
             // Still pending from last time: count it as an overrun instead.
             if let Some((_, prev)) = fired.iter_mut().find(|(tid, i)| *tid == timer.tid && i.timer.is_some_and(|t| t.0 == timer.id)) {
                 if let Some(t) = &mut prev.timer {
@@ -206,15 +211,10 @@ fn run(timer: Arc<PosixTimer>) {
             s.overrun = expiries - 1;
             drop(fired);
             drop(s);
-            signal::alert();
+            signal::alert(&timer.inbox);
             s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
         }
     }
-}
-
-/// Whether a timer's signal is waiting to be taken in.
-pub(super) fn any_fired() -> bool {
-    !FIRED.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
 /// Interrupt blocking host calls in this process, if the core said how.
@@ -223,5 +223,130 @@ pub(super) fn interrupt_host() {
     if !interrupt.is_null() {
         let interrupt: fn() = unsafe { std::mem::transmute(interrupt) };
         interrupt();
+    }
+}
+
+const SI_KERNEL: i32 = 0x80;
+
+/// A process's interval timers (`setitimer`), by `which`: ITIMER_REAL
+/// (wall time, SIGALRM), ITIMER_VIRTUAL (user CPU time, SIGVTALRM) and
+/// ITIMER_PROF (user and system CPU time, SIGPROF). As on Linux, they
+/// survive `execve`, and a forked child starts without them.
+#[derive(Debug, Default)]
+pub(super) struct ITimers([Option<Arc<ITimer>>; 3]);
+
+pub(super) struct ITimer {
+    signo: u64,
+    clock: CpuClock,
+    /// Whether the clock is CPU time, which can run faster than wall time
+    /// when several threads run.
+    cpu: bool,
+    state: Mutex<IState>,
+    wake: Condvar,
+    inbox: Arc<Inbox>,
+}
+
+impl std::fmt::Debug for ITimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ITimer").field("signo", &self.signo).finish()
+    }
+}
+
+#[derive(Debug, Default)]
+struct IState {
+    /// When it expires next, on its clock.
+    deadline: Option<Duration>,
+    interval: Duration,
+    /// A thread is sleeping for this timer.
+    running: bool,
+}
+
+/// `setitimer(which, new, old)` (`getitimer` is `new` = 0).
+pub(super) fn setitimer<M: GuestMemory + ?Sized>(p: &Process, mem: &M, which: u64, new: u64, old: u64) -> Result<i64, i64> {
+    if which > 2 {
+        return Err(errno::EINVAL);
+    }
+    // `struct itimerval`: two timevals of two longs.
+    let new = if new != 0 {
+        let v: [i64; 4] = mem.read_pod(new)?;
+        if v.iter().any(|&x| x < 0) || v[1] >= 1_000_000 || v[3] >= 1_000_000 {
+            return Err(errno::EINVAL);
+        }
+        let tv = |s: i64, us: i64| Duration::new(s as u64, us as u32 * 1000);
+        Some((tv(v[0], v[1]), tv(v[2], v[3])))
+    } else {
+        None
+    };
+    let timer = itimer(p, which as usize);
+    let mut s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
+    let now = (timer.clock)();
+    let left = s.deadline.map_or(Duration::ZERO, |d| d.saturating_sub(now).max(Duration::from_micros(1)));
+    let prev = [s.interval.as_secs() as i64, s.interval.subsec_micros() as i64, left.as_secs() as i64, left.subsec_micros() as i64];
+    if let Some((interval, value)) = new {
+        s.interval = interval;
+        s.deadline = (!value.is_zero()).then(|| now + value);
+        if s.deadline.is_some() && !s.running {
+            s.running = true;
+            let timer = timer.clone();
+            std::thread::spawn(move || run_itimer(timer));
+        }
+        timer.wake.notify_all();
+    }
+    drop(s);
+    if old != 0 {
+        mem.write_pod(old, &prev)?;
+    }
+    Ok(0)
+}
+
+/// The process's interval timer `which`, made on first use.
+fn itimer(p: &Process, which: usize) -> Arc<ITimer> {
+    let mut timers = p.itimers.lock().unwrap_or_else(|e| e.into_inner());
+    timers.0[which]
+        .get_or_insert_with(|| {
+            let (signo, clock, cpu): (u64, CpuClock, bool) = match which {
+                0 => {
+                    let start = Instant::now();
+                    (SIGALRM, Box::new(move || start.elapsed()), false)
+                }
+                1 => (26, p.kernel.cpu_clock(p, true), true),  // SIGVTALRM
+                _ => (27, p.kernel.cpu_clock(p, false), true), // SIGPROF
+            };
+            Arc::new(ITimer { signo, clock, cpu, state: Mutex::default(), wake: Condvar::new(), inbox: p.inbox.clone() })
+        })
+        .clone()
+}
+
+/// An interval timer's thread: sleep until it expires, signal, repeat while
+/// armed.
+fn run_itimer(timer: Arc<ITimer>) {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+    let mut s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let Some(deadline) = s.deadline else {
+            s.running = false;
+            return;
+        };
+        let now = (timer.clock)();
+        if now < deadline {
+            // CPU time can run up to a second a second per CPU: look again
+            // before it could have got there.
+            let wait = if timer.cpu { ((deadline - now) / cpus).max(Duration::from_millis(1)) } else { deadline - now };
+            s = timer.wake.wait_timeout(s, wait).unwrap_or_else(|e| e.into_inner()).0;
+            continue;
+        }
+        // Late (a busy host): the next period counts from now, rather than
+        // firing again at once.
+        s.deadline = (!s.interval.is_zero()).then(|| (deadline + s.interval).max(now + Duration::from_micros(100)));
+        {
+            // A standard signal: pending once, however often it fires.
+            let mut fired = timer.inbox.fired.lock().unwrap_or_else(|e| e.into_inner());
+            if !fired.iter().any(|(tid, i)| tid.is_none() && i.signo == timer.signo && i.timer.is_none()) {
+                fired.push((None, signal::SigInfo { signo: timer.signo, code: SI_KERNEL, ..Default::default() }));
+            }
+        }
+        drop(s);
+        signal::alert(&timer.inbox);
+        s = timer.state.lock().unwrap_or_else(|e| e.into_inner());
     }
 }

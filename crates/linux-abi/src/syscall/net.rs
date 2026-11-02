@@ -253,7 +253,18 @@ fn put_addr<M: GuestMemory + ?Sized>(mem: &M, addr: u64, len_ptr: u64, bytes: &[
 
 pub(super) fn bind<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, addr: u64, len: u64) -> Result<i64, i64> {
     let host = addr_to_host(p, mem, addr, len)?;
-    ok(unsafe { libc::bind(p.fds.host(fd)?, host.as_ptr().cast(), host.len() as u32) } as i64).map(|_| 0)
+    ok(unsafe { libc::bind(p.fds.host(fd)?, host.as_ptr().cast(), host.len() as u32) } as i64)?;
+    // A Unix socket's file gets the process's umask, as on Linux (the
+    // host's own may not be the process's).
+    if host.len() > 2 && host[1] as i32 == libc::AF_UNIX {
+        let path: Vec<u8> = host[2..].iter().copied().take_while(|&b| b != 0).collect();
+        if let Ok(path) = std::ffi::CString::new(path)
+            && !path.is_empty()
+        {
+            unsafe { libc::chmod(path.as_ptr(), (0o777 & !p.umask()) as libc::mode_t) };
+        }
+    }
+    Ok(0)
 }
 
 pub(super) fn connect<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, addr: u64, len: u64) -> Result<i64, i64> {

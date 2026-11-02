@@ -239,6 +239,9 @@ fn execute(space: AddressSpace, start: Start, process: &Process, thread: Thread)
     // process must not be killed by SIGPIPE.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     signal::install_interrupt();
+    // This host process runs this one Linux process: signals from the Mac
+    // side are its.
+    process.receive_host_signals();
     // Teardown order matters: vCPUs, then the VM, then the memory mapped into
     // it — so `space` is declared first (dropped last).
     let space = Space::new(space);

@@ -32,7 +32,10 @@ use std::{
     },
 };
 
-use super::{ok, path_arg, signal, Action, Process, Thread};
+use super::{
+    kernel::{ChildInfo, Waited},
+    ok, path_arg, signal, Action, Process, Thread,
+};
 use crate::{
     errno,
     fs::{FdTable, Filesystem, Target},
@@ -235,6 +238,7 @@ impl Process {
         }
         e.bytes(&t.comm).bool(self.dumpable.load(Ordering::Relaxed)).bool(self.no_new_privs.load(Ordering::Relaxed));
         self.file_maps().encode(e);
+        e.u64(self.umask() as u64);
         fds
     }
 
@@ -242,9 +246,9 @@ impl Process {
     /// one thread. `ctl` is its control socket to the parent.
     pub fn decode_forked(d: &mut Decoder, fds: Vec<OwnedFd>, ctl: OwnedFd) -> Result<(Process, Thread), Truncated> {
         let mut fds = fds.into_iter();
-        let table = FdTable::decode(d, &mut fds)?;
-        let fs = Filesystem::decode(d)?;
         let mut p = Process::new("/");
+        let table = FdTable::decode(d, &mut fds, &p.inbox)?;
+        let fs = Filesystem::decode(d)?;
         p.fds = table;
         p.fs = fs;
         p.set_exe(d.bytes()?);
@@ -259,6 +263,8 @@ impl Process {
         p.dumpable.store(d.bool()?, Ordering::Relaxed);
         p.no_new_privs.store(d.bool()?, Ordering::Relaxed);
         *p.file_maps() = super::mem::FileMaps::decode(d)?;
+        // The host process is new: its umask may not be the parent's now.
+        p.set_umask(d.u64()? as u32);
         p.parent_ctl = Some(ctl);
         Ok((p, t))
     }
@@ -319,7 +325,7 @@ impl Process {
 /// group (EACCES), though Linux lets a parent do it to its forked children
 /// (shells do, for each pipeline). So such a child is asked to do it itself,
 /// over its control socket, and the parent waits for the answer.
-pub(super) fn setpgid(p: &Process, pid: i64, pgid: i64) -> Result<i64, i64> {
+pub(super) fn host_setpgid(p: &Process, pid: i64, pgid: i64) -> Result<i64, i64> {
     if unsafe { libc::setpgid(pid as i32, pgid as i32) } == 0 {
         return Ok(0);
     }
@@ -724,6 +730,19 @@ pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, pid: u64, sta
     if options & !(WNOHANG | WUNTRACED | WCONTINUED | WALL_ETC) != 0 {
         return Err(errno::EINVAL);
     }
+    let Some(got) = p.kernel.wait4(p, pid as i64, options)? else { return Ok(0) };
+    if status != 0 {
+        mem.write_pod(status, &got.status)?;
+    }
+    if rusage != 0 {
+        mem.write(rusage, &got.rusage)?;
+    }
+    Ok(got.pid)
+}
+
+/// [`wait4`] when each Linux process is a host process: the host's `wait4`,
+/// its status in Linux's terms.
+pub(super) fn host_wait4(p: &Process, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
     let mut host_opts = 0;
     if options & WNOHANG != 0 {
         host_opts |= libc::WNOHANG;
@@ -737,7 +756,7 @@ pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, pid: u64, sta
     // The host process may have children the guest didn't fork (the runtime's
     // spare, see the core's fork): they don't count, and are skipped if they
     // turn up.
-    let any = (pid as i64) <= 0;
+    let any = pid <= 0;
     if any && p.children().ctl.is_empty() {
         return Err(errno::ECHILD);
     }
@@ -746,7 +765,7 @@ pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, pid: u64, sta
     let got = loop {
         let got = ok(unsafe { libc::wait4(pid as i32, &mut st, host_opts, &mut ru) } as i64)?;
         if got == 0 {
-            return Ok(0);
+            return Ok(None);
         }
         if !any || p.children().ctl.contains_key(&got) {
             break got;
@@ -756,16 +775,7 @@ pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, mem: &M, pid: u64, sta
     if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
         p.children().reaped(got);
     }
-    if status != 0 {
-        mem.write_pod(status, &linux)?;
-    }
-    if rusage != 0 {
-        // `struct rusage` is laid out the same on both: two timevals and
-        // fourteen longs.
-        let bytes = unsafe { std::slice::from_raw_parts((&ru as *const libc::rusage).cast::<u8>(), 144) };
-        mem.write(rusage, bytes)?;
-    }
-    Ok(got)
+    Ok(Some(Waited { pid: got, status: linux, rusage: super::kernel::rusage_bytes(&ru) }))
 }
 
 /// `waitid(idtype, id, infop, options, rusage)`.
@@ -774,19 +784,43 @@ pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, mem: &M, idtype: u64,
     const WEXITED: u64 = 4;
     const WNOWAIT: u64 = 0x0100_0000;
     const SIGCHLD: i32 = 17;
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
-    const CLD_DUMPED: i32 = 3;
     if options & !(WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | WALL_ETC) != 0
         || options & (WSTOPPED | WEXITED | WCONTINUED) == 0
     {
         return Err(errno::EINVAL);
     }
+    if idtype > 2 {
+        return Err(errno::EINVAL);
+    }
+    let mut out = [0u8; 128];
+    if let Some(child) = p.kernel.waitid(p, idtype, id, options)? {
+        let fields: [(usize, i32); 5] = [(0, SIGCHLD), (8, child.code), (16, child.pid as i32), (20, child.uid as i32), (24, child.status)];
+        for (off, v) in fields {
+            out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    if infop != 0 {
+        mem.write(infop, &out)?;
+    }
+    if rusage != 0 {
+        mem.write(rusage, &[0u8; 144])?;
+    }
+    Ok(0)
+}
+
+/// [`waitid`] when each Linux process is a host process: the host's
+/// `waitid`, in Linux's terms.
+pub(super) fn host_waitid(p: &Process, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WNOWAIT: u64 = 0x0100_0000;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
     let idtype = match idtype {
         0 => libc::P_ALL,
         1 => libc::P_PID,
-        2 => libc::P_PGID,
-        _ => return Err(errno::EINVAL),
+        _ => libc::P_PGID,
     };
     let mut host_opts = 0;
     for (l, d) in [(WNOHANG, libc::WNOHANG), (WSTOPPED, libc::WSTOPPED), (WEXITED, libc::WEXITED), (WCONTINUED, libc::WCONTINUED), (WNOWAIT, libc::WNOWAIT)] {
@@ -810,35 +844,25 @@ pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, mem: &M, idtype: u64,
             unsafe { libc::waitpid(info.si_pid, std::ptr::null_mut(), libc::WNOHANG) };
         }
     }
-    let mut out = [0u8; 128];
-    if info.si_pid != 0 {
-        let pid = info.si_pid as i64;
-        let (mut code, mut status) = (info.si_code, info.si_status);
-        match code {
-            CLD_EXITED if status >= 128 => {
-                let mut children = p.children();
-                children.poll(pid);
-                if let Some(&sig) = children.killed.get(&pid) {
-                    (code, status) = (CLD_KILLED, sig as i32);
-                }
+    if info.si_pid == 0 {
+        return Ok(None);
+    }
+    let pid = info.si_pid as i64;
+    let (mut code, mut status) = (info.si_code, info.si_status);
+    match code {
+        CLD_EXITED if status >= 128 => {
+            let mut children = p.children();
+            children.poll(pid);
+            if let Some(&sig) = children.killed.get(&pid) {
+                (code, status) = (CLD_KILLED, sig as i32);
             }
-            CLD_KILLED | CLD_DUMPED => status = signal::from_darwin(status) as i32,
-            CLD_EXITED => {}
-            _ => status = signal::from_darwin(status) as i32, // stopped, continued, trapped
         }
-        if options & WNOWAIT == 0 && matches!(code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) {
-            p.children().reaped(pid);
-        }
-        let fields: [(usize, i32); 5] = [(0, SIGCHLD), (8, code), (16, pid as i32), (20, info.si_uid as i32), (24, status)];
-        for (off, v) in fields {
-            out[off..off + 4].copy_from_slice(&v.to_le_bytes());
-        }
+        CLD_KILLED | CLD_DUMPED => status = signal::from_darwin(status) as i32,
+        CLD_EXITED => {}
+        _ => status = signal::from_darwin(status) as i32, // stopped, continued, trapped
     }
-    if infop != 0 {
-        mem.write(infop, &out)?;
+    if options & WNOWAIT == 0 && matches!(code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) {
+        p.children().reaped(pid);
     }
-    if rusage != 0 {
-        mem.write(rusage, &[0u8; 144])?;
-    }
-    Ok(0)
+    Ok(Some(ChildInfo { pid, uid: info.si_uid, code, status }))
 }

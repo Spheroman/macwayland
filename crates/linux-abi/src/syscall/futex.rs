@@ -75,27 +75,6 @@ impl Default for Waker {
     }
 }
 
-/// Every thread's waker, for waking them all from outside (a timer).
-static WAKERS: Mutex<Vec<std::sync::Weak<Waker>>> = Mutex::new(Vec::new());
-
-impl Waker {
-    /// A new waker that [`wake_all_wakers`] reaches.
-    pub fn registered() -> Arc<Waker> {
-        let w = Arc::new(Waker::new());
-        let mut all = WAKERS.lock().unwrap_or_else(|e| e.into_inner());
-        all.retain(|w| w.strong_count() > 0);
-        all.push(Arc::downgrade(&w));
-        w
-    }
-}
-
-/// Wake every thread sleeping in the runtime (to look at signals).
-pub(super) fn wake_all_wakers() {
-    for w in WAKERS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()) {
-        w.wake();
-    }
-}
-
 #[derive(Debug)]
 struct Waiter {
     bitset: u32,

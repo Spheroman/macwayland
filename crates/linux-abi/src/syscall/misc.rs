@@ -40,34 +40,6 @@ pub(super) fn clock_gettime<M: GuestMemory + ?Sized>(mem: &M, id: u64, out: u64,
     Ok(0)
 }
 
-/// `setitimer(which, new, old)` (`getitimer` is `new` = 0): the host's
-/// interval timers, whose signals (SIGALRM...) come back as host signals.
-pub(super) fn setitimer<M: GuestMemory + ?Sized>(mem: &M, which: u64, new: u64, old: u64) -> Result<i64, i64> {
-    if which > 2 {
-        return Err(errno::EINVAL);
-    }
-    // `struct itimerval`: two timevals of two longs (Darwin's usec is an int).
-    let to_host = |v: [i64; 4]| libc::itimerval {
-        it_interval: libc::timeval { tv_sec: v[0], tv_usec: v[1] as i32 },
-        it_value: libc::timeval { tv_sec: v[2], tv_usec: v[3] as i32 },
-    };
-    let mut prev: libc::itimerval = unsafe { std::mem::zeroed() };
-    if new != 0 {
-        let v: [i64; 4] = mem.read_pod(new)?;
-        if v.iter().any(|&x| x < 0) || v[1] >= 1_000_000 || v[3] >= 1_000_000 {
-            return Err(errno::EINVAL);
-        }
-        ok(unsafe { libc::setitimer(which as i32, &to_host(v), &mut prev) } as i64)?;
-    } else {
-        ok(unsafe { libc::getitimer(which as i32, &mut prev) } as i64)?;
-    }
-    if old != 0 {
-        let i = &prev;
-        mem.write_pod(old, &[i.it_interval.tv_sec, i.it_interval.tv_usec as i64, i.it_value.tv_sec, i.it_value.tv_usec as i64])?;
-    }
-    Ok(0)
-}
-
 /// `gettimeofday`. The timezone argument is obsolete; Linux fills it with
 /// zeros unless the clock was set with one, which nothing does any more.
 pub(super) fn gettimeofday<M: GuestMemory + ?Sized>(mem: &M, tv: u64, tz: u64) -> Result<i64, i64> {
@@ -161,18 +133,10 @@ pub(super) fn prlimit64<M: GuestMemory + ?Sized>(p: &Process, mem: &M, pid: u64,
     Ok(0)
 }
 
-/// `getrusage`: the host's, whose `struct rusage` has the same layout.
-pub(super) fn getrusage<M: GuestMemory + ?Sized>(mem: &M, who: u64, out: u64) -> Result<i64, i64> {
-    let who = match who as i64 {
-        0 => libc::RUSAGE_SELF,
-        -1 => libc::RUSAGE_CHILDREN,
-        1 => libc::RUSAGE_SELF, // RUSAGE_THREAD: one thread so far
-        _ => return Err(errno::EINVAL),
-    };
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    ok(unsafe { libc::getrusage(who, &mut ru) } as i64)?;
-    let bytes = unsafe { std::slice::from_raw_parts((&ru as *const libc::rusage).cast::<u8>(), 144) };
-    mem.write(out, bytes)?;
+/// `getrusage`: the process's, its children's, or the thread's, from the
+/// kernel's accounting.
+pub(super) fn getrusage<M: GuestMemory + ?Sized>(p: &Process, mem: &M, who: u64, out: u64) -> Result<i64, i64> {
+    mem.write(out, &p.kernel.rusage(p, who as i64)?)?;
     Ok(0)
 }
 

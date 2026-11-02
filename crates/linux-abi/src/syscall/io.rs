@@ -333,15 +333,14 @@ pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, req:
             }
             Ok(0)
         }
-        // Guest pids are host pids.
         ioctl::TIOCGPGRP => {
-            let pgrp = ok(unsafe { libc::tcgetpgrp(host) } as i64)? as i32;
+            let pgrp = p.kernel.tcgetpgrp(p, host)? as i32;
             mem.write_pod(arg, &pgrp)?;
             Ok(0)
         }
         ioctl::TIOCSPGRP => {
             let pgrp: i32 = mem.read_pod(arg)?;
-            ok(unsafe { libc::tcsetpgrp(host, pgrp) } as i64).map(|_| 0)
+            p.kernel.tcsetpgrp(p, host, pgrp as i64)
         }
         // No reflinks to be had into an existing file on macOS (clonefile
         // makes a new one): what Linux says on a file system without them,

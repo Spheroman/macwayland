@@ -70,6 +70,7 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
     }
     let entry = match r.target {
         Target::Host(h) => {
+            let mode = mode as u32 & !p.umask();
             let fd = match ok(unsafe { libc::open(h.as_ptr(), abi::open_flags_to_darwin(flags), mode as libc::c_uint) } as i64) {
                 Ok(fd) => fd as i32,
                 Err(errno::ENOENT) if flags & 3 == 0 && let Some(contents) = stand_in(p, &r.guest) => {
@@ -83,7 +84,7 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
         }
         Target::Proc(rest) => proc::open(p, mem, &rest)?,
         Target::Shm(name) => {
-            let fd = shm::open_named(&name, abi::open_flags_to_darwin(flags), mode as u32)?;
+            let fd = shm::open_named(&name, abi::open_flags_to_darwin(flags), mode as u32 & !p.umask())?;
             FdEntry::new(fd).path(r.guest)
         }
     };
@@ -294,7 +295,7 @@ pub(super) fn faccessat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u6
 
 pub(super) fn mkdirat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64, mode: u64) -> Result<i64, i64> {
     let h = host_only(resolve(p, mem, dirfd, path, false)?)?;
-    ok(unsafe { libc::mkdir(h.as_ptr(), mode as libc::mode_t) } as i64).map(|_| 0)
+    ok(unsafe { libc::mkdir(h.as_ptr(), (mode as u32 & !p.umask()) as libc::mode_t) } as i64).map(|_| 0)
 }
 
 pub(super) fn unlinkat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64, flags: u64) -> Result<i64, i64> {

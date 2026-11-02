@@ -10,6 +10,7 @@ mod epoll;
 mod futex;
 mod inotify;
 mod io;
+mod kernel;
 mod kfd;
 mod mem;
 mod misc;
@@ -29,17 +30,21 @@ pub(crate) use kfd::{eventfd_copy, timerfd_copy};
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::SignalFd;
 pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
+pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, Waited, RUSAGE_SIZE};
 pub use timer::set_interrupt;
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
 pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
-pub use signal::{set_kick, set_yield_check, Delivery, HandlerCall, SigInfo, StackT, HOST_PENDING};
+pub use signal::{set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::fd::{AsFd, OwnedFd},
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::{
@@ -92,6 +97,16 @@ pub struct Process {
     unimplemented: Mutex<BTreeSet<String>>,
     /// Which files are mapped where.
     file_maps: Mutex<mem::FileMaps>,
+    /// What the process asks of the world outside it: other processes,
+    /// groups, sessions, accounting (the host's own, in 1:1 mode).
+    pub kernel: Arc<dyn Kernel>,
+    /// Signals and timer expiries from outside its system calls, and who
+    /// to wake for them.
+    pub(crate) inbox: Arc<Inbox>,
+    /// The file mode creation mask.
+    umask: AtomicU32,
+    /// Interval timers (`setitimer`).
+    itimers: Mutex<timer::ITimers>,
 }
 
 /// What other threads need of a thread: where to put signals for it, and how
@@ -122,17 +137,21 @@ pub struct Thread {
     /// `set_tid_address` / CLONE_CHILD_CLEARTID: zeroed, and futex-woken, when
     /// the thread exits (how `pthread_join` knows).
     pub clear_child_tid: u64,
+    /// Its process's inbox, whose alerts reach its waker.
+    inbox: Arc<Inbox>,
 }
 
 impl Thread {
     /// The process's first thread (tid = pid).
     pub fn main(p: &Process) -> Thread {
-        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker: Waker::registered(), clear_child_tid: 0 }
+        let waker = p.inbox.new_waker();
+        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker, clear_child_tid: 0, inbox: p.inbox.clone() }
     }
 
     /// A thread `self` creates (`clone` with CLONE_THREAD), as tid `tid`.
     pub fn spawn(&self, tid: i64) -> Thread {
-        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker: Waker::registered(), clear_child_tid: 0 }
+        let waker = self.inbox.new_waker();
+        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker, clear_child_tid: 0, inbox: self.inbox.clone() }
     }
 
     /// The signals it blocks (Linux numbering, bit n-1 for signal n).
@@ -162,7 +181,24 @@ impl Process {
             timers: Mutex::default(),
             unimplemented: Mutex::default(),
             file_maps: Mutex::default(),
+            kernel: Arc::new(HostKernel),
+            inbox: Arc::default(),
+            umask: AtomicU32::new(0o022),
+            itimers: Mutex::default(),
         }
+    }
+
+    /// The file mode creation mask.
+    pub fn umask(&self) -> u32 {
+        self.umask.load(Ordering::Relaxed)
+    }
+
+    /// Set the file mode creation mask (and tell the kernel), returning the
+    /// old one.
+    pub fn set_umask(&self, mask: u32) -> u32 {
+        let old = self.umask.swap(mask & 0o777, Ordering::Relaxed);
+        self.kernel.umask_changed(self, mask & 0o777);
+        old
     }
 
     pub(crate) fn file_maps(&self) -> std::sync::MutexGuard<'_, mem::FileMaps> {
@@ -270,6 +306,13 @@ impl Process {
     }
 }
 
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Host signal handlers mustn't look for its inbox any more.
+        self.stop_receiving_host_signals();
+    }
+}
+
 /// What the core should do after a system call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -320,17 +363,16 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::SET_ROBUST_LIST => Ok(0),
         nr::GETPID => Ok(p.pid),
         nr::GETTID => Ok(t.tid),
-        nr::GETPPID => Ok(unsafe { libc::getppid() } as i64),
+        nr::GETPPID => Ok(p.kernel.getppid(p)),
         nr::GETUID => Ok(unsafe { libc::getuid() } as i64),
         nr::GETEUID => Ok(unsafe { libc::geteuid() } as i64),
         nr::GETGID => Ok(unsafe { libc::getgid() } as i64),
         nr::GETEGID => Ok(unsafe { libc::getegid() } as i64),
         nr::GETGROUPS => misc::getgroups(mem, a0, a1),
-        // The guest process is the host process: same pid, group and session.
-        nr::GETPGID => ok(unsafe { libc::getpgid(a0 as i32) } as i64),
-        nr::SETPGID => process::setpgid(p, a0 as i32 as i64, a1 as i32 as i64),
-        nr::GETSID => ok(unsafe { libc::getsid(a0 as i32) } as i64),
-        nr::SETSID => ok(unsafe { libc::setsid() } as i64),
+        nr::GETPGID => p.kernel.getpgid(p, a0 as i32 as i64),
+        nr::SETPGID => p.kernel.setpgid(p, a0 as i32 as i64, a1 as i32 as i64),
+        nr::GETSID => p.kernel.getsid(p, a0 as i32 as i64),
+        nr::SETSID => p.kernel.setsid(p),
         nr::SETUID => misc::setids(&[a0], false),
         nr::SETGID => misc::setids(&[a0], true),
         nr::SETREUID => misc::setids(&[a0, a1], false),
@@ -378,7 +420,7 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::CLOCK_GETTIME => misc::clock_gettime(mem, a0, a1, false),
         nr::CLOCK_GETRES => misc::clock_gettime(mem, a0, a1, true),
         nr::GETTIMEOFDAY => misc::gettimeofday(mem, a0, a1),
-        nr::GETRUSAGE => misc::getrusage(mem, a0, a1),
+        nr::GETRUSAGE => misc::getrusage(p, mem, a0, a1),
         nr::SYSINFO => misc::sysinfo(mem, a0),
         nr::SCHED_GETAFFINITY => misc::sched_getaffinity(mem, a1, a2),
         // macOS has no CPU affinity: accept any mask, as if the scheduler
@@ -401,13 +443,13 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::KILL => signal::kill(p, a0 as i64, a1),
         nr::TKILL => signal::tkill(p, t, None, a0 as i64, a1),
         nr::TGKILL => signal::tkill(p, t, Some(a0 as i64), a1 as i64, a2),
-        nr::SETITIMER => misc::setitimer(mem, a0, a1, a2),
+        nr::SETITIMER => timer::setitimer(p, mem, a0, a1, a2),
         nr::TIMER_CREATE => timer::timer_create(p, t, mem, a0, a1, a2),
         nr::TIMER_SETTIME => timer::timer_settime(p, mem, a0, a1, a2, a3),
         nr::TIMER_GETTIME => timer::timer_gettime(p, mem, a0, a1),
         nr::TIMER_GETOVERRUN => timer::timer_getoverrun(p, a0),
         nr::TIMER_DELETE => timer::timer_delete(p, a0),
-        nr::GETITIMER => misc::setitimer(mem, a0, 0, a1),
+        nr::GETITIMER => timer::setitimer(p, mem, a0, 0, a1),
 
         nr::BRK => Ok(mem.brk(a0) as i64),
         nr::MMAP => mem::mmap(p, mem, args),
@@ -483,7 +525,7 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::GETCWD => path::getcwd(p, mem, a0, a1),
         nr::CHDIR => path::chdir(p, mem, a0),
         nr::FCHDIR => path::fchdir(p, a0),
-        nr::UMASK => Ok(unsafe { libc::umask(a0 as libc::mode_t & 0o777) } as i64),
+        nr::UMASK => Ok(p.set_umask(a0 as u32) as i64),
 
         nr::SOCKET => net::socket(p, a0, a1, a2),
         nr::SOCKETPAIR => net::socketpair(p, mem, a0, a1, a2, a3),
