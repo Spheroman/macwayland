@@ -1,9 +1,12 @@
 // Sockets passed in SCM_RIGHTS while the socket carrying them is itself in
 // flight (as Firefox hands a child its IPC socket through its fork server),
 // and the end of the file once they arrive: see the in_flight module in
-// crates/linux-abi/src/syscall/net.rs.
+// crates/linux-abi/src/syscall/net.rs. Also a directory fd passed the
+// same way, used with fchdir and as a dirfd, as wineserver's clients do.
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +89,42 @@ int main(void) {
     struct pollfd p = { ipc[0], POLLIN, 0 };
     CHECK(poll(&p, 1, 2000) == 1);
     CHECK(read(ipc[0], buf, sizeof buf) == 0);
+
+    // A directory opened by another process: list it after fchdir, and
+    // open a file in it.
+    char dir[] = "/tmp/macwl-passfd-XXXXXX";
+    CHECK(mkdtemp(dir));
+    char file[64];
+    snprintf(file, sizeof file, "%s/inside", dir);
+    int f = open(file, O_CREAT | O_WRONLY, 0600);
+    CHECK(f >= 0);
+    close(f);
+    int pair[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int d = open(dir, O_RDONLY | O_DIRECTORY);
+        CHECK(d >= 0);
+        send_fd(pair[1], d);
+        _exit(0);
+    }
+    int d = recv_fd(pair[0]);
+    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    int in = openat(d, "inside", O_RDONLY);
+    CHECK(in >= 0);
+    close(in);
+    int cwd = open(".", O_RDONLY);
+    CHECK(fchdir(d) == 0);
+    DIR *list = opendir(".");
+    CHECK(list);
+    int found = 0;
+    struct dirent *e;
+    while ((e = readdir(list))) found |= !strcmp(e->d_name, "inside");
+    closedir(list);
+    CHECK(found);
+    CHECK(fchdir(cwd) == 0);
+    CHECK(unlink(file) == 0 && rmdir(dir) == 0);
     puts("passfd ok");
     return 0;
 }

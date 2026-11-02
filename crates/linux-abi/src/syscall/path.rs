@@ -104,7 +104,7 @@ fn stand_in(p: &Process, guest: &[u8]) -> Option<String> {
 
 /// The canonical host path of an open file (with a host root, also its guest
 /// path): one `fcntl`, where resolving it ourselves would take a walk.
-fn host_fd_path(fd: i32) -> Option<Vec<u8>> {
+pub(super) fn host_fd_path(fd: i32) -> Option<Vec<u8>> {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
         return None;

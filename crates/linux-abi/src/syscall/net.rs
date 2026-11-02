@@ -343,6 +343,15 @@ pub(super) fn recvfrom<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, b
     Ok(n)
 }
 
+/// The guest path of a directory fd received from another process.
+fn received_dir_path(p: &Process, host: i32) -> Option<Vec<u8>> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(host, &mut st) } < 0 || st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return None;
+    }
+    Some(p.fs.guest_path_of_host(&super::path::host_fd_path(host)?))
+}
+
 /// Parse Linux control messages; only SCM_RIGHTS is supported. Returns the
 /// host fds to pass.
 fn guest_rights(p: &Process, control: &[u8]) -> Result<Vec<i32>, i64> {
@@ -621,7 +630,13 @@ pub(super) fn recvmsg<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, ms
                         truncated = true; // dropping `host` closes it
                         continue;
                     }
-                    let entry = FdEntry::new(host).cloexec(flags & MSG_CMSG_CLOEXEC != 0);
+                    let mut entry = FdEntry::new(host).cloexec(flags & MSG_CMSG_CLOEXEC != 0);
+                    // A directory needs its path to be a dirfd or the target
+                    // of fchdir: wineserver opens directories for its
+                    // clients, which list them after an fchdir.
+                    if let Some(guest) = received_dir_path(p, entry.host.as_raw_fd()) {
+                        entry = entry.path(guest);
+                    }
                     received.push(p.fds.insert(entry) as i32);
                 }
             }
