@@ -230,6 +230,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // With many processes in the VM, the terminal it was started in is
+    // relayed to a pty of the host's (in 1:1 the Mac's own driver does
+    // job control).
+    macwl_runtime::relay_terminal();
     let argv: Vec<&[u8]> = opts.args.iter().map(|a| a.as_bytes()).collect();
     // A minimal Linux-flavoured environment rather than the Mac's, plus what
     // a Wayland client needs to find the compositor (and D-Bus clients the

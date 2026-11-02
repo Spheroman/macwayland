@@ -529,11 +529,38 @@ impl Process {
         if self.signals().drops(info.signo, 0) {
             return;
         }
+        self.discard_contrary(info.signo);
         self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner()).push((tid, info));
         self.signal_added();
         match tid {
             Some(tid) => self.wake_thread(tid),
             None => self.wake_all_threads(),
+        }
+    }
+
+    /// Whether thread `t` blocks or ignores `sig` (SIG_IGN): what Linux's
+    /// terminal checks call ignored.
+    pub fn blocks_or_ignores(&self, t: &Thread, sig: u64) -> bool {
+        t.signals.blocked & bit(sig) != 0 || self.signals().actions[sig as usize - 1].handler == SIG_IGN
+    }
+
+    /// `sig` is being sent: as Linux does as it's generated, a SIGCONT
+    /// discards pending stop signals, and a stop signal a pending SIGCONT
+    /// (so a job continued just after it was told to stop runs on).
+    fn discard_contrary(&self, sig: u64) {
+        const SIGCONT: u64 = 18;
+        let gone = match sig {
+            SIGCONT => STOPS,
+            19..=22 => bit(SIGCONT),
+            _ => return,
+        };
+        self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, i)| bit(i.signo) & gone == 0);
+        let mut s = self.signals();
+        for sig in (1..=NSIG).filter(|&g| gone & bit(g) != 0) {
+            s.pending.discard(sig);
+            for h in self.inbox.threads().values() {
+                h.pending.lock().unwrap_or_else(|e| e.into_inner()).discard(sig);
+            }
         }
     }
 
@@ -707,6 +734,8 @@ impl Process {
 /// The signals the terminal sends a process that touches it from the
 /// background: SIGTSTP, SIGTTIN, SIGTTOU.
 const JOB_CONTROL: u64 = (1 << (20 - 1)) | (1 << (21 - 1)) | (1 << (22 - 1));
+/// The stop signals: SIGSTOP and the job-control ones.
+const STOPS: u64 = JOB_CONTROL | (1 << (19 - 1));
 
 impl Thread {
     /// `rt_sigreturn`: the handler's done; back to the mask it saved.
@@ -935,6 +964,7 @@ pub(super) fn kill(p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
 /// `kill` of the caller's own process.
 pub(super) fn kill_self(p: &Process, sig: u64) -> Result<i64, i64> {
     if sig != 0 {
+        p.discard_contrary(sig);
         let mut s = p.signals();
         if !s.drops(sig, 0) {
             s.pending.add(SigInfo::user(sig, SI_USER, p.pid));

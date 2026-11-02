@@ -40,6 +40,12 @@ pub struct OpenFile {
     /// Whether a call on it can block (a pipe, socket, device), found out
     /// the first time it's asked.
     can_block: std::sync::OnceLock<bool>,
+    /// Which pty it's an end of, if any, found out the first time it's
+    /// asked.
+    tty: std::sync::OnceLock<Option<crate::syscall::TtyId>>,
+    /// What to do as the last reference to it goes (a pty master's hangup,
+    /// with many processes in a host).
+    on_close: CloseHook,
 }
 
 impl OpenFile {
@@ -47,6 +53,35 @@ impl OpenFile {
     /// directory).
     pub fn can_block(&self) -> bool {
         *self.can_block.get_or_init(|| crate::syscall::can_block(self.host.as_raw_fd()))
+    }
+
+    /// The pty it's an end of, if it is one.
+    pub fn tty(&self) -> Option<crate::syscall::TtyId> {
+        *self.tty.get_or_init(|| if self.can_block() { crate::syscall::tty_of(self.host.as_raw_fd()) } else { None })
+    }
+
+    /// Run `f` as the file closes for good (its last guest fd closed, and
+    /// no call holding it), before its host fd closes.
+    pub fn on_close(&self, f: Box<dyn FnOnce() + Send>) {
+        *self.on_close.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_close.0.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            f();
+        }
+    }
+}
+
+/// A file's [`OpenFile::on_close`].
+#[derive(Default)]
+struct CloseHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl std::fmt::Debug for CloseHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CloseHook")
     }
 }
 
@@ -120,7 +155,7 @@ impl FdEntry {
     }
 
     fn open(self) -> Slot {
-        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(self.dir), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default() };
+        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(self.dir), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default(), tty: Default::default(), on_close: Default::default() };
         Slot { file: Arc::new(file), cloexec: self.cloexec }
     }
 }

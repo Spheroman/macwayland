@@ -6,7 +6,7 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use super::{gather, iov_len, iovecs, kfd, ok, path_arg, scatter, tty, Process, Thread, MAX_IO};
+use super::{gather, iov_len, iovecs, kfd, ok, path_arg, scatter, tty, Process, Thread, TtyOp, MAX_IO};
 use crate::{
     abi::{self, fcntl, ioctl, o, PollFd, Timespec, POLLRDHUP},
     errno,
@@ -40,7 +40,15 @@ fn read_host(p: &Process, t: &Thread, fd: u64, data: &mut [u8], off: Option<u64>
         return Ok(n as i64);
     }
     if off.is_none() {
-        super::block::ready(p, t, &entry, libc::POLLIN)?;
+        // A terminal read from the background: SIGTTIN, as Linux's line
+        // discipline checks before it waits.
+        let wait = match entry.tty() {
+            Some(tty) if !tty.master => p.kernel.tty_access(p, t, &entry, TtyOp::Read)?,
+            _ => true,
+        };
+        if wait {
+            super::block::ready(p, t, &entry, libc::POLLIN)?;
+        }
     }
     let ptr = data.as_mut_ptr().cast();
     ok(match off {
@@ -71,8 +79,21 @@ fn write_host(p: &Process, t: &Thread, fd: u64, data: &[u8], off: Option<u64>) -
         }
         return Ok(n as i64);
     }
+    let tty = if off.is_none() { entry.tty() } else { None };
+    if let Some(tty) = tty
+        && !tty.master
+    {
+        p.kernel.tty_access(p, t, &entry, TtyOp::Write)?;
+    }
     if off.is_none() {
         super::block::ready(p, t, &entry, libc::POLLOUT)?;
+    }
+    // Typed input, through the line discipline's signal characters.
+    if let Some(tty) = tty
+        && tty.master
+        && let Some(r) = p.kernel.write_master(p, &entry, data)
+    {
+        return r;
     }
     let ptr = data.as_ptr().cast();
     match off {
@@ -292,8 +313,16 @@ pub(super) fn set_nonblocking(host: i32, on: bool) -> Result<(), i64> {
     ok(unsafe { libc::fcntl(host, libc::F_SETFL, new) } as i64).map(|_| ())
 }
 
-pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, req: u64, arg: u64) -> Result<i64, i64> {
-    let host = p.fds.host(fd)?;
+pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, req: u64, arg: u64) -> Result<i64, i64> {
+    let file = p.fds.get(fd)?;
+    let host = file.host.as_raw_fd();
+    // Changing a terminal from the background: SIGTTOU, as Linux checks
+    // (`tcsetpgrp` checks for itself).
+    if matches!(req, tty::TCSETS | tty::TCSETSW | tty::TCSETSF | tty::TCSETS2 | tty::TCSETSW2 | tty::TCSETSF2 | tty::TCSBRK | tty::TCXONC | tty::TCFLSH)
+        && file.tty().is_some()
+    {
+        p.kernel.tty_access(p, t, &file, TtyOp::Change)?;
+    }
     match req {
         ioctl::TIOCGWINSZ => {
             let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -324,34 +353,51 @@ pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd: u64, req:
         tty::TCGETS | tty::TCSETS | tty::TCSETSW | tty::TCSETSF | tty::TCGETS2 | tty::TCSETS2 | tty::TCSETSW2 | tty::TCSETSF2 | tty::TCSBRK | tty::TCXONC | tty::TCFLSH => {
             tty::ioctl(mem, host, req, arg)
         }
-        tty::TIOCGPTN | tty::TIOCSPTLCK | tty::TIOCGPTPEER | tty::TIOCSCTTY | tty::TIOCNOTTY => {
+        tty::TIOCGPTN | tty::TIOCSPTLCK | tty::TIOCGPTPEER => {
             tty::pty_ioctl(mem, host, req, arg, |flags| {
                 let mut name = [0 as libc::c_char; 128];
                 ok(unsafe { libc::ioctl(host, libc::TIOCPTYGNAME as u64, name.as_mut_ptr()) } as i64)?;
                 let fd = ok(unsafe { libc::open(name.as_ptr(), flags | libc::O_NOCTTY) } as i64)? as i32;
                 let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_bytes().to_vec();
-                Ok(p.fds.insert(FdEntry::new(unsafe { OwnedFd::from_raw_fd(fd) }).path(path).cloexec(arg & o::CLOEXEC != 0)))
+                let new = p.fds.insert(FdEntry::new(unsafe { OwnedFd::from_raw_fd(fd) }).path(path).cloexec(arg & o::CLOEXEC != 0));
+                if let Ok(slave) = p.fds.get(new as u64) {
+                    p.kernel.tty_opened(p, &slave, arg & o::NOCTTY != 0);
+                }
+                Ok(new)
             })
+        }
+        tty::TIOCSCTTY | tty::TIOCNOTTY | tty::TIOCGSID if file.tty().is_none() && unsafe { libc::isatty(host) } == 0 => Err(errno::ENOTTY),
+        tty::TIOCSCTTY => p.kernel.set_ctty(p, &file, arg == 1),
+        tty::TIOCNOTTY => p.kernel.drop_ctty(p, &file),
+        tty::TIOCGSID => {
+            let sid = p.kernel.tcgetsid(p, &file)? as i32;
+            mem.write_pod(arg, &sid)?;
+            Ok(0)
         }
         ioctl::TIOCSWINSZ => {
             let v: [u16; 4] = mem.read_pod(arg)?;
             let ws = libc::winsize { ws_row: v[0], ws_col: v[1], ws_xpixel: v[2], ws_ypixel: v[3] };
+            let old = tty::winsize(host);
             if unsafe { libc::ioctl(host, libc::TIOCSWINSZ, &ws) } < 0 {
                 // macOS only sizes a pty once its slave is open; Linux any
                 // time. Keep it for when the slave is opened.
                 let e = super::last_errno();
                 return if tty::park_winsize(p, host, &ws) { Ok(0) } else { Err(e) };
             }
+            let same = old.is_some_and(|o| (o.ws_row, o.ws_col, o.ws_xpixel, o.ws_ypixel) == (ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel));
+            if !same {
+                p.kernel.winsize_changed(p, &file);
+            }
             Ok(0)
         }
         ioctl::TIOCGPGRP => {
-            let pgrp = p.kernel.tcgetpgrp(p, host)? as i32;
+            let pgrp = p.kernel.tcgetpgrp(p, &file)? as i32;
             mem.write_pod(arg, &pgrp)?;
             Ok(0)
         }
         ioctl::TIOCSPGRP => {
             let pgrp: i32 = mem.read_pod(arg)?;
-            p.kernel.tcsetpgrp(p, host, pgrp as i64)
+            p.kernel.tcsetpgrp(p, t, &file, pgrp as i64)
         }
         // No reflinks to be had into an existing file on macOS (clonefile
         // makes a new one): what Linux says on a file system without them,

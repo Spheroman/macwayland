@@ -14,11 +14,15 @@ mod cputime;
 mod fork;
 mod host;
 mod park;
+mod relay;
 pub mod loader;
 pub mod mach;
 pub mod memory;
 pub mod paging;
 pub mod profile;
+/// `macwl-run` relays the Mac terminal it's started in, with many processes
+/// in its VM (see `relay`).
+pub use relay::enable as relay_terminal;
 mod sched;
 pub mod shared;
 pub mod signal;
@@ -1579,6 +1583,21 @@ fn deliver_signals(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &m
                 process.sync_host_signals();
             }
         }
+    }
+    // No handler ran for a call a signal interrupted (it stopped the
+    // process, or was ignored by the time it came to be delivered): the
+    // call is made again, as Linux restarts an ERESTARTSYS without a
+    // handler. (A background read that sent itself SIGTTIN reads once
+    // continued; `cat` stopped by Ctrl-Z doesn't see EINTR after `fg`.)
+    if let Some((nr, arg0, ret)) = syscall
+        && ret == -linux_abi::errno::EINTR
+        && restartable(nr)
+        && !process.exiting()
+    {
+        let mut ctx = hv::UserContext::save(vcpu)?;
+        ctx.pc -= 4;
+        ctx.x[0] = arg0;
+        ctx.restore(vcpu)?;
     }
     // The mask may have changed (a handler's, or a suspend's ending).
     thread.sync_host_mask();

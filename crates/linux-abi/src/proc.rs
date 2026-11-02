@@ -424,8 +424,10 @@ fn pid_stat(p: &Process, mem: &dyn GuestMemory, pid: i64, tid: i64, s: &ProcStat
         s.ppid.to_string(),
         s.pgid.to_string(),
         s.sid.to_string(),
-        "0".into(),  // tty_nr: no controlling terminal yet (step 4)
-        "-1".into(), // tpgid
+        // tty_nr: /dev/pts/N is Linux's major 136, the minor split as
+        // new_encode_dev does.
+        s.tty.map_or(0, |n| (136u64 << 8) | (n as u64 & 0xff) | ((n as u64 >> 8) << 20)).to_string(),
+        s.tpgid.to_string(),
         "4194304".into(), // flags: PF_RANDOMIZE
         "0".into(),
         "0".into(),

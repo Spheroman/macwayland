@@ -24,7 +24,8 @@ mod process;
 mod signal;
 mod signalfd;
 mod timer;
-mod tty;
+pub mod tty;
+pub use tty::{identify as tty_of, TtyId, TtyOp};
 #[cfg(test)]
 mod tests;
 
@@ -571,9 +572,11 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::RT_SIGPENDING => signal::rt_sigpending(p, t, mem, a0, a1),
         nr::RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(p, t, mem, a0, a1, a2, a3),
         nr::RT_SIGRETURN => return Action::SigReturn,
-        nr::KILL => signal::kill(p, a0 as i64, a1),
-        nr::TKILL => signal::tkill(p, t, None, a0 as i64, a1),
-        nr::TGKILL => signal::tkill(p, t, Some(a0 as i64), a1 as i64, a2),
+        // pids are ints: the upper half of the register is whatever the
+        // caller left (glibc's `kill(-pgid)` leaves it zero).
+        nr::KILL => signal::kill(p, a0 as i32 as i64, a1),
+        nr::TKILL => signal::tkill(p, t, None, a0 as i32 as i64, a1),
+        nr::TGKILL => signal::tkill(p, t, Some(a0 as i32 as i64), a1 as i32 as i64, a2),
         nr::SETITIMER => timer::setitimer(p, mem, a0, a1, a2),
         nr::TIMER_CREATE => timer::timer_create(p, t, mem, a0, a1, a2),
         nr::TIMER_SETTIME => timer::timer_settime(p, mem, a0, a1, a2, a3),
@@ -599,7 +602,7 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::DUP => io::dup(p, a0),
         nr::DUP3 => io::dup3(p, a0, a1, a2),
         nr::FCNTL => io::fcntl(p, mem, a0, a1, a2),
-        nr::IOCTL => io::ioctl(p, mem, a0, a1, a2),
+        nr::IOCTL => io::ioctl(p, t, mem, a0, a1, a2),
         nr::PIPE2 => io::pipe2(p, mem, a0, a1),
         nr::PPOLL => io::ppoll(p, t, mem, a0, a1, a2, a3),
         nr::PSELECT6 => io::pselect6(p, t, mem, a0, [a1, a2, a3], a4, a5),

@@ -55,6 +55,14 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
         }
         r => r?,
     };
+    // /dev/tty: the process's controlling terminal, which the kernel may
+    // keep rather than the host.
+    let mut r = r;
+    if r.guest == b"/dev/tty"
+        && let Some(path) = p.kernel.ctty_path(p)
+    {
+        r.target = Target::Host(std::ffi::CString::new(path?).map_err(|_| errno::ENXIO)?);
+    }
     // /etc/passwd and /etc/group, read: with the user added (crate::identity).
     // (Only those are read: others may be big, or never end, like /dev/urandom.)
     if flags & 3 == 0
@@ -69,10 +77,18 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
         shm::ShmFile::of(fd.as_raw_fd()).ok_or(errno::EIO)?.write_at(0, &extended)?;
         return Ok(p.fds.insert(FdEntry::new(fd).path(r.guest).cloexec(flags & o::CLOEXEC != 0)));
     }
+    let mut tty = false;
     let entry = match r.target {
         Target::Host(h) => {
             let mode = mode as u32 & !p.umask();
-            let fd = match ok(unsafe { libc::open(h.as_ptr(), abi::open_flags_to_darwin(flags), mode as libc::c_uint) } as i64) {
+            let mut host_flags = abi::open_flags_to_darwin(flags);
+            // A terminal never becomes the host process's own controlling
+            // terminal when the kernel keeps them: it's a Linux process's.
+            if p.kernel.keeps_ttys() {
+                host_flags |= libc::O_NOCTTY;
+            }
+            tty = h.as_bytes().starts_with(b"/dev/");
+            let fd = match ok(unsafe { libc::open(h.as_ptr(), host_flags, mode as libc::c_uint) } as i64) {
                 Ok(fd) => fd as i32,
                 Err(errno::ENOENT) if flags & 3 == 0 && let Some(contents) = stand_in(p, &r.guest) => {
                     return Ok(p.fds.insert(proc::generated(contents.as_bytes())?.path(r.guest).cloexec(flags & o::CLOEXEC != 0)));
@@ -89,7 +105,14 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
             FdEntry::new(fd).path(r.guest)
         }
     };
-    Ok(p.fds.insert(entry.cloexec(flags & o::CLOEXEC != 0)))
+    let fd = p.fds.insert(entry.cloexec(flags & o::CLOEXEC != 0));
+    if tty
+        && let Ok(file) = p.fds.get(fd as u64)
+        && file.tty().is_some()
+    {
+        p.kernel.tty_opened(p, &file, flags & o::NOCTTY != 0);
+    }
+    Ok(fd)
 }
 
 /// What a root without them (the Mac's `/`) gets for files Linux programs

@@ -32,7 +32,8 @@ use std::{
 
 use linux_abi::{
     errno,
-    syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostSignalWait, Inbox, Kernel, ProcStatus, SigInfo, Thread, Waited, Waker, RUSAGE_SIZE},
+    fs::OpenFile,
+    syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostSignalWait, Inbox, Kernel, ProcStatus, SigInfo, Thread, TtyOp, Waited, Waker, RUSAGE_SIZE},
     GuestMemory, Process,
 };
 
@@ -210,6 +211,9 @@ pub(crate) struct Table {
     first_exit: Mutex<Option<Result<Exit, Error>>>,
     /// Processes that haven't finished: the host ends when none is left.
     live: AtomicUsize,
+    /// The relay between the Mac terminal `macwl-run` was started in and
+    /// the pty its first process has instead, if it was started in one.
+    relay: std::sync::OnceLock<Arc<crate::relay::Relay>>,
 }
 
 struct State {
@@ -217,6 +221,20 @@ struct State {
     /// Threads other than main threads (whose tid is the pid): their
     /// process.
     tids: HashMap<i64, i64>,
+    /// The host's terminals (ptys, by number) that sessions have as their
+    /// controlling terminal, or that were opened here.
+    ttys: HashMap<u32, Tty>,
+}
+
+/// A terminal's job control: the session it's the controlling terminal
+/// of, and that session's foreground process group (Linux's `tty->ctrl`).
+#[derive(Debug, Default)]
+struct Tty {
+    sid: Option<i64>,
+    pgrp: Option<i64>,
+    /// The last byte written to its master was a VLNEXT, which quotes the
+    /// next one (so a Ctrl-V Ctrl-C is a character, not a SIGINT).
+    quoted: bool,
 }
 
 /// A process in the table.
@@ -244,6 +262,13 @@ struct Entry {
     pidfds: Vec<std::os::fd::OwnedFd>,
     /// When it started, in ns since the machine booted.
     start_ns: u64,
+    /// Its controlling terminal, a pty's number (Linux's `signal->tty`):
+    /// inherited across fork, gone with `setsid`.
+    ctty: Option<u32>,
+    /// A Mac process stands as its parent in its session: the shell that
+    /// started `macwl-run` in a terminal (through the relay), which
+    /// continues it when it stops. Its group is never orphaned.
+    mac_parent: bool,
 }
 
 /// What a table entry is. Steps 6 and 9 add stand-ins: a Mac program
@@ -267,8 +292,13 @@ pub(crate) enum Target {
     Thread { tgid: Option<i64>, tid: i64 },
 }
 
+const SIGHUP: u64 = 1;
 const SIGKILL: u64 = 9;
+const SIGSTOP: u64 = 19;
+const SIGWINCH: u64 = 28;
 const SI_USER: i32 = 0;
+/// What the kernel sends (terminals' signals, orphaned groups' hangups).
+const SI_KERNEL: i32 = 0x80;
 const SI_TKILL: i32 = -6;
 const SIGCHLD: u64 = 17;
 const SIGCONT: u64 = 18;
@@ -328,12 +358,13 @@ enum Which {
 impl Table {
     fn new(pids: Box<dyn PidAllocator>, first: i64, parking: Arc<crate::park::Parking>) -> Table {
         Table {
-            state: Mutex::new(State { procs: BTreeMap::new(), tids: HashMap::new() }),
+            state: Mutex::new(State { procs: BTreeMap::new(), tids: HashMap::new(), ttys: HashMap::new() }),
             pids,
             parking,
             first,
             first_exit: Mutex::new(None),
             live: AtomicUsize::new(0),
+            relay: std::sync::OnceLock::new(),
         }
     }
 
@@ -351,7 +382,8 @@ impl Table {
 
     /// A new process `pid`, child of `ppid` (1: init), in the group and
     /// session given.
-    fn insert(&self, pid: i64, ppid: i64, pgid: i64, sid: i64, proc: Arc<Proc>, exit_signal: u64) {
+    #[allow(clippy::too_many_arguments)]
+    fn insert(&self, pid: i64, ppid: i64, pgid: i64, sid: i64, ctty: Option<u32>, proc: Arc<Proc>, exit_signal: u64) {
         let start_ns = proc.abi.started_ns;
         let mut s = self.state();
         s.procs.insert(
@@ -370,6 +402,8 @@ impl Table {
                 subreaper: false,
                 pidfds: Vec::new(),
                 start_ns,
+                ctty,
+                mac_parent: false,
             },
         );
         if let Some(parent) = s.procs.get_mut(&ppid) {
@@ -476,12 +510,30 @@ impl Table {
     /// A stop signal's default action: `proc` stops (its tasks park as they
     /// come back to the guest), and its parent hears of it.
     fn stop(&self, proc: &Arc<Proc>, sig: u64) {
+        // The job-control stops do nothing to a process in an orphaned
+        // group: no one in its session could continue it (SIGSTOP still
+        // stops it).
+        if sig != SIGSTOP {
+            let s = self.state();
+            if let Some(e) = s.procs.get(&proc.abi.pid)
+                && orphaned(&s, e.pgid, 0)
+            {
+                return;
+            }
+        }
         if proc.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
         self.child_changed(proc.abi.pid, ((sig as i32) << 8) | 0x7f, CLD_STOPPED, sig as i32);
         // Its threads come out of the guest, and park.
         proc.abi.wake_all_threads();
+        // The process `macwl-run` was started for stopped (Ctrl-Z): the Mac
+        // shell that started it sees its job stop too.
+        if proc.abi.pid == self.first
+            && let Some(relay) = self.relay.get()
+        {
+            relay.first_stopped();
+        }
     }
 
     /// `proc` continues if it was stopped (`report`: and its parent hears
@@ -601,6 +653,15 @@ impl Table {
     /// the first process's group, as a terminal sends its foreground job;
     /// once the first has gone, to every process left.
     fn from_host(&self, sig: u64) {
+        // With a relay, the Mac terminal's resize and hangup are the
+        // relay pty's.
+        if let Some(relay) = self.relay.get() {
+            match sig {
+                SIGWINCH => return relay.resize(self),
+                SIGHUP => return self.hangup(relay.n),
+                _ => {}
+            }
+        }
         let info = SigInfo::user(sig, SI_USER, 0);
         let group = self.state().procs.get(&self.first).filter(|e| matches!(e.kind, Kind::Local(_))).map(|e| e.pgid);
         let _ = match group {
@@ -608,6 +669,150 @@ impl Table {
             None => self.deliver(Target::All { except: 0 }, info),
         };
     }
+}
+
+impl Table {
+    /// A signal from the kernel to process group `pgid` (a terminal's, an
+    /// orphaned group's hangup); none if the group has gone.
+    fn signal_group(&self, pgid: i64, sig: u64) {
+        let _ = self.deliver(Target::Group(pgid), SigInfo::user(sig, SI_KERNEL, 0));
+    }
+
+    /// Pty `n`'s master has closed (or the Mac terminal its relay stood for
+    /// has gone): the terminal hangs up. As Linux's `tty_vhangup`: its
+    /// session no longer has it, and the session's leader gets SIGHUP and
+    /// SIGCONT (a shell then hangs its jobs up).
+    pub fn hangup(&self, n: u32) {
+        let leaders: Vec<i64> = {
+            let mut s = self.state();
+            let Some(tty) = s.ttys.remove(&n) else { return };
+            let mut leaders = Vec::new();
+            for (&pid, e) in s.procs.iter_mut() {
+                if e.ctty == Some(n) {
+                    e.ctty = None;
+                }
+                if tty.sid == Some(e.sid) && e.sid == pid && matches!(e.kind, Kind::Local(_)) {
+                    leaders.push(pid);
+                }
+            }
+            leaders
+        };
+        for pid in leaders {
+            for sig in [SIGHUP, SIGCONT] {
+                let _ = self.deliver(Target::Pid(pid), SigInfo::user(sig, SI_KERNEL, 0));
+            }
+        }
+    }
+
+    /// Session leader `pid` gives up its controlling terminal, by
+    /// `TIOCNOTTY` (`exiting` false) or by ending: the terminal's foreground
+    /// group gets SIGHUP (and SIGCONT, for TIOCNOTTY), and no one in the
+    /// session has a controlling terminal any more (Linux's
+    /// `disassociate_ctty`).
+    fn disassociate(&self, s: &mut State, pid: i64, exiting: bool) -> Vec<(i64, u64)> {
+        let Some(n) = s.procs.get(&pid).and_then(|e| e.ctty) else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some(tty) = s.ttys.get_mut(&n) {
+            if let Some(fg) = tty.pgrp {
+                out.push((fg, SIGHUP));
+                if !exiting {
+                    out.push((fg, SIGCONT));
+                }
+            }
+            tty.sid = None;
+            tty.pgrp = None;
+        }
+        for e in s.procs.values_mut().filter(|e| e.sid == pid) {
+            e.ctty = None;
+        }
+        out
+    }
+
+    /// The process group of the session's foreground on pty `n`, and
+    /// whether a VLNEXT quotes the next byte.
+    fn foreground(&self, n: u32) -> Option<(i64, bool)> {
+        let s = self.state();
+        let tty = s.ttys.get(&n)?;
+        Some((tty.pgrp?, tty.quoted))
+    }
+
+    /// `data` typed at pty `n`, whose master is `master`: written, with the
+    /// signals its characters raise sent to the foreground group as each is
+    /// written. None: no session has the terminal in the foreground, or
+    /// ISIG is off, and it's just written.
+    pub fn type_keys(&self, n: u32, master: i32, data: &[u8]) -> Option<Result<i64, i64>> {
+        let (_, quoted) = self.foreground(n)?;
+        let keys = linux_abi::syscall::tty::Keyboard::of(master).ok()?;
+        if !keys.isig {
+            return None;
+        }
+        let (r, quoted) = linux_abi::syscall::tty::write_keys(master, data, &keys, quoted, |sig| {
+            // The group in the foreground as the byte is read.
+            if let Some((fg, _)) = self.foreground(n) {
+                self.signal_group(fg, sig);
+            }
+        });
+        if let Some(tty) = self.state().ttys.get_mut(&n) {
+            tty.quoted = quoted;
+        }
+        Some(r)
+    }
+
+    /// Pty `n` is the controlling terminal of `pid`'s session from now on,
+    /// with `pid`'s group in the foreground (Linux's `proc_set_tty`).
+    fn set_ctty(s: &mut State, pid: i64, n: u32) {
+        let Some(e) = s.procs.get_mut(&pid) else { return };
+        e.ctty = Some(n);
+        let (sid, pgid) = (e.sid, e.pgid);
+        let tty = s.ttys.entry(n).or_default();
+        tty.sid = Some(sid);
+        tty.pgrp = Some(pgid);
+    }
+
+    /// Pty `n` is the first process's controlling terminal (the relay's),
+    /// with it as the session leader and its group in the foreground.
+    pub fn first_ctty(&self, n: u32) {
+        let mut s = self.state();
+        Table::set_ctty(&mut s, self.first, n);
+        // The Mac shell's job: it stops (Ctrl-Z) and is continued (`fg`) as
+        // a child of that shell's would be.
+        if let Some(e) = s.procs.get_mut(&self.first) {
+            e.mac_parent = true;
+        }
+    }
+
+    /// Continue the first process's group (the Mac shell continued its
+    /// job: `fg`, `bg`).
+    pub fn continue_first(&self) {
+        let pgid = self.state().procs.get(&self.first).map(|e| e.pgid);
+        if let Some(pgid) = pgid {
+            self.signal_group(pgid, SIGCONT);
+        }
+    }
+
+    /// The foreground group of pty `n`, if a session has it.
+    pub fn tty_foreground(&self, n: u32) -> Option<i64> {
+        self.foreground(n).map(|(fg, _)| fg)
+    }
+}
+
+/// Whether process group `pgid` is orphaned, not counting process `ignore`
+/// (Linux's `will_become_orphaned_pgrp`): none of its members that are
+/// running has a parent in another group of the same session, who could
+/// continue it if it stopped. Init isn't such a parent; the Mac shell a
+/// relayed first process stands in for is.
+fn orphaned(s: &State, pgid: i64, ignore: i64) -> bool {
+    !s.procs.iter().any(|(&pid, e)| {
+        e.pgid == pgid
+            && pid != ignore
+            && matches!(e.kind, Kind::Local(_))
+            && (e.mac_parent || (e.ppid != 1 && s.procs.get(&e.ppid).is_some_and(|parent| parent.pgid != pgid && parent.sid == e.sid)))
+    })
+}
+
+/// Whether a process of group `pgid` is stopped.
+fn has_stopped(s: &State, pgid: i64) -> bool {
+    s.procs.values().any(|e| e.pgid == pgid && matches!(&e.kind, Kind::Local(p) if p.stopped.load(Ordering::Acquire)))
 }
 
 fn local_of(e: &Entry) -> Option<Arc<Proc>> {
@@ -693,6 +898,8 @@ impl Kernel for TableKernel {
         let me = s.procs.get_mut(&p.pid).ok_or(errno::ESRCH)?;
         me.sid = p.pid;
         me.pgid = p.pid;
+        // A new session has no controlling terminal.
+        me.ctty = None;
         Ok(p.pid)
     }
 
@@ -749,14 +956,180 @@ impl Kernel for TableKernel {
         Ok(Some(ChildInfo { pid, uid: unsafe { libc::getuid() }, code, status }))
     }
 
-    // Terminals and job control are step 4's: here, a process has no
-    // controlling terminal yet.
-    fn tcgetpgrp(&self, _p: &Process, _host_fd: std::os::fd::RawFd) -> Result<i64, i64> {
-        Err(errno::ENOTTY)
+    // Terminals: the host's ptys are no Mac process's controlling
+    // terminal; their sessions and foreground groups are the table's, with
+    // Linux's rules (drivers/tty/tty_jobctrl.c).
+
+    fn tcgetpgrp(&self, p: &Process, file: &OpenFile) -> Result<i64, i64> {
+        let id = file.tty().ok_or(errno::ENOTTY)?;
+        let table = self.table()?;
+        let s = table.state();
+        // Through the slave, only the caller's own controlling terminal says.
+        if !id.master && s.procs.get(&p.pid).and_then(|e| e.ctty) != Some(id.n) {
+            return Err(errno::ENOTTY);
+        }
+        Ok(s.ttys.get(&id.n).and_then(|t| t.pgrp).unwrap_or(0))
     }
 
-    fn tcsetpgrp(&self, _p: &Process, _host_fd: std::os::fd::RawFd, _pgrp: i64) -> Result<i64, i64> {
-        Err(errno::ENOTTY)
+    fn tcsetpgrp(&self, p: &Process, t: &Thread, file: &OpenFile, pgrp: i64) -> Result<i64, i64> {
+        let id = file.tty().ok_or(errno::ENOTTY)?;
+        // From the background: SIGTTOU (bash blocks it in a child, which
+        // then goes ahead).
+        self.tty_access(p, t, file, TtyOp::Change).map_err(|e| if e == errno::EIO { errno::ENOTTY } else { e })?;
+        let table = self.table()?;
+        let mut s = table.state();
+        let me = s.procs.get(&p.pid).ok_or(errno::ESRCH)?;
+        let (my_sid, ctty) = (me.sid, me.ctty);
+        if ctty != Some(id.n) || s.ttys.get(&id.n).and_then(|t| t.sid) != Some(my_sid) {
+            return Err(errno::ENOTTY);
+        }
+        if pgrp < 0 {
+            return Err(errno::EINVAL);
+        }
+        // The group's session: a member's, else (as Linux) that of the
+        // process with that pid.
+        let sid = s.procs.values().find(|e| e.pgid == pgrp).or_else(|| s.procs.get(&pgrp)).map(|e| e.sid).ok_or(errno::ESRCH)?;
+        if sid != my_sid {
+            return Err(errno::EPERM);
+        }
+        s.ttys.entry(id.n).or_default().pgrp = Some(pgrp);
+        Ok(0)
+    }
+
+    fn tcgetsid(&self, p: &Process, file: &OpenFile) -> Result<i64, i64> {
+        let id = file.tty().ok_or(errno::ENOTTY)?;
+        let table = self.table()?;
+        let s = table.state();
+        if !id.master && s.procs.get(&p.pid).and_then(|e| e.ctty) != Some(id.n) {
+            return Err(errno::ENOTTY);
+        }
+        s.ttys.get(&id.n).and_then(|t| t.sid).ok_or(errno::ENOTTY)
+    }
+
+    fn set_ctty(&self, p: &Process, file: &OpenFile, _steal: bool) -> Result<i64, i64> {
+        let id = file.tty().ok_or(errno::ENOTTY)?;
+        let table = self.table()?;
+        let mut s = table.state();
+        let me = s.procs.get(&p.pid).ok_or(errno::ESRCH)?;
+        let (leader, sid, ctty) = (me.sid == p.pid, me.sid, me.ctty);
+        let owner = s.ttys.get(&id.n).and_then(|t| t.sid);
+        // Already this session's.
+        if leader && owner == Some(sid) {
+            return Ok(0);
+        }
+        // A session leader without one; and not another session's (taking
+        // it needs CAP_SYS_ADMIN, which no process here has).
+        if !leader || ctty.is_some() || owner.is_some() {
+            return Err(errno::EPERM);
+        }
+        if !readable(file) {
+            return Err(errno::EPERM);
+        }
+        Table::set_ctty(&mut s, p.pid, id.n);
+        Ok(0)
+    }
+
+    fn drop_ctty(&self, p: &Process, file: &OpenFile) -> Result<i64, i64> {
+        let id = file.tty().ok_or(errno::ENOTTY)?;
+        let table = self.table()?;
+        let signals = {
+            let mut s = table.state();
+            let me = s.procs.get(&p.pid).ok_or(errno::ESRCH)?;
+            if id.master || me.ctty != Some(id.n) {
+                return Err(errno::ENOTTY);
+            }
+            let signals = if me.sid == p.pid { table.disassociate(&mut s, p.pid, false) } else { Vec::new() };
+            if let Some(me) = s.procs.get_mut(&p.pid) {
+                me.ctty = None;
+            }
+            signals
+        };
+        for (pgid, sig) in signals {
+            table.signal_group(pgid, sig);
+        }
+        Ok(0)
+    }
+
+    fn tty_opened(&self, p: &Process, file: &OpenFile, noctty: bool) {
+        let Some(id) = file.tty() else { return };
+        let Ok(table) = self.table() else { return };
+        if id.master {
+            // A new pty (its number may be an old one's): its hangup comes
+            // as the last reference to its master goes.
+            table.state().ttys.remove(&id.n);
+            let weak = Arc::downgrade(&table);
+            file.on_close(Box::new(move || {
+                if let Some(table) = weak.upgrade() {
+                    table.hangup(id.n);
+                }
+            }));
+            return;
+        }
+        // A session leader without a controlling terminal opening one no
+        // session has, for reading, without O_NOCTTY, gets it.
+        let mut s = table.state();
+        let Some(me) = s.procs.get(&p.pid) else { return };
+        let owned = s.ttys.get(&id.n).is_some_and(|t| t.sid.is_some());
+        if !noctty && me.sid == p.pid && me.ctty.is_none() && !owned && readable(file) {
+            Table::set_ctty(&mut s, p.pid, id.n);
+        }
+    }
+
+    fn keeps_ttys(&self) -> bool {
+        true
+    }
+
+    fn ctty_path(&self, p: &Process) -> Option<Result<Vec<u8>, i64>> {
+        let ctty = self.table().ok().and_then(|t| t.state().procs.get(&p.pid).and_then(|e| e.ctty));
+        Some(ctty.map(|n| format!("/dev/ttys{n:03}").into_bytes()).ok_or(errno::ENXIO))
+    }
+
+    fn tty_access(&self, p: &Process, t: &Thread, file: &OpenFile, op: TtyOp) -> Result<bool, i64> {
+        let Some(id) = file.tty() else { return Ok(true) };
+        let table = self.table()?;
+        // Only a process outside the foreground group of the terminal that
+        // is its controlling one.
+        let pgid = {
+            let s = table.state();
+            let Some(me) = s.procs.get(&p.pid) else { return Ok(true) };
+            if me.ctty != Some(id.n) {
+                return Ok(true);
+            }
+            match s.ttys.get(&id.n).and_then(|t| t.pgrp) {
+                Some(fg) if fg != me.pgid => me.pgid,
+                _ => return Ok(true),
+            }
+        };
+        let tostop = op == TtyOp::Write && linux_abi::syscall::tty::tostop(file.host.as_raw_fd());
+        if op == TtyOp::Write && !tostop {
+            return Ok(true);
+        }
+        let sig = if op == TtyOp::Read { linux_abi::syscall::tty::SIGTTIN } else { linux_abi::syscall::tty::SIGTTOU };
+        let ignored = p.blocks_or_ignores(t, sig);
+        let orphaned = orphaned(&table.state(), pgid, 0);
+        match linux_abi::syscall::tty::background(op, tostop, ignored, orphaned)? {
+            None => Ok(true),
+            // Its whole group stops; the call is made again once it's
+            // continued (or the signal's handler has run, with SA_RESTART).
+            Some(sig) => {
+                table.signal_group(pgid, sig);
+                Err(errno::EINTR)
+            }
+        }
+    }
+
+    fn write_master(&self, _p: &Process, file: &OpenFile, data: &[u8]) -> Option<Result<i64, i64>> {
+        let id = file.tty()?;
+        self.table().ok()?.type_keys(id.n, file.host.as_raw_fd(), data)
+    }
+
+    fn winsize_changed(&self, _p: &Process, file: &OpenFile) {
+        let Some(id) = file.tty() else { return };
+        if let Ok(table) = self.table()
+            && let Some(fg) = table.tty_foreground(id.n)
+        {
+            table.signal_group(fg, SIGWINCH);
+        }
     }
 
     fn stop(&self, p: &Process, sig: u64) {
@@ -854,6 +1227,8 @@ impl Kernel for TableKernel {
             children_user_ns: e.children_cpu.user,
             children_sys_ns: e.children_cpu.sys,
             start_ns: e.start_ns,
+            tty: e.ctty,
+            tpgid: e.ctty.and_then(|n| s.ttys.get(&n)).and_then(|t| t.pgrp).unwrap_or(-1),
         })
     }
 
@@ -882,6 +1257,13 @@ impl Kernel for TableKernel {
         // come back as processes of their own at step 6.
         false
     }
+}
+
+/// Whether `file` was opened for reading (Linux gives a controlling
+/// terminal only through such a file).
+fn readable(file: &OpenFile) -> bool {
+    let fl = unsafe { libc::fcntl(file.host.as_raw_fd(), libc::F_GETFL) };
+    fl >= 0 && fl & libc::O_ACCMODE != libc::O_WRONLY
 }
 
 /// A Linux `struct rusage` with `cpu`'s user and system time and `rss_kb`
@@ -920,6 +1302,9 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     // would apply on top.
     let old_umask = unsafe { libc::umask(0) };
     route_host_signals(&table)?;
+    // Started in a Mac terminal: the first process's terminal is a pty of
+    // the host's, relayed to it.
+    let relay = crate::relay::Relay::new(&process).map(Arc::new);
 
     profile_mark("load start");
     let machine = Machine::new()?;
@@ -936,7 +1321,12 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
     let proc = Proc::new(process, space);
     // A process `macwl-run` starts is init's child, and leads a group and
     // session of its own.
-    table.insert(pid, 1, pid, pid, proc.clone(), SIGCHLD);
+    table.insert(pid, 1, pid, pid, None, proc.clone(), SIGCHLD);
+    if let Some(relay) = &relay {
+        table.first_ctty(relay.n);
+        let _ = table.relay.set(relay.clone());
+        relay.start(&table);
+    }
     let host = Host { vm: &vm, machine: &machine, sched, parking, table: Some(table.clone()), exec_host: Mutex::new(None) };
     std::thread::scope(|scope| {
         linux_abi::host_threads::spawn_scoped(scope, "ticker", || host.sched.ticker()).expect("the host's own threads fit its budget");
@@ -952,6 +1342,9 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
         }
     });
     drop(host.parking.take_all());
+    if let Some(relay) = relay {
+        relay.finish();
+    }
     let exit = table.first_exit.lock().unwrap_or_else(|e| e.into_inner()).take();
     unsafe { libc::umask(old_umask) };
     exit.unwrap_or(Ok(Exit::Code(0)))
@@ -1042,12 +1435,12 @@ pub(crate) fn fork<'scope, 'env>(
     if let Some(addr) = f.child_tid {
         let _ = GuestMemory::write(&*child_space, addr, &(pid as i32).to_le_bytes());
     }
-    let (pgid, sid) = {
+    let (pgid, sid, ctty) = {
         let s = table.state();
         let me = s.procs.get(&proc.abi.pid);
-        (me.map_or(pid, |e| e.pgid), me.map_or(pid, |e| e.sid))
+        (me.map_or(pid, |e| e.pgid), me.map_or(pid, |e| e.sid), me.and_then(|e| e.ctty))
     };
-    table.insert(pid, proc.abi.pid, pgid, sid, child.clone(), f.exit_signal);
+    table.insert(pid, proc.abi.pid, pgid, sid, ctty, child.clone(), f.exit_signal);
     ctx.x[0] = 0;
     if f.stack != 0 {
         ctx.sp = f.stack;
@@ -1122,14 +1515,28 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
     }
     vfork_done(sh, proc);
     let cpu = proc.cpu.times();
-    let (parent, exit_signal, adopted, _pidfds) = {
+    let (parent, exit_signal, adopted, _pidfds, _was, hangups) = {
         let mut s = table.state();
         let Some(e) = s.procs.get_mut(&pid) else { return };
-        e.kind = Kind::Zombie { status, cpu, comm: proc.abi.comm() };
-        let (ppid, exit_signal) = (e.ppid, e.exit_signal);
+        let leader = e.sid == pid;
+        // (What it was goes once the table is let go: its files may close
+        // with it, and a pty master's hangup takes the table.)
+        let was = std::mem::replace(&mut e.kind, Kind::Zombie { status, cpu, comm: proc.abi.comm() });
+        let (ppid, exit_signal, my_pgid, my_sid) = (e.ppid, e.exit_signal, e.pgid, e.sid);
         let children = std::mem::take(&mut e.children);
         // Its pidfds read as ready from now on (once the lock is let go).
         let pidfds = std::mem::take(&mut e.pidfds);
+        // A session leader ending: its terminal's foreground group gets
+        // SIGHUP, and the session has no terminal any more.
+        let mut hangups = if leader { table.disassociate(&mut s, pid, true) } else { Vec::new() };
+        // Children in other groups of the session, which it may have been
+        // the last link to (checked once they're reparented).
+        let linked: Vec<i64> = children
+            .iter()
+            .filter_map(|c| s.procs.get(c))
+            .filter(|ce| matches!(ce.kind, Kind::Local(_)) && ce.pgid != my_pgid && ce.sid == my_sid)
+            .map(|ce| ce.pgid)
+            .collect();
         // Orphans go to the nearest ancestor that's a subreaper, else to
         // init, which reaps them (and those already zombies).
         let reaper = {
@@ -1158,6 +1565,20 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
                 }
             }
         }
+        // A group this leaves orphaned, with a stopped process in it, would
+        // stay stopped for good: SIGHUP and SIGCONT to it (Linux's
+        // `kill_orphaned_pgrp`), for its children's groups and its own.
+        let mut groups: Vec<i64> = linked;
+        if ppid != 1 && s.procs.get(&ppid).is_some_and(|pe| pe.pgid != my_pgid && pe.sid == my_sid) {
+            groups.push(my_pgid);
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        for g in groups {
+            if orphaned(&s, g, pid) && has_stopped(&s, g) {
+                hangups.extend([(g, SIGHUP), (g, SIGCONT)]);
+            }
+        }
         // A subreaper adopting zombies hears of them as their parent would
         // have (or reaps them at once, if it doesn't care).
         let adopted = match s.procs.get(&reaper).and_then(local_of) {
@@ -1183,8 +1604,11 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
         if parent.as_ref().is_none_or(|p| p.abi.child_policy().0) {
             table.reap(&mut s, pid);
         }
-        (parent, exit_signal, adopted, pidfds)
+        (parent, exit_signal, adopted, pidfds, was, hangups)
     };
+    for (pgid, sig) in hangups {
+        table.signal_group(pgid, sig);
+    }
     if let Some((reaper, told, waiters)) = adopted {
         for w in waiters {
             w.wake();

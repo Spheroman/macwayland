@@ -7,7 +7,9 @@
 //! the runtime keeps the process table instead, and answers them from it
 //! with a `Kernel` of its own; the dispatcher doesn't change.
 
-use std::{os::fd::RawFd, time::Duration};
+use std::{os::fd::AsRawFd, time::Duration};
+
+use crate::fs::OpenFile;
 
 use super::{ok, process, signal, Process, Thread};
 use crate::errno;
@@ -56,6 +58,10 @@ pub struct ProcStatus {
     pub children_sys_ns: u64,
     /// When it started, in ns since the machine booted.
     pub start_ns: u64,
+    /// Its controlling terminal, a pty's number, and that terminal's
+    /// foreground group (-1 without one).
+    pub tty: Option<u32>,
+    pub tpgid: i64,
 }
 
 /// A clock reading a process's CPU time, from any thread.
@@ -87,10 +93,66 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     fn wait4(&self, p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64>;
     /// `waitid(idtype, id, options)`: likewise.
     fn waitid(&self, p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64>;
-    /// The foreground process group of the terminal open as `host_fd`.
-    fn tcgetpgrp(&self, p: &Process, host_fd: RawFd) -> Result<i64, i64>;
-    /// Make `pgrp` the foreground group of the terminal open as `host_fd`.
-    fn tcsetpgrp(&self, p: &Process, host_fd: RawFd, pgrp: i64) -> Result<i64, i64>;
+    /// The foreground process group of terminal `file` (`TIOCGPGRP`).
+    fn tcgetpgrp(&self, p: &Process, file: &OpenFile) -> Result<i64, i64>;
+    /// Make `pgrp` the foreground group of terminal `file` (`TIOCSPGRP`), by
+    /// thread `t`.
+    fn tcsetpgrp(&self, p: &Process, t: &Thread, file: &OpenFile, pgrp: i64) -> Result<i64, i64>;
+    /// The session terminal `file` controls (`TIOCGSID`).
+    fn tcgetsid(&self, _p: &Process, file: &OpenFile) -> Result<i64, i64> {
+        ok(unsafe { libc::tcgetsid(file.host.as_raw_fd()) } as i64)
+    }
+    /// Make terminal `file` the caller's controlling terminal (`TIOCSCTTY`;
+    /// `steal`: from another session).
+    fn set_ctty(&self, _p: &Process, file: &OpenFile, steal: bool) -> Result<i64, i64> {
+        ok(unsafe { libc::ioctl(file.host.as_raw_fd(), libc::TIOCSCTTY as u64, steal as libc::c_int) } as i64).map(|_| 0)
+    }
+    /// Give up the controlling terminal `file` (`TIOCNOTTY`).
+    fn drop_ctty(&self, _p: &Process, file: &OpenFile) -> Result<i64, i64> {
+        ok(unsafe { libc::ioctl(file.host.as_raw_fd(), libc::TIOCNOTTY) } as i64).map(|_| 0)
+    }
+    /// Terminal `file` was just opened (`noctty`: with O_NOCTTY, or as a
+    /// master): a session leader with no controlling terminal gets it as
+    /// one. Here the host's open did that, if anything.
+    fn tty_opened(&self, _p: &Process, _file: &OpenFile, _noctty: bool) {}
+    /// Whether host opens of terminals must not make them the host
+    /// process's controlling terminal (the kernel keeps controlling
+    /// terminals itself).
+    fn keeps_ttys(&self) -> bool {
+        false
+    }
+    /// The terminal `/dev/tty` opens: None for the host's own `/dev/tty`
+    /// (the host process is the Linux one), else its host path, or ENXIO
+    /// with none.
+    fn ctty_path(&self, _p: &Process) -> Option<Result<Vec<u8>, i64>> {
+        None
+    }
+    /// Thread `t` is about to do `op` to terminal `file`: Linux's
+    /// job-control check for a process outside the foreground group of its
+    /// controlling terminal (SIGTTIN, SIGTTOU or EIO; EINTR here once the
+    /// signal is sent, and the call is made again). Ok(false): make the
+    /// host call at once, without waiting for the terminal to be ready, for
+    /// the host's driver to check.
+    ///
+    /// Here the host's driver does it, as the call is made; but a read
+    /// waits for input before it's made, which a background process's
+    /// shouldn't: it reads at once, and the driver stops it.
+    fn tty_access(&self, _p: &Process, _t: &Thread, file: &OpenFile, op: super::TtyOp) -> Result<bool, i64> {
+        if op != super::TtyOp::Read {
+            return Ok(true);
+        }
+        let fg = unsafe { libc::tcgetpgrp(file.host.as_raw_fd()) };
+        Ok(fg < 0 || fg == unsafe { libc::getpgrp() })
+    }
+    /// Write `data` to pty master `file` as typed input, raising the
+    /// keyboard's signals for the terminal's foreground group (None: write it
+    /// as any file, the host's driver raising them).
+    fn write_master(&self, _p: &Process, _file: &OpenFile, _data: &[u8]) -> Option<Result<i64, i64>> {
+        None
+    }
+    /// Terminal `file`'s size changed: SIGWINCH to its foreground group.
+    /// Here the host's driver sends it.
+    fn winsize_changed(&self, _p: &Process, _file: &OpenFile) {}
     /// A stop signal's default action: the process stops until continued.
     fn stop(&self, p: &Process, sig: u64);
     /// `getrusage(who)`: RUSAGE_SELF (0), RUSAGE_CHILDREN (-1), RUSAGE_THREAD
@@ -164,6 +226,8 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
             children_user_ns: ns(cru.ru_utime),
             children_sys_ns: ns(cru.ru_stime),
             start_ns: p.started_ns,
+            tty: None,
+            tpgid: -1,
         })
     }
     /// Run `f` with another process's state and memory, for its `/proc`
@@ -246,12 +310,12 @@ impl Kernel for HostKernel {
         process::host_waitid(p, t, idtype, id, options)
     }
 
-    fn tcgetpgrp(&self, _p: &Process, host_fd: RawFd) -> Result<i64, i64> {
-        ok(unsafe { libc::tcgetpgrp(host_fd) } as i64)
+    fn tcgetpgrp(&self, _p: &Process, file: &OpenFile) -> Result<i64, i64> {
+        ok(unsafe { libc::tcgetpgrp(file.host.as_raw_fd()) } as i64)
     }
 
-    fn tcsetpgrp(&self, _p: &Process, host_fd: RawFd, pgrp: i64) -> Result<i64, i64> {
-        ok(unsafe { libc::tcsetpgrp(host_fd, pgrp as i32) } as i64).map(|_| 0)
+    fn tcsetpgrp(&self, _p: &Process, _t: &Thread, file: &OpenFile, pgrp: i64) -> Result<i64, i64> {
+        ok(unsafe { libc::tcsetpgrp(file.host.as_raw_fd(), pgrp as i32) } as i64).map(|_| 0)
     }
 
     fn stop(&self, _p: &Process, _sig: u64) {
