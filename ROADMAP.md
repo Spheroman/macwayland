@@ -40,6 +40,7 @@ remains the fallback if B stalls.
 | Spike 1: full-screen Metal shell | `crates/shell` | Hosts the compositor and blits client frames. On-demand rendering (present immediately on input or commit). |
 | Native latency baseline | `crates/native-probe` | Measures drawRect, CALayer and CAMetalLayer paths via ScreenCaptureKit `displayTime`, cross-checked against `MTLDrawable.presentedTime` (agree to <1 ms). |
 | B1: vCPU limit | `crates/hv-limits`, `scripts/sign-hv.sh` | 64 vCPUs per VM, one VM per process (M4, macOS 27.2; same on M5 Pro, macOS 26.6). |
+| B1: VM limit | `hv-limits vms` | 128 VMs at once, system-wide (M5 Pro, macOS 27.0.1): `kern.hv.max_address_spaces`, read-only. A count of VMs only: the same 128 with no memory mapped or 64 GiB each, no vCPUs or 16 each, IPA 32 to 40 bits. Track B uses one per live Linux process; zombies and idle fork spares hold none (test `processes_go_when_they_end`). Other hypervisor users share the 128. |
 | `linux-abi` building blocks | `crates/linux-abi` | arm64 syscall numbers, Darwin→Linux errno, `stat`/`timespec`/open-flag layouts, fd table, guest→host path mapping, `GuestMemory` interface. 8 unit tests. |
 | B0 scaffold: core runtime | `crates/runtime` (`macwl-run`) | Loads a static ELF, runs it at EL0 under our own page tables (see item 3); `svc` traps to an EL1 vector that does `hvc` to the host, which calls `linux_abi::dispatch` (`write`, `writev`, `exit_group`, `set_tid_address`, `brk`). Tested with hand-assembled ELFs: hello world, -ENOSYS, null-pointer fault. |
 | B2: Linux Wayland client on the Mac | `crates/runtime`, `scripts/build-guest.sh` | The unmodified `hello-client`, built for `aarch64-unknown-linux-musl`, runs under `macwl-run`, connects to macwl-compositor, shares its pool through `/dev/shm` and `SCM_RIGHTS`, and draws in the full-screen macwl-shell (~90 fps). Frames arrive pixel-exact (test `b2_linux_wayland_client_draws_on_the_mac_compositor`). |
@@ -205,6 +206,13 @@ from a static Linux binary.
      the VM. `MACWL_PROFILE=1` prints where the time goes.
    - Wait statuses carry Linux signal numbers (a guest killed by a signal
      tells its parent over the control socket; host signals are translated).
+   - Each live process holds one of the Mac's 128 VMs (B1 in Done); ended
+     ones give theirs back at once (test `processes_go_when_they_end`). A
+     Wine session (10–20 processes) fits; a full desktop with a browser
+     may not. If it binds: a process blocked in a system call for a while
+     could give up its VM and create a new one when it wakes (its page
+     tables and memory are host-side, so only the vCPUs' registers need
+     saving), making the cap 128 *running* processes.
    Not yet: threads in a forked process (item 5), `CLONE_VM` without vfork,
    pidfds, `kill(-1)` (refused: on a Mac that's the whole login session).
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
