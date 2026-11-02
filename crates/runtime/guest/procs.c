@@ -12,6 +12,9 @@
 //            pid, the sender in siginfo, tgkill of another process's thread
 //   timers   a process's interval and POSIX timers and alarm() signal it
 //            alone: another process's sleeps and waits aren't interrupted
+//   contain  a runtime error (a panic) in one process's system call ends
+//            that process with SIGSYS; its parent and a sibling carry on
+//            (debug builds of the runtime only)
 //   execmac  execve of a Mac program: prints its errno
 //
 // Prints "procs TEST ok".
@@ -503,6 +506,60 @@ static void timers(void) {
     CHECK(got == quiet && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
+// ---- contain ----
+
+// The runtime's debug-only call that panics (linux_abi::nr::MACWL_TEST_PANIC).
+#define MACWL_TEST_PANIC 0x4d570001L
+
+static void *spin_then_panic(void *arg) {
+    (void)arg;
+    sleep_ms(5);
+    syscall(MACWL_TEST_PANIC);
+    return 0;
+}
+
+static void contain(void) {
+    // A sibling that must outlive the failing process, blocked meanwhile.
+    int p[2];
+    CHECK(pipe(p) == 0);
+    pid_t sibling = fork();
+    CHECK(sibling >= 0);
+    if (sibling == 0) {
+        close(p[1]);
+        char c;
+        _exit(read(p[0], &c, 1) == 0 ? 0 : 1);
+    }
+    close(p[0]);
+    // The call made by the main thread, and by one of several threads
+    // (others blocked in reads and sleeps).
+    for (int how = 0; how < 2; how++) {
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            if (how == 0) syscall(MACWL_TEST_PANIC);
+            int q[2];
+            CHECK(pipe(q) == 0);
+            pthread_t t;
+            CHECK(pthread_create(&t, 0, spin_then_panic, 0) == 0);
+            char c;
+            read(q[0], &c, 1);
+            _exit(0);
+        }
+        int st = wait_status(pid);
+        if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGSYS) {
+            dprintf(2, "case %d: status %#x\n", how, st);
+            _exit(1);
+        }
+    }
+    // The host carries on: the sibling, and forks after.
+    pid_t later = fork();
+    CHECK(later >= 0);
+    if (later == 0) _exit(7);
+    CHECK(WEXITSTATUS(wait_status(later)) == 7);
+    close(p[1]);
+    CHECK(WIFEXITED(wait_status(sibling)));
+}
+
 int main(int argc, char **argv) {
     self = argv[0];
     CHECK(argc >= 2);
@@ -520,6 +577,8 @@ int main(int argc, char **argv) {
         groups();
     } else if (!strcmp(test, "timers")) {
         timers();
+    } else if (!strcmp(test, "contain")) {
+        contain();
     } else if (!strcmp(test, "execmac")) {
         char *args[] = { "/usr/bin/true", 0 };
         execv("/usr/bin/true", args);

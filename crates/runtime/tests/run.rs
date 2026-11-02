@@ -610,6 +610,16 @@ fn one_vm_timers_are_their_process_alone() {
     procs_in_one_vm("timers");
 }
 
+/// Containment in one VM: a runtime error (a panic, here from a call debug
+/// builds of the runtime answer with one) in one process's system call ends
+/// that process with SIGSYS, whether its main thread or another made the
+/// call; its parent, a sibling and later forks carry on in the same host.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_contains_a_runtime_error() {
+    procs_in_one_vm("contain");
+}
+
 /// More live Linux processes than a Mac has VMs (128): 300 at once in one
 /// host, which stays one Mac process meanwhile.
 #[test]

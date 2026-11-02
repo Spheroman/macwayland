@@ -524,7 +524,7 @@ fn run_cpu<'scope, 'env>(
         let warm = holds == Some((task.proc.abi.pid, task.thread.tid)) && task.last_cpu == Some(cpu.slot);
         let mut after = None;
         let cpu_time = sh.table.is_some().then(thread_cpu_ns);
-        let step = (|| {
+        let step = || {
             let space = task.proc.space();
             {
                 let mut s = space.lock();
@@ -566,7 +566,19 @@ fn run_cpu<'scope, 'env>(
             task.last_cpu = Some(cpu.slot);
             task.thread.moved_host_thread();
             run_task(&mut cpu, sh, scope, &mut task, &mut configured, after.take())
-        })();
+        };
+        // A panic anywhere in running the task (not only in a system call,
+        // which `contained` already catches) is a runtime error like any
+        // other: it ends the task's process, not the host.
+        let step = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) {
+            Ok(step) => step,
+            Err(e) => {
+                // A Mac program the process was about to become (1:1) is
+                // forgotten: after a panic it ends, nothing more.
+                *sh.exec_host.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                Err(Error::Unexpected(format!("panic: {}", panic_message(&*e))))
+            }
+        };
         sh.sched.done(cpu.slot);
         if let Some(t0) = cpu_time {
             task.proc.cpu_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Ordering::Relaxed);
@@ -777,7 +789,12 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
             if (!sets_mask(nr, &args) && process.signal_ready(thread)) || process.exiting() {
                 break -linux_abi::errno::EINTR;
             }
-            let action = dispatch(process, thread, &*space, nr, args);
+            let Some(action) = contained(process, nr, || dispatch(process, thread, &*space, nr, args)) else {
+                // A runtime error in the call: its process ends (the task
+                // sees that when it's back on a CPU).
+                sh.end(&proc, Ok(Exit::Signal(SIGSYS)));
+                break -linux_abi::errno::EINTR;
+            };
             let ret = match action {
                 Action::Return(ret) => ret,
                 // Only calls that return come here (see may_block).
@@ -806,6 +823,31 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
             host::place_ready(sh, scope, table);
         }
     }
+}
+
+/// Linux's SIGSYS: how a process whose system call met a runtime error ends
+/// (docs/processes.md, "Fault isolation").
+const SIGSYS: i32 = 31;
+
+/// Make a system call (`call`), containing a runtime error in it: a panic
+/// is logged and gives None, for the caller to end the process with SIGSYS,
+/// rather than taking the host (and every other process in it) down.
+fn contained<T>(process: &Process, nr: u64, call: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            // The files the call held for its duration (dispatch lets go of
+            // them as it returns, which it didn't).
+            linux_abi::fs::end_call();
+            eprintln!("macwl-run: pid {}: system call {nr} ({}) failed in the runtime ({}): the process ends with SIGSYS", process.pid, linux_abi::nr::name(nr), panic_message(&*e));
+            None
+        }
+    }
+}
+
+/// What a caught panic said.
+fn panic_message(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic".into())
 }
 
 /// Calls that may block in the host, and that a worker can make for a task
@@ -1120,8 +1162,11 @@ fn run_loop<'scope, 'env>(
                     sched::set_inline(slot, false);
                     break Action::Return(-linux_abi::errno::EINTR);
                 }
-                let action = dispatch(process, thread, space, nr, args);
+                let action = contained(process, nr, || dispatch(process, thread, space, nr, args));
                 sched::set_inline(slot, false);
+                // The call met a runtime error (a panic): its process ends,
+                // and the host carries on.
+                let Some(action) = action else { return Ok(Next::Exit(Exit::Signal(SIGSYS))) };
                 let interrupted = matches!(action, Action::Return(r) if r == -linux_abi::errno::EINTR);
                 // The CPU was taken back, for a task waiting for one: a worker
                 // makes the call again (nothing was done), or the guest gets

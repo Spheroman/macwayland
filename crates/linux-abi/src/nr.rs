@@ -164,6 +164,9 @@ pub const GETTIMEOFDAY: u64 = 169;
 pub const SYSINFO: u64 = 179;
 pub const MADVISE: u64 = 233;
 pub const CLOCK_NANOSLEEP: u64 = 115;
+/// Not Linux's: a call debug builds answer by panicking, to test that a
+/// runtime error in one process's call ends that process alone.
+pub const MACWL_TEST_PANIC: u64 = 0x4d57_0001;
 
 /// Names of system calls 0–243 (the generic table; 244–259 are reserved for
 /// architecture-specific calls, which arm64 doesn't have).

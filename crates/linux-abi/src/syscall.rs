@@ -383,6 +383,8 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::GETRESUID => misc::getresids(mem, [a0, a1, a2], false),
         nr::GETRESGID => misc::getresids(mem, [a0, a1, a2], true),
         nr::SCHED_YIELD => Ok(0),
+        #[cfg(debug_assertions)]
+        nr::MACWL_TEST_PANIC => panic!("MACWL_TEST_PANIC from pid {} tid {}", p.pid, t.tid),
         // Every thread is SCHED_OTHER at nice 0, for now (docs/mn-threads.md,
         // step 5, is where priorities come in). getpriority returns 20 - nice.
         nr::GETPRIORITY => Ok(20),
