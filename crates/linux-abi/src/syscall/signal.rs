@@ -331,11 +331,17 @@ pub struct Signals {
     signalfd_watched: u64,
     /// Dispositions changed since the host's were last set to match.
     host_stale: bool,
+    /// The signals ignored now, by SIG_IGN or a default of ignore (bit n-1
+    /// for signal n): kept as the dispositions change, as every blocking call
+    /// asks ([`Process::signal_ready`]).
+    ignored: u64,
 }
 
 impl Default for Signals {
     fn default() -> Self {
-        Signals { actions: [SigAction::default(); NSIG as usize], pending: Pending::default(), signalfd_watched: 0, host_stale: true }
+        let mut s = Signals { actions: [SigAction::default(); NSIG as usize], pending: Pending::default(), signalfd_watched: 0, host_stale: true, ignored: 0 };
+        s.actions_changed();
+        s
     }
 }
 
@@ -362,6 +368,17 @@ impl ThreadSignals {
 }
 
 impl Signals {
+    /// The dispositions changed: what's ignored now.
+    fn actions_changed(&mut self) {
+        self.ignored = (1..=NSIG)
+            .filter(|&sig| match self.actions[sig as usize - 1].handler {
+                SIG_IGN => true,
+                SIG_DFL => !terminates_by_default(sig) && !stops_by_default(sig),
+                _ => false,
+            })
+            .fold(0, |m, sig| m | bit(sig));
+    }
+
     /// The dispositions, and the forking thread's mask and alternate stack.
     pub fn encode(&self, t: &ThreadSignals, e: &mut Encoder) {
         for a in &self.actions {
@@ -379,6 +396,7 @@ impl Signals {
             *a = SigAction { handler: d.u64()?, flags: d.u64()?, restorer: d.u64()?, mask: d.u64()? };
         }
         s.signalfd_watched = d.u64()?;
+        s.actions_changed();
         let t = ThreadSignals {
             blocked: d.u64()?,
             altstack: StackT { sp: d.u64()?, flags: d.i64()? as i32, _pad: 0, size: d.u64()? },
@@ -398,6 +416,7 @@ impl Signals {
         }
         t.altstack = StackT::default();
         self.host_stale = true;
+        self.actions_changed();
     }
 
     /// Whether a signal raised now is dropped at once: ignored, and (for a
@@ -579,11 +598,11 @@ impl Process {
     /// Whether a signal is waiting that thread `t` would act on now (so a
     /// blocking wait should give up with EINTR).
     pub fn signal_ready(&self, t: &Thread) -> bool {
-        self.take_external(&mut self.signals(), &t.signals, t.tid);
-        let pending = self.signals().pending.bits
-            | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits
-            | self.inbox.host_pending.load(Ordering::Acquire);
-        pending & !t.signals.blocked & !self.ignoring() != 0
+        // One hold of the signals: every blocking call asks, several times.
+        let mut s = self.signals();
+        self.take_external(&mut s, &t.signals, t.tid);
+        let pending = s.pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits | self.inbox.host_pending.load(Ordering::Acquire);
+        pending & !t.signals.blocked & !self.ignoring(&s) != 0
     }
 
     /// Signals that would be ignored now, which (on Linux, where they're
@@ -592,18 +611,11 @@ impl Process {
     /// memory: a child's SIGCHLD at its default action mustn't end its
     /// parent's `wait4` with EINTR. (In 1:1 mode the host's own dispositions
     /// do that already.)
-    fn ignoring(&self) -> u64 {
+    fn ignoring(&self, s: &Signals) -> u64 {
         if self.inbox.mirror_host.load(Ordering::Relaxed) {
             return 0;
         }
-        let s = self.signals();
-        (1..=NSIG)
-            .filter(|&sig| match s.actions[sig as usize - 1].handler {
-                SIG_IGN => true,
-                SIG_DFL => !terminates_by_default(sig) && !stops_by_default(sig),
-                _ => false,
-            })
-            .fold(0, |m, sig| m | bit(sig))
+        s.ignored
     }
 
     /// A fault thread `t` can't continue past (SIGSEGV, SIGBUS, SIGILL...): its
@@ -723,6 +735,7 @@ fn start_handler(s: &mut Signals, ts: &mut ThreadSignals, sig: u64, action: SigA
     if action.flags & SA_RESETHAND != 0 {
         s.actions[sig as usize - 1] = SigAction::default();
         s.host_stale = true;
+        s.actions_changed();
     }
     HandlerCall {
         info,
@@ -807,6 +820,7 @@ pub(super) fn rt_sigaction<M: GuestMemory + ?Sized>(p: &Process, mem: &M, sig: u
             s.pending.discard(sig);
         }
         s.host_stale = true;
+        s.actions_changed();
     }
     Ok(0)
 }
@@ -927,11 +941,10 @@ pub(super) fn rt_sigsuspend<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread
     ts.suspend_saved = Some(ts.blocked);
     ts.blocked = new & !UNBLOCKABLE;
     loop {
-        let ignoring = p.ignoring();
         let ready = {
             let mut s = p.signals();
             p.take_external(&mut s, ts, tid);
-            (s.pending.bits | ts.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !ts.blocked & !ignoring
+            (s.pending.bits | ts.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !ts.blocked & !p.ignoring(&s)
         };
         if ready != 0 {
             return Err(errno::EINTR);
