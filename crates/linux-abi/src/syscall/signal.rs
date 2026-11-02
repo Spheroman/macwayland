@@ -275,20 +275,40 @@ impl SigInfo {
     }
 }
 
+/// The first real-time signal (the kernel's SIGRTMIN; C libraries keep the
+/// first few for themselves). Real-time signals queue: each one sent is
+/// delivered. A standard signal is pending once, however often it's sent.
+const FIRST_REALTIME: u64 = 32;
+
+/// The most of one real-time signal queued at once (Linux bounds them by
+/// RLIMIT_SIGPENDING, per user; this bounds the memory they take).
+const MAX_QUEUED: usize = 1024;
+
 /// Raised signals not yet delivered, with the details of each.
 #[derive(Debug, Clone, Default)]
 pub struct Pending {
     bits: u64,
-    info: BTreeMap<u64, SigInfo>,
+    info: BTreeMap<u64, std::collections::VecDeque<SigInfo>>,
 }
 
 impl Pending {
     fn add(&mut self, info: SigInfo) {
         let sig = info.signo;
-        if self.bits & bit(sig) == 0 {
-            self.info.insert(sig, info);
-        }
         self.bits |= bit(sig);
+        let queued = self.info.entry(sig).or_default();
+        // A timer's signal is queued once: expiries while it's pending count
+        // as its overrun, as on Linux.
+        if let Some((id, overrun, _)) = info.timer
+            && let Some(prev) = queued.iter_mut().find(|i| i.timer.is_some_and(|t| t.0 == id))
+        {
+            if let Some(t) = &mut prev.timer {
+                t.1 = t.1.saturating_add(overrun.saturating_add(1));
+            }
+            return;
+        }
+        if queued.is_empty() || (sig >= FIRST_REALTIME && queued.len() < MAX_QUEUED) {
+            queued.push_back(info);
+        }
     }
 
     /// Whether any signal in `set` is pending.
@@ -303,8 +323,14 @@ impl Pending {
             return None;
         }
         let sig = ready.trailing_zeros() as u64 + 1;
-        self.bits &= !bit(sig);
-        Some(self.info.remove(&sig).unwrap_or(SigInfo { signo: sig, ..Default::default() }))
+        let queued = self.info.get_mut(&sig);
+        let info = queued.and_then(|q| q.pop_front());
+        // Pending still while more are queued (real-time signals).
+        if self.info.get(&sig).is_none_or(|q| q.is_empty()) {
+            self.bits &= !bit(sig);
+            self.info.remove(&sig);
+        }
+        Some(info.unwrap_or(SigInfo { signo: sig, ..Default::default() }))
     }
 
     fn discard(&mut self, sig: u64) {
@@ -1029,5 +1055,59 @@ pub(super) fn rt_sigtimedwait<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thre
         if !super::block::wait_woken(t, deadline)? {
             return Err(errno::EAGAIN);
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    fn sig(signo: u64, pid: i32) -> SigInfo {
+        SigInfo { signo, pid, ..Default::default() }
+    }
+
+    #[test]
+    fn realtime_signals_queue_standard_ones_dont() {
+        let mut p = Pending::default();
+        for pid in 1..=3 {
+            p.add(sig(34, pid));
+            p.add(sig(10, pid));
+        }
+        let all = bit(34) | bit(10);
+        // Lowest number first; SIGUSR1 once, with the first sender's details.
+        assert_eq!(p.take(all).map(|i| (i.signo, i.pid)), Some((10, 1)));
+        for pid in 1..=3 {
+            assert!(p.any(bit(34)), "still pending while more are queued");
+            assert_eq!(p.take(all).map(|i| (i.signo, i.pid)), Some((34, pid)), "in the order sent");
+        }
+        assert!(!p.any(all));
+        assert!(p.take(all).is_none());
+    }
+
+    #[test]
+    fn a_pending_timer_signal_counts_expiries_as_overrun() {
+        let mut p = Pending::default();
+        let timer = |id: i32, overrun: i32| SigInfo { signo: 34, code: -2, timer: Some((id, overrun, 0)), ..Default::default() };
+        p.add(timer(1, 0));
+        p.add(timer(2, 0));
+        p.add(timer(1, 0)); // timer 1 again while its signal waits
+        p.add(timer(1, 2)); // and again, three expiries late
+        let first = p.take(bit(34)).unwrap();
+        assert_eq!(first.timer.map(|t| (t.0, t.1)), Some((1, 4)), "1 + (1 + 2) expiries folded in");
+        assert_eq!(p.take(bit(34)).unwrap().timer.map(|t| t.0), Some(2), "another timer's signal queued on its own");
+        assert!(!p.any(bit(34)));
+    }
+
+    #[test]
+    fn realtime_queue_is_bounded() {
+        let mut p = Pending::default();
+        for pid in 0..(MAX_QUEUED as i32 + 10) {
+            p.add(sig(40, pid));
+        }
+        let mut n = 0;
+        while p.take(bit(40)).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, MAX_QUEUED);
     }
 }
