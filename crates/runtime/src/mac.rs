@@ -56,7 +56,7 @@ const POSIX_SPAWN_START_SUSPENDED: libc::c_short = 0x0080;
 
 /// The spawn flags given, if they start a new process: never
 /// `POSIX_SPAWN_SETEXEC`, which would replace the caller with the program.
-/// Panics otherwise.
+/// Fails an assertion otherwise.
 pub(crate) fn new_process_flags(flags: libc::c_short) -> libc::c_short {
     assert!(flags & libc::POSIX_SPAWN_SETEXEC as libc::c_short == 0, "a spawn here starts a new process: never POSIX_SPAWN_SETEXEC");
     flags
