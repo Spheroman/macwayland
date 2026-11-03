@@ -314,12 +314,21 @@ impl Kernel for HostKernel {
     }
 
     fn tgkill(&self, p: &Process, tgid: Option<i64>, tid: i64, sig: u64) -> Result<i64, i64> {
-        // Another process's thread: its process is the best we can do (its
-        // tids aren't the host's).
-        if tgid.is_none() && tid == p.pid {
-            return Err(errno::ESRCH);
-        }
-        self.kill(p, tid, sig)
+        // Another process's thread. Its tids aren't the host's, and macOS
+        // can't signal another process's thread, so the signal goes to its
+        // process: the best we can do. What mustn't happen is ESRCH for a
+        // thread that's alive: wineserver takes that to mean the thread has
+        // died and ends it on its side while it still runs, after which it
+        // releases an object once too often and its heap is corrupt.
+        let pid = match tgid {
+            Some(pid) if Process::may_be_thread_of(pid, tid) => pid,
+            Some(_) => return Err(errno::ESRCH),
+            // `tkill` alone: a main thread's tid is its pid; another
+            // thread's says too little of its process.
+            None if !Process::is_other_thread(tid) && tid != p.pid => tid,
+            None => return Err(errno::ESRCH),
+        };
+        self.kill(p, pid, sig)
     }
 
     fn wait4(&self, p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {

@@ -411,6 +411,24 @@ fn signals() {
     assert!(out.status.success());
 }
 
+/// tgkill to a thread of another process, in both modes: never ESRCH while
+/// the thread lives, and the signal arrives (see guest/tgkill.c). In 1:1 it
+/// was ESRCH, which wineserver took to mean a client's thread had died; it
+/// ended the thread on its side while it still ran, and its heap was soon
+/// corrupt.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn tgkill_reaches_another_process_thread() {
+    let path = format!("{}/../../target/guest/tgkill", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    for one_vm in ["0", "1"] {
+        let out = macwl_run().env("MACWL_ONE_VM", one_vm).arg(&path).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "tgkill ok\n", "MACWL_ONE_VM={one_vm}, stderr: {stderr}");
+        assert!(out.status.success(), "MACWL_ONE_VM={one_vm}");
+    }
+}
+
 /// More threads than CPUs (150 at once, past the 64 vCPUs a process can
 /// have), preemption sharing a CPU among spinning threads, a signal to one
 /// thread: see guest/manythreads.c. Run with the default CPUs and with two.

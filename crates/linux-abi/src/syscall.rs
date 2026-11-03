@@ -71,6 +71,10 @@ const IOV_MAX: u64 = 1024;
 /// host allocate without bound.
 const MAX_IO: u64 = 16 << 20;
 
+/// The tids of threads other than a process's first ([`Process::new_tid`]):
+/// above any pid.
+const THREAD_TIDS: std::ops::Range<i64> = 0x1000_0000..0x1800_0000;
+
 /// Per-process state the dispatcher works on (everything except memory, which
 /// the core owns and passes in). Shared by the process's threads.
 #[derive(Debug)]
@@ -305,11 +309,24 @@ impl Process {
         // skipping those still in use as they come round again.
         loop {
             let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let tid = 0x1000_0000 + (self.pid % 0x800) * 0x1_0000 + (n % 0x1_0000);
+            let tid = THREAD_TIDS.start + (self.pid % 0x800) * 0x1_0000 + (n % 0x1_0000);
             if !self.inbox.threads().contains_key(&tid) {
                 return tid;
             }
         }
+    }
+
+    /// Whether `tid` may be a thread of process `pid`, from what
+    /// [`Process::new_tid`] makes of a pid (for another process's threads,
+    /// which only that process knows).
+    pub fn may_be_thread_of(pid: i64, tid: i64) -> bool {
+        tid == pid || (THREAD_TIDS.contains(&tid) && (tid - THREAD_TIDS.start) / 0x1_0000 == pid % 0x800)
+    }
+
+    /// Whether `tid` is a thread's other than a main one (whose tid is its
+    /// pid).
+    pub fn is_other_thread(tid: i64) -> bool {
+        THREAD_TIDS.contains(&tid)
     }
 
     /// Its program's arguments and environment are at `[args.0, args.1)`

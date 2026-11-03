@@ -1000,7 +1000,7 @@ pub(super) fn kill_self(p: &Process, sig: u64) -> Result<i64, i64> {
 
 /// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`: to one thread.
 pub(super) fn tkill(p: &Process, t: &mut Thread, tgid: Option<i64>, tid: i64, sig: u64) -> Result<i64, i64> {
-    if sig > NSIG || tid <= 0 {
+    if sig > NSIG || tid <= 0 || tgid.is_some_and(|g| g <= 0) {
         return Err(errno::EINVAL);
     }
     if tgid.is_some_and(|g| g != p.pid) {

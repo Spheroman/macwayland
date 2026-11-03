@@ -1651,3 +1651,15 @@ fn a_blocked_call_wakes_without_an_interrupt() {
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "{case}");
     }
 }
+
+/// Another process's threads are known by their tids alone: those its
+/// threads get say which process they may be of.
+#[test]
+fn a_tid_says_which_process_it_may_be_of() {
+    let p = Process::new("/");
+    let tid = p.new_tid();
+    assert!(Process::may_be_thread_of(p.pid, tid));
+    assert!(Process::may_be_thread_of(p.pid, p.pid), "the first thread's tid is the pid");
+    assert!(!Process::may_be_thread_of(p.pid + 1, tid));
+    assert!(Process::is_other_thread(tid) && !Process::is_other_thread(p.pid));
+}
