@@ -33,7 +33,7 @@ use linux_abi::{
     abi::mm,
     errno,
     wire::{Decoder, Encoder, Truncated},
-    Fault, GuestMemory,
+    Fault, GuestMemory, SharedKey,
 };
 
 use crate::{
@@ -740,12 +740,13 @@ impl AddressSpace {
         }
     }
 
-    /// Copy into guest memory, checking `access` against the regions (None:
-    /// the loader, which may write anything mapped).
-    fn copy_in(&mut self, addr: u64, data: &[u8], access: Option<Access>) -> Result<(), Fault> {
-        let mut done = 0;
-        while done < data.len() {
-            let va = addr.checked_add(done as u64).ok_or(Fault { addr })?;
+    /// The physical address of the page holding `va`, to be written, as a
+    /// write would leave it: populated, this address space's own if it was
+    /// shared copy on write, a private copy if it was read through a
+    /// file's window. Checks `access` against the region (None: the
+    /// loader, which may write anything mapped).
+    fn page_to_write(&mut self, va: u64, access: Option<Access>) -> Result<u64, Fault> {
+        loop {
             let (start, vma) = self.vmas.find(va).ok_or(Fault { addr: va })?;
             if access.is_some_and(|a| !allowed(vma.prot, a)) {
                 return Err(Fault { addr: va });
@@ -756,13 +757,24 @@ impl AddressSpace {
                 self.privatize(page, page + PAGE_SIZE)?;
                 continue;
             }
-            let pa = match (vma.shared_pa(start, page), self.user.entry_of(&self.phys, page)) {
-                (Some(pa), _) => pa,
+            return match (vma.shared_pa(start, page), self.user.entry_of(&self.phys, page)) {
+                (Some(pa), _) => Ok(pa),
                 // Shared with a fork: written, it becomes ours.
-                (None, Some((slot, desc))) if desc & paging::DESC_COW != 0 => self.break_cow(slot, desc, vma).map_err(|_| Fault { addr: va })?,
-                (None, Some((_, desc))) => desc & paging::DESC_ADDR,
-                (None, None) => self.populate(page, start, vma).map_err(|_| Fault { addr: va })?,
+                (None, Some((slot, desc))) if desc & paging::DESC_COW != 0 => self.break_cow(slot, desc, vma).map_err(|_| Fault { addr: va }),
+                (None, Some((_, desc))) => Ok(desc & paging::DESC_ADDR),
+                (None, None) => self.populate(page, start, vma).map_err(|_| Fault { addr: va }),
             };
+        }
+    }
+
+    /// Copy into guest memory, checking `access` against the regions (None:
+    /// the loader, which may write anything mapped).
+    fn copy_in(&mut self, addr: u64, data: &[u8], access: Option<Access>) -> Result<(), Fault> {
+        let mut done = 0;
+        while done < data.len() {
+            let va = addr.checked_add(done as u64).ok_or(Fault { addr })?;
+            let pa = self.page_to_write(va, access)?;
+            let page = page_down(va);
             let off = va - page;
             let n = ((PAGE_SIZE - off) as usize).min(data.len() - done);
             unsafe { std::ptr::copy_nonoverlapping(data[done..].as_ptr(), self.ptr(pa + off), n) };
@@ -837,6 +849,14 @@ impl AddressSpace {
                 self.windows.remove(&ws);
                 self.machine.windows().release(ws);
             }
+        }
+    }
+
+    /// It uses `window`, which [`SharedWindows::create`] counted it a user
+    /// of: once is enough (a second mapping of something it maps already).
+    fn use_window(&mut self, window: u64) {
+        if !self.windows.insert(window) {
+            self.machine.windows().release(window);
         }
     }
 
@@ -955,7 +975,7 @@ impl AddressSpace {
         let created = self.machine.windows().create(host_fd, offset, len, writable);
         match created {
             Ok((window, ipa)) => {
-                self.windows.insert(window);
+                self.use_window(window);
                 self.vmas.insert(addr, addr + len, p, Backing::Shared { ipa });
                 addr as i64
             }
@@ -981,7 +1001,7 @@ impl AddressSpace {
         let created = self.machine.windows().create(Some(host_fd), offset, len, false);
         match created {
             Ok((window, ipa)) => {
-                self.windows.insert(window);
+                self.use_window(window);
                 self.vmas.insert(addr, addr + len, p, Backing::File { ipa });
                 addr as i64
             }
@@ -1009,6 +1029,39 @@ impl AddressSpace {
         let window = self.machine.windows().find(ipa).into_iter().collect();
         self.release_unused_windows(window);
         self.copy_in(start, &data, None)
+    }
+
+    /// See [`GuestMemory::shared_futex_key`]: the window's object and
+    /// offset for a `MAP_SHARED` region; None for the rest (a private
+    /// file mapping's pages become the process's own when written, as on
+    /// Linux, where only an unwritten one is keyed by its file).
+    pub fn shared_futex_key(&self, addr: u64) -> Result<Option<SharedKey>, Fault> {
+        let (start, vma) = self.vmas.find(addr).ok_or(Fault { addr })?;
+        if !matches!(vma.backing, Backing::Shared { .. }) {
+            return Ok(None);
+        }
+        let page = page_down(addr);
+        let pa = vma.shared_pa(start, page).expect("a shared region's window") + (addr - page);
+        Ok(self.machine.windows().futex_key(pa))
+    }
+
+    /// See [`GuestMemory::update_u32`]: a compare-and-swap on the host's
+    /// view of the page, which is the guest's memory itself, so it's atomic
+    /// against the guest's own atomics on other CPUs.
+    pub fn update_u32(&mut self, addr: u64, f: &mut dyn FnMut(u32) -> Option<u32>) -> Result<u32, Fault> {
+        if !addr.is_multiple_of(4) {
+            return Err(Fault { addr });
+        }
+        let pa = self.page_to_write(addr, Some(Access::Write))?;
+        let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(self.ptr(pa + (addr - page_down(addr))).cast()) };
+        let mut old = word.load(Ordering::Acquire);
+        loop {
+            let Some(new) = f(old) else { return Ok(old) };
+            match word.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(old),
+                Err(now) => old = now,
+            }
+        }
     }
 
     pub fn munmap(&mut self, addr: u64, len: u64) -> i64 {
@@ -1134,6 +1187,12 @@ impl GuestMemory for Space {
     }
     fn discard(&self, addr: u64, len: u64) -> i64 {
         self.lock().discard(addr, len)
+    }
+    fn shared_futex_key(&self, addr: u64) -> Result<Option<SharedKey>, Fault> {
+        self.lock().shared_futex_key(addr)
+    }
+    fn update_u32(&self, addr: u64, f: &mut dyn FnMut(u32) -> Option<u32>) -> Result<u32, Fault> {
+        self.lock().update_u32(addr, f)
     }
 }
 
@@ -1475,6 +1534,43 @@ mod tests {
             s.write(a + 100, &[42]).unwrap();
             assert_eq!(read_byte(&s, b + 100).unwrap(), 42);
             assert!(s.write(b, &[1]).is_err(), "second mapping is read-only");
+        }
+
+        /// Address spaces of one machine mapping the same file share its
+        /// window (one host mapping, one place in guest physical memory),
+        /// for shared and private read-only mappings alike, and key a
+        /// futex there alike; a private mapping's first write is its own.
+        #[test]
+        fn one_window_per_object_and_access() {
+            let f = pages(4);
+            let file = f.reopen().unwrap();
+            let machine = Machine::new().unwrap();
+            let mut spaces: Vec<AddressSpace> = (0..3).map(|_| AddressSpace::new(&machine).unwrap()).collect();
+            let shared: Vec<u64> = spaces.iter_mut().map(|s| map(s, &file, 0x4000, RW, 0) as u64).collect();
+            assert_eq!(machine.windows().count(), 1, "one window for three mappings");
+            spaces[0].write(shared[0] + 0x1000, b"x").unwrap();
+            assert_eq!(read_byte(&spaces[2], shared[2] + 0x1000).unwrap(), b'x');
+            let keys: Vec<_> = spaces.iter().zip(&shared).map(|(s, &a)| s.shared_futex_key(a + 0x1004).unwrap().unwrap()).collect();
+            assert!(keys.iter().all(|k| *k == keys[0] && k.offset == 0x1004), "{keys:?}");
+            // A smaller range inside it, at an offset: the same window.
+            let inner = map(&mut spaces[1], &file, 0x1000, RW, 0x1000) as u64;
+            assert_eq!(read_byte(&spaces[1], inner).unwrap(), b'x');
+            assert_eq!(machine.windows().count(), 1);
+            // Private read-only mappings (a library's): a window of their
+            // own access, one for all.
+            let private: Vec<u64> = spaces.iter_mut().map(|s| s.mmap_file(0, 0x4000, RW, mm::MAP_PRIVATE, file.as_raw_fd(), 0) as u64).collect();
+            assert_eq!(machine.windows().count(), 2);
+            assert_eq!(spaces[0].shared_futex_key(private[0]).unwrap(), None, "a private mapping's futexes are its own");
+            spaces[0].write(private[0], b"mine").unwrap();
+            assert_eq!(read_byte(&spaces[1], private[1]).unwrap(), b'a', "the first write stayed private");
+            assert_eq!(read_byte(&spaces[0], shared[0]).unwrap(), b'a', "and out of the file");
+            // Unmapping in one leaves the others' views.
+            assert_eq!(spaces[1].munmap(shared[1], 0x4000), 0);
+            assert_eq!(spaces[1].munmap(inner, 0x1000), 0);
+            spaces[2].write(shared[2] + 2, b"y").unwrap();
+            assert_eq!(read_byte(&spaces[0], shared[0] + 2).unwrap(), b'y');
+            drop(spaces);
+            assert_eq!(machine.windows().count(), 0, "gone with their last users");
         }
 
         #[test]

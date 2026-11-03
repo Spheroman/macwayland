@@ -93,6 +93,41 @@ pub trait GuestMemory {
     fn resident_pages(&self) -> u64 {
         0
     }
+
+    /// Where the word at `addr` lives, for a futex that isn't private:
+    /// Some(key) if it's in memory shared with other processes (a
+    /// `MAP_SHARED` mapping), naming the object mapped and the offset in
+    /// it, so that every process mapping that object finds the same key
+    /// there, as Linux keys such futexes by inode and page; None if it's
+    /// the address space's own. Err if `addr` isn't mapped.
+    fn shared_futex_key(&self, addr: u64) -> Result<Option<SharedKey>, Fault> {
+        let mut b = [0u8; 1];
+        self.read(addr, &mut b).map(|()| None)
+    }
+
+    /// Change the aligned 4-byte word at `addr` atomically, as the guest's
+    /// own atomic instructions see it: `f` gets the value and gives the new
+    /// one (None: leave it), and may be called again if the word changed
+    /// meanwhile. Returns the value `f` was last given. Needs write access.
+    /// (This default, for memories no other thread touches, isn't atomic.)
+    fn update_u32(&self, addr: u64, f: &mut dyn FnMut(u32) -> Option<u32>) -> Result<u32, Fault> {
+        let mut b = [0u8; 4];
+        self.read(addr, &mut b)?;
+        let old = u32::from_le_bytes(b);
+        if let Some(new) = f(old) {
+            self.write(addr, &new.to_le_bytes())?;
+        }
+        Ok(old)
+    }
+}
+
+/// A futex word in shared memory, as every process mapping it sees it: the
+/// object (a file, a shared memory object, shared anonymous memory) and the
+/// offset of the word in it. See [`GuestMemory::shared_futex_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SharedKey {
+    pub object: [u64; 2],
+    pub offset: u64,
 }
 
 /// Any [`GuestMemory`], sized, so that `&ByRef(mem)` can be a `&dyn
@@ -132,6 +167,12 @@ impl<M: GuestMemory + ?Sized> GuestMemory for ByRef<'_, M> {
     }
     fn resident_pages(&self) -> u64 {
         self.0.resident_pages()
+    }
+    fn shared_futex_key(&self, addr: u64) -> Result<Option<SharedKey>, Fault> {
+        self.0.shared_futex_key(addr)
+    }
+    fn update_u32(&self, addr: u64, f: &mut dyn FnMut(u32) -> Option<u32>) -> Result<u32, Fault> {
+        self.0.update_u32(addr, f)
     }
 }
 

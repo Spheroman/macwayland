@@ -35,7 +35,7 @@ pub(crate) use kfd::{eventfd_copy, timerfd_copy};
 pub use kfd::now as kevent_now;
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::{HostSignalWait, SignalFd};
-pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
+pub use futex::{finish_wait as futex_finish_wait, restarts_after_handler as futex_restarts_after_handler, waits as futex_waits, FutexWait, Waker};
 pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, MacPrograms, ProcStatus, Waited, RUSAGE_SIZE};
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
@@ -46,7 +46,7 @@ pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, Handle
 pub use signal::{from_darwin as signal_from_darwin, to_darwin as signal_to_darwin};
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     os::fd::{AsFd, OwnedFd},
     path::PathBuf,
     sync::{
@@ -93,8 +93,11 @@ pub struct Process {
     children: Mutex<process::Children>,
     /// If this process was forked: the control socket to its parent.
     parent_ctl: Option<OwnedFd>,
-    /// Threads waiting in `futex`.
+    /// Its private futexes' number, in the futex table's keys.
     futexes: futex::Futexes,
+    /// Each thread's robust futex list (`set_robust_list`), by tid: what
+    /// the core lets go of as the thread ends ([`Process::release_robust`]).
+    robust: Mutex<HashMap<i64, u64>>,
     /// `exit_group` (or a fatal signal, or `execve`) is ending every thread.
     exiting: AtomicBool,
     /// POSIX timers.
@@ -242,6 +245,7 @@ impl Process {
             children: Mutex::default(),
             parent_ctl: None,
             futexes: futex::Futexes::default(),
+            robust: Mutex::default(),
             exiting: AtomicBool::new(false),
             tids: std::sync::atomic::AtomicI64::new(0),
             timers: Mutex::default(),
@@ -412,10 +416,31 @@ impl Process {
         self.exiting.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Wake up to `n` threads waiting in `futex` on `addr` (a thread's exit
-    /// with CLONE_CHILD_CLEARTID: what `pthread_join` waits for).
-    pub fn futex_wake(&self, addr: u64, n: u64) -> i64 {
-        self.futexes.wake(addr, n, u32::MAX)
+    /// A thread's exit with CLONE_CHILD_CLEARTID, its word zeroed: wake a
+    /// thread waiting on it (what `pthread_join` waits for), as a shared
+    /// futex, as Linux does.
+    pub fn futex_wake_cleared_tid<M: GuestMemory + ?Sized>(&self, mem: &M, addr: u64) -> i64 {
+        futex::wake_cleared_tid(self, mem, addr)
+    }
+
+    /// Thread `tid` has ended, or is replacing its program (`execve`, with
+    /// the old program's memory as `mem`): the robust futexes it holds are
+    /// marked as their owner's death leaves them, and their waiters woken
+    /// (EOWNERDEAD for the next to lock one), as Linux does.
+    pub fn release_robust<M: GuestMemory + ?Sized>(&self, tid: i64, mem: &M) {
+        let head = self.robust.lock().unwrap_or_else(|e| e.into_inner()).remove(&tid);
+        if let Some(head) = head {
+            futex::exit_robust_list(self, mem, tid, head);
+        }
+    }
+
+    /// The process has ended: every thread's robust futexes still held,
+    /// as for [`Process::release_robust`].
+    pub fn release_all_robust<M: GuestMemory + ?Sized>(&self, mem: &M) {
+        let all = std::mem::take(&mut *self.robust.lock().unwrap_or_else(|e| e.into_inner()));
+        for (tid, head) in all {
+            futex::exit_robust_list(self, mem, tid, head);
+        }
     }
 
     fn thread_pending(&self, tid: i64) -> Option<Arc<Mutex<signal::Pending>>> {
@@ -508,8 +533,25 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
             t.clear_child_tid = a0;
             Ok(t.tid)
         }
-        // Only consulted when a thread dies holding a robust futex.
-        nr::SET_ROBUST_LIST => Ok(0),
+        // Walked when the thread ends (see `Process::release_robust`).
+        nr::SET_ROBUST_LIST => {
+            if a1 != futex::ROBUST_HEAD_SIZE {
+                return Action::Return(-errno::EINVAL);
+            }
+            let mut robust = p.robust.lock().unwrap_or_else(|e| e.into_inner());
+            if a0 == 0 { robust.remove(&t.tid) } else { robust.insert(t.tid, a0) };
+            Ok(0)
+        }
+        nr::GET_ROBUST_LIST => {
+            // This process's threads only (Linux allows others' with
+            // ptrace's permission).
+            let tid = if a0 as i32 == 0 { t.tid } else { a0 as i32 as i64 };
+            if tid != t.tid && !p.inbox.threads().contains_key(&tid) {
+                return Action::Return(-errno::ESRCH);
+            }
+            let head = p.robust.lock().unwrap_or_else(|e| e.into_inner()).get(&tid).copied().unwrap_or(0);
+            mem.write_pod(a1, &head).and_then(|()| mem.write_pod(a2, &futex::ROBUST_HEAD_SIZE)).map(|()| 0)
+        }
         nr::GETPID => Ok(p.pid),
         nr::GETTID => Ok(t.tid),
         nr::GETPPID => Ok(p.kernel.getppid(p)),
@@ -579,6 +621,10 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
             }
             r
         }
+        nr::FUTEX_WAITV => futex::waitv(p, t, mem, a0, a1, a2, a3, a4),
+        nr::FUTEX_WAIT => futex::wait2(p, t, mem, a0, a1, a2, a3, a4, a5),
+        nr::FUTEX_WAKE => futex::wake2(p, mem, a0, a1, a2, a3),
+        nr::FUTEX_REQUEUE => futex::requeue2(p, mem, a0, a1, a2, a3),
         nr::CLOCK_GETTIME => misc::clock_gettime(p, mem, a0, a1, false),
         nr::CLOCK_GETRES => misc::clock_gettime(p, mem, a0, a1, true),
         nr::TIMES => misc::times(p, mem, a0),

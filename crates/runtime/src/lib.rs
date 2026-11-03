@@ -322,6 +322,12 @@ impl Proc {
         self.space.lock().unwrap_or_else(|e| e.into_inner()).clone().expect("a process with no address space")
     }
 
+    /// Its address space, if it still has one (not once it's to become a
+    /// Mac program, in 1:1).
+    fn space_if_any(&self) -> Option<Arc<Space>> {
+        self.space.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// A new address space (`execve`); the old one is returned.
     fn set_space(&self, space: Arc<Space>) -> Option<Arc<Space>> {
         self.space.lock().unwrap_or_else(|e| e.into_inner()).replace(space)
@@ -393,6 +399,11 @@ impl Host<'_> {
 
     /// Thread `tid` of `proc` has ended (its task won't run again).
     fn thread_gone(&self, proc: &Arc<Proc>, tid: i64) {
+        // The robust futexes it holds, as it goes (another process may be
+        // waiting for one, in shared memory).
+        if let Some(space) = proc.space_if_any() {
+            proc.abi.release_robust(tid, &*space);
+        }
         proc.abi.unregister_thread(tid);
         if let Some(table) = &self.table {
             table.thread_gone(proc.abi.pid, tid);
@@ -406,6 +417,11 @@ impl Host<'_> {
     fn check_finished(&self, proc: &Arc<Proc>) {
         if proc.abi.thread_count() > 0 || proc.exit().is_none() || proc.finished.swap(true, Ordering::AcqRel) {
             return;
+        }
+        // Threads that ended without passing `thread_gone` (taken off the
+        // run queue as the process ended): their robust futexes now.
+        if let Some(space) = proc.space_if_any() {
+            proc.abi.release_all_robust(&*space);
         }
         if let Some(table) = &self.table {
             host::finished(self, table, proc);
@@ -808,6 +824,9 @@ fn run_task<'scope, 'env>(
             // CPUs set up for it when they next run a task.
             Next::Exec(program) => {
                 stop_other_threads(sh, &proc);
+                // Its robust futexes are the old program's: Linux lets them
+                // go at `execve`.
+                process.release_robust(thread.tid, &*space);
                 let new = Arc::new(Space::new(program.space));
                 {
                     let mut s = new.lock();
@@ -961,7 +980,7 @@ fn may_block(nr: u64) -> bool {
     use linux_abi::nr::*;
     matches!(
         nr,
-        FUTEX | READ | READV | PREAD64 | WRITE | WRITEV | PWRITE64 | RECVFROM | RECVMSG | RECVMMSG | SENDTO | SENDMSG | SENDMMSG | ACCEPT | ACCEPT4
+        FUTEX | FUTEX_WAITV | FUTEX_WAIT | READ | READV | PREAD64 | WRITE | WRITEV | PWRITE64 | RECVFROM | RECVMSG | RECVMMSG | SENDTO | SENDMSG | SENDMMSG | ACCEPT | ACCEPT4
             | CONNECT | PPOLL | PSELECT6 | EPOLL_PWAIT | EPOLL_PWAIT2 | NANOSLEEP | CLOCK_NANOSLEEP | WAIT4 | WAITID
             | RT_SIGTIMEDWAIT | RT_SIGSUSPEND | FLOCK | FCNTL | OPENAT
     )
@@ -1003,7 +1022,7 @@ fn needs_worker(nr: u64, args: &[u64; 6]) -> bool {
 fn end_thread(proc: &Proc, space: &Space, thread: &Thread) {
     let addr = thread.clear_child_tid;
     if addr != 0 && linux_abi::GuestMemory::write(space, addr, &0u32.to_le_bytes()).is_ok() {
-        proc.abi.futex_wake(addr, 1);
+        proc.abi.futex_wake_cleared_tid(space, addr);
     }
 }
 
@@ -1051,15 +1070,21 @@ fn start_fresh_on(vcpu: &mut Vcpu, entry: u64, sp: u64) -> Result<(), Error> {
 /// result takes (a CPU, a worker, a wait made again after parking) ends
 /// here; the call's x1 (op) and x3 (timeout) are still the guest's.
 fn futex_result_check(vcpu: &Vcpu, process: &Process, thread: &Thread, uaddr: u64, ret: i64) {
-    use linux_abi::errno::{EAGAIN, EINTR, ETIMEDOUT};
+    use linux_abi::errno::{EAGAIN, EDEADLK, EINTR, EPERM, ESRCH, ETIMEDOUT};
     static SAID: AtomicBool = AtomicBool::new(false);
     let op = vcpu.reg(reg::X0 + 1).unwrap_or(0);
     let timeout = vcpu.reg(reg::X0 + 3).unwrap_or(0);
-    let cmd = op & 0x7f;
-    let waits = cmd == 0 || cmd == 9; // FUTEX_WAIT, FUTEX_WAIT_BITSET
+    let waits = linux_abi::syscall::futex_waits(op);
+    // FUTEX_LOCK_PI, UNLOCK_PI, TRYLOCK_PI, LOCK_PI2: errors the C
+    // libraries handle (a lock held already, or not held).
+    let pi = matches!(op & 0x7f, 6 | 7 | 8 | 13);
     // A wait returns 0 when woken: anything above is as fatal to glibc as
     // an errno it doesn't expect.
-    let fine = ret == -EAGAIN || (ret == -EINTR && waits) || (ret == -ETIMEDOUT && waits && timeout != 0) || (ret > 0 && !waits);
+    let fine = ret == -EAGAIN
+        || (ret == -EINTR && waits)
+        || (ret == -ETIMEDOUT && waits && timeout != 0)
+        || (ret > 0 && !waits)
+        || (pi && matches!(-ret, EDEADLK | EPERM | ESRCH));
     if !fine && !SAID.swap(true, Ordering::Relaxed) {
         eprintln!("macwl-run: futex returned {ret} (op {op:#x}, uaddr {uaddr:#x}, timeout {timeout:#x}) to pid {} tid {}", process.pid, thread.tid);
     }
@@ -1358,7 +1383,7 @@ fn system_call<'scope, 'env>(
             // A futex wait made again after it parked: the same wait,
             // still queued (made from scratch, it could miss a wake).
             let action = match futex.take() {
-                Some(w) => Some(Action::Return(futex_finish_wait(process, thread, w).unwrap_or_else(|e| -e))),
+                Some(w) => Some(Action::Return(futex_finish_wait(process, thread, space, w).unwrap_or_else(|e| -e))),
                 None => contained(process, nr, || dispatch(process, thread, space, nr, args)),
             };
             sched::set_inline(slot, false);
@@ -1675,10 +1700,11 @@ fn deliver_signals(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &m
             Delivery::Kill(sig) => return Ok(Some(Exit::Signal(sig as i32))),
             Delivery::Handler(call) => {
                 let mut ctx = hv::UserContext::save(vcpu)?;
+                // A PI lock is made again whatever the handler's flags, as
+                // Linux does (ERESTARTNOINTR).
                 if let Some((nr, arg0, ret)) = syscall.take()
                     && ret == -linux_abi::errno::EINTR
-                    && call.restart
-                    && restartable(nr)
+                    && ((call.restart && restartable(nr)) || (nr == linux_abi::nr::FUTEX && linux_abi::syscall::futex_restarts_after_handler(ctx.x[1])))
                 {
                     // Back to the svc, with its first argument again.
                     ctx.pc -= 4;
@@ -1717,7 +1743,7 @@ fn restartable(nr: u64) -> bool {
     use linux_abi::nr::*;
     // Locks too: an interrupted `flock` or `F_SETLKW` hasn't taken the lock
     // (and no other `fcntl` command blocks, so none is interrupted).
-    matches!(nr, READ | READV | WRITE | WRITEV | PREAD64 | PWRITE64 | WAIT4 | WAITID | OPENAT | IOCTL | RECVFROM | SENDTO | RECVMSG | SENDMSG | RECVMMSG | SENDMMSG | ACCEPT | ACCEPT4 | FUTEX | FLOCK | FCNTL)
+    matches!(nr, READ | READV | WRITE | WRITEV | PREAD64 | PWRITE64 | WAIT4 | WAITID | OPENAT | IOCTL | RECVFROM | SENDTO | RECVMSG | SENDMSG | RECVMMSG | SENDMMSG | ACCEPT | ACCEPT4 | FUTEX | FUTEX_WAITV | FUTEX_WAIT | FLOCK | FCNTL)
 }
 
 /// Whether an abort's fault status code (ISS bits 5:0) is a translation or

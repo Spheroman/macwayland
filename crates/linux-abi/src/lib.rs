@@ -19,5 +19,5 @@ pub mod shm;
 pub mod syscall;
 pub mod wire;
 
-pub use memory::{Fault, GuestMemory, Region};
+pub use memory::{Fault, GuestMemory, Region, SharedKey};
 pub use syscall::{dispatch, Action, Process};

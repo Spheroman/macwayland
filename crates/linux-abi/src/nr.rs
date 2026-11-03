@@ -42,6 +42,7 @@ pub const EXIT_GROUP: u64 = 94;
 pub const SET_TID_ADDRESS: u64 = 96;
 pub const FUTEX: u64 = 98;
 pub const SET_ROBUST_LIST: u64 = 99;
+pub const GET_ROBUST_LIST: u64 = 100;
 pub const NANOSLEEP: u64 = 101;
 pub const CLOCK_GETTIME: u64 = 113;
 pub const CLOCK_GETRES: u64 = 114;
@@ -113,6 +114,10 @@ pub const WAIT4: u64 = 260;
 pub const CLONE3: u64 = 435;
 pub const CLOSE_RANGE: u64 = 436;
 pub const EPOLL_PWAIT2: u64 = 441;
+pub const FUTEX_WAITV: u64 = 449;
+pub const FUTEX_WAKE: u64 = 454;
+pub const FUTEX_WAIT: u64 = 455;
+pub const FUTEX_REQUEUE: u64 = 456;
 pub const FADVISE64: u64 = 223;
 pub const STATX: u64 = 291;
 pub const RSEQ: u64 = 293;
@@ -291,6 +296,11 @@ mod tests {
             (SET_TID_ADDRESS, "set_tid_address"),
             (FUTEX, "futex"),
             (SET_ROBUST_LIST, "set_robust_list"),
+            (GET_ROBUST_LIST, "get_robust_list"),
+            (FUTEX_WAITV, "futex_waitv"),
+            (FUTEX_WAKE, "futex_wake"),
+            (FUTEX_WAIT, "futex_wait"),
+            (FUTEX_REQUEUE, "futex_requeue"),
             (NANOSLEEP, "nanosleep"),
             (CLOCK_GETTIME, "clock_gettime"),
             (CLOCK_GETRES, "clock_getres"),

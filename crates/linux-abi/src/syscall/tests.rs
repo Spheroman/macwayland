@@ -892,6 +892,112 @@ fn futex_waits_and_wakes_across_threads() {
     });
 }
 
+/// PI locks (LOCK_PI handing over at UNLOCK_PI, TRYLOCK_PI, EDEADLK,
+/// EPERM), a robust futex whose owner thread ends with a waiter on it,
+/// WAKE_OP's arithmetic, and futex_waitv woken by its second futex.
+#[test]
+fn pi_robust_wake_op_and_waitv() {
+    use std::time::Duration;
+    let p = Process::new("/");
+    let mem = SyncMem(std::sync::Mutex::new(vec![0; 4096]));
+    let call = |t: &mut Thread, nr: u64, a: &[u64]| -> i64 {
+        let mut args = [0; 6];
+        args[..a.len()].copy_from_slice(a);
+        match dispatch(&p, t, &mem, nr, args) {
+            Action::Return(v) => v,
+            other => panic!("{other:?}"),
+        }
+    };
+    let u32_at = |a: u64| {
+        let mut b = [0; 4];
+        mem.read(a, &mut b).unwrap();
+        u32::from_le_bytes(b)
+    };
+    const WAITERS: u32 = 0x8000_0000;
+    const OWNER_DIED: u32 = 0x4000_0000;
+    const LOCK_PI: u64 = 6;
+    const UNLOCK_PI: u64 = 7;
+    const TRYLOCK_PI: u64 = 8;
+    let word = BASE;
+    let mut a = Thread::main(&p).spawn(2);
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, LOCK_PI, 0, 0]), 0, "free: taken");
+    assert_eq!(u32_at(word), 2);
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, LOCK_PI, 0, 0]), -errno::EDEADLK);
+    std::thread::scope(|s| {
+        let b = s.spawn(|| {
+            let mut b = Thread::main(&p).spawn(3);
+            assert_eq!(call(&mut b, nr::FUTEX, &[word, TRYLOCK_PI, 0, 0]), -errno::EAGAIN);
+            assert_eq!(call(&mut b, nr::FUTEX, &[word, UNLOCK_PI, 0, 0]), -errno::EPERM, "not its own");
+            call(&mut b, nr::FUTEX, &[word, LOCK_PI, 0, 0])
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(u32_at(word), 2 | WAITERS, "a waiter marked");
+        assert_eq!(call(&mut a, nr::FUTEX, &[word, UNLOCK_PI, 0, 0]), 0);
+        assert_eq!(b.join().unwrap(), 0);
+        assert_eq!(u32_at(word), 3 | WAITERS, "handed to the waiter");
+    });
+    let mut b = Thread::main(&p).spawn(3);
+    assert_eq!(call(&mut b, nr::FUTEX, &[word, UNLOCK_PI, 0, 0]), 0);
+    assert_eq!(u32_at(word), 0, "no one waits");
+
+    // A robust list: its head at H, one entry at E, the futex word 16 past
+    // each entry. Thread 4 holds it; a waiter waits; 4 ends.
+    let (h, e) = (BASE + 64, BASE + 128);
+    let robust = e + 16;
+    mem.write(h, &[e.to_le_bytes(), 16u64.to_le_bytes(), 0u64.to_le_bytes()].concat()).unwrap();
+    mem.write(e, &h.to_le_bytes()).unwrap();
+    mem.write(robust, &(4 | WAITERS).to_le_bytes()).unwrap();
+    let mut owner = Thread::main(&p).spawn(4);
+    assert_eq!(call(&mut owner, nr::SET_ROBUST_LIST, &[h, 23]), -errno::EINVAL);
+    assert_eq!(call(&mut owner, nr::SET_ROBUST_LIST, &[h, 24]), 0);
+    let got = BASE + 256;
+    assert_eq!(call(&mut owner, nr::GET_ROBUST_LIST, &[0, got, got + 8]), 0);
+    assert_eq!(u32_at(got) as u64, h);
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            let mut w = Thread::main(&p).spawn(5);
+            call(&mut w, nr::FUTEX, &[robust, 0, (4 | WAITERS) as u64, 0])
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        p.release_robust(4, &mem);
+        assert_eq!(waiter.join().unwrap(), 0, "woken by the owner's end");
+    });
+    assert_eq!(u32_at(robust), WAITERS | OWNER_DIED);
+
+    // WAKE_OP: word2 += 5, then (old 0 == 0) a wake on both; no one waits.
+    let word2 = BASE + 512;
+    let op = (1u64 << 28) | (5 << 12); // FUTEX_OP_ADD 5, FUTEX_OP_CMP_EQ 0
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, 5, 1, 1, word2, op]), 0);
+    assert_eq!(u32_at(word2), 5);
+    let shift = (8u64 << 28) | (2 << 28) | (4 << 12); // OR (1 << 4)
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, 5, 1, 1, word2, shift]), 0);
+    assert_eq!(u32_at(word2), 5 | 16);
+
+    // futex_waitv on three words, woken by the second.
+    let v = BASE + 1024;
+    let words = [BASE + 2048, BASE + 2052, BASE + 2056];
+    let mut entries = Vec::new();
+    for w in words {
+        entries.extend([0u64.to_le_bytes(), w.to_le_bytes(), (2u64 | 128).to_le_bytes()].concat());
+    }
+    mem.write(v, &entries).unwrap();
+    assert_eq!(call(&mut a, nr::FUTEX_WAITV, &[v, 0, 0, 0, 0]), -errno::EINVAL, "none");
+    mem.write(words[2], &1u32.to_le_bytes()).unwrap();
+    assert_eq!(call(&mut a, nr::FUTEX_WAITV, &[v, 3, 0, 0, 0]), -errno::EAGAIN, "one differs");
+    mem.write(words[2], &0u32.to_le_bytes()).unwrap();
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            let mut w = Thread::main(&p).spawn(6);
+            call(&mut w, nr::FUTEX_WAITV, &[v, 3, 0, 0, 0])
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(call(&mut a, nr::FUTEX_WAKE, &[words[1], u32::MAX as u64, 1, 2 | 128]), 1, "futex2 wake");
+        assert_eq!(waiter.join().unwrap(), 1, "the second woke it");
+    });
+    // Its other entries left their queues.
+    assert_eq!(call(&mut a, nr::FUTEX, &[words[0], 129, 1]), 0);
+}
+
 #[test]
 fn epoll_on_pipes() {
     let mut t = T::new();
