@@ -1570,3 +1570,133 @@ fn stand_ins_in_the_hosts_listing() {
     let st = client.wait().unwrap();
     assert_eq!(st.code(), Some(5), "{st:?}");
 }
+
+/// Whether the suite runs one VM (the default) or 1:1 (`MACWL_ONE_VM=0`).
+fn suite_one_vm() -> bool {
+    std::env::var_os("MACWL_ONE_VM").is_none_or(|v| v != "0")
+}
+
+fn shmfutex_guest() -> std::path::PathBuf {
+    let path = format!("{}/../../target/guest/shmfutex", env!("CARGO_MANIFEST_DIR"));
+    std::fs::canonicalize(path).expect("run scripts/build-guest.sh first")
+}
+
+/// `guest/shmfutex` with `args`, in the suite's mode: its stdout, after
+/// checking it ended well and the runtime said nothing of futexes.
+fn shmfutex(args: &[&str]) -> String {
+    let out = macwl_run().arg(shmfutex_guest()).args(args).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && stdout.ends_with(&format!("shmfutex {} ok\n", args[0])), "{args:?}: {stdout}, stderr: {stderr}");
+    assert!(!stderr.contains("futex returned") && !stderr.contains("internal result"), "{args:?}: {stderr}");
+    stdout
+}
+
+/// Process-shared mutexes, condition variables, semaphores and barriers
+/// across processes: forked ones sharing anonymous memory, and a program
+/// exec'd afresh mapping a POSIX shm object by name, or a memfd it was
+/// passed over a Unix socket. (In 1:1 a waiter in another Mac process
+/// isn't reached by a wake: it looks at the word now and then instead,
+/// slower, but it works.)
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn process_shared_sync() {
+    for test in ["fork", "shm", "memfd"] {
+        shmfutex(&[test]);
+    }
+}
+
+/// The same between processes of two clients of one host (one VM, as
+/// clients are): one makes a POSIX shm object, the other maps it by name.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn process_shared_sync_between_clients() {
+    let host = Served::start();
+    let name = format!("/shmfutex.clients.{}", std::process::id());
+    let maker = host.client().arg(shmfutex_guest()).args(["shm", &name]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let peer = host.client().arg(shmfutex_guest()).args(["peer", "shm", &name]).output().unwrap();
+    let made = maker.wait_with_output().unwrap();
+    assert!(peer.status.success(), "peer: {peer:?}");
+    assert_eq!(String::from_utf8_lossy(&made.stdout), "shmfutex shm ok\n", "{made:?}");
+}
+
+/// Robust mutexes, plain and priority-inheriting, whose holder exits
+/// holding them: the next locker gets EOWNERDEAD, whether it was waiting
+/// already or came later; and (one VM) whose holder is killed with SIGKILL.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn robust_mutexes() {
+    shmfutex(&["robust"]);
+    // Not in 1:1: SIGKILL ends the holder's Mac process outright, with
+    // nothing of the runtime left to walk its robust list.
+    if suite_one_vm() {
+        shmfutex(&["robust", "kill"]);
+    }
+}
+
+/// A priority-inheriting process-shared mutex (FUTEX_LOCK_PI and
+/// UNLOCK_PI) contended by three processes; trylock while another holds it.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn pi_mutexes() {
+    shmfutex(&["pi"]);
+}
+
+/// FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP and futex_waitv between processes,
+/// with the counts of waiters woken and moved. One VM only: in 1:1 the
+/// waiters are other Mac processes, which a wake can't reach or count.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn futex_ops_across_processes() {
+    if !suite_one_vm() {
+        return;
+    }
+    for test in ["requeue", "wakeop", "waitv"] {
+        shmfutex(&[test]);
+    }
+}
+
+/// Two processes see each other's writes through a file, POSIX shm, a
+/// memfd (each mapped afresh by both) and shared anonymous memory; one
+/// unmapping leaves the other's view; a private mapping's first write
+/// stays its own while its unwritten pages show the file's changes.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn shared_windows() {
+    shmfutex(&["windows"]);
+}
+
+/// A file mapped by many processes of a host (as a library is) is one
+/// host mapping however many map it, as `vmmap` lists the host's. One VM
+/// only: in 1:1 each process is a Mac process with a mapping of its own.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_window_for_a_library_in_many_processes() {
+    use std::io::{BufRead, BufReader, Write};
+    if !suite_one_vm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("libbig.so");
+    std::fs::File::create(&lib).unwrap().write_all(&vec![b'x'; 8 << 20]).unwrap();
+    let mappings = |n: usize| {
+        let mut child = macwl_run()
+            .arg(shmfutex_guest())
+            .args(["library".as_ref(), lib.as_os_str(), n.to_string().as_ref()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(lines.next().map(Result::unwrap), Some(format!("{n} mapped")));
+        let vmmap = std::process::Command::new("vmmap").arg("-wide").arg(child.id().to_string()).output().unwrap();
+        let count = String::from_utf8_lossy(&vmmap.stdout).lines().filter(|l| l.contains("libbig.so")).count();
+        drop(child.stdin.take());
+        assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("shmfutex library ok"));
+        assert!(child.wait().unwrap().success());
+        count
+    };
+    let one = mappings(1);
+    assert!(one >= 1, "the file is mapped in the host");
+    assert_eq!(mappings(30), one, "30 processes, as many host mappings as for one");
+}

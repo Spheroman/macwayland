@@ -8,6 +8,11 @@
 //   unix-thread   the same, between two threads
 //   eventfd       a count over two eventfds, between two threads
 //   futex         a word and FUTEX_WAIT/FUTEX_WAKE, between two threads
+//   futex-proc    the same between two processes, the word in shared
+//                 memory (non-private futex ops)
+//   mutex-proc    a process-shared mutex in shared memory handed over: the
+//                 time from the holder's unlock to the other process,
+//                 blocked in pthread_mutex_lock, holding it
 //   sleep         no partner: nanosleep(50 us), the time it took
 // N is the number of rounds timed (after 200 not timed). SPIN threads (0 by
 // default) spin meanwhile, so that blocked calls give their CPU up (with
@@ -17,12 +22,14 @@
 #include <errno.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -43,7 +50,9 @@ static int rounds;
 // and sockets: there, ping uses a[1]/b[0], pong b[1]/a[0].
 static int a[2], b[2];
 static int efd[2];
-static _Atomic uint32_t word;
+static _Atomic uint32_t word_here;
+static _Atomic uint32_t *wordp = &word_here;
+static int futex_flags = FUTEX_PRIVATE_FLAG;
 static atomic_int stop_spinning;
 
 static void put(int fd) {
@@ -57,13 +66,26 @@ static void get(int fd) {
 }
 
 static void futex_wait(uint32_t val) {
-    while (atomic_load(&word) == val)
-        syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, val, 0, 0, 0);
+    while (atomic_load(wordp) == val)
+        syscall(SYS_futex, wordp, FUTEX_WAIT | futex_flags, val, 0, 0, 0);
 }
 
 static void futex_set(uint32_t val) {
-    atomic_store(&word, val);
-    syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+    atomic_store(wordp, val);
+    syscall(SYS_futex, wordp, FUTEX_WAKE | futex_flags, 1, 0, 0, 0);
+}
+
+// mutex-proc: in shared memory.
+struct handoff {
+    pthread_mutex_t m;
+    atomic_int phase;
+    _Atomic double t0, took;
+};
+static struct handoff *ho;
+
+static void until_phase(int p) {
+    while (atomic_load(&ho->phase) != p)
+        sched_yield();
 }
 
 static const char *mode;
@@ -78,7 +100,16 @@ static void pong(void) {
             v = 1;
             CHECK(write(efd[1], &v, 8) == 8);
         }
-    } else if (!strcmp(mode, "futex")) {
+    } else if (!strcmp(mode, "mutex-proc")) {
+        for (int i = 0; i < total; i++) {
+            until_phase(1);
+            atomic_store(&ho->phase, 2);
+            CHECK(pthread_mutex_lock(&ho->m) == 0);
+            atomic_store(&ho->took, now_us() - atomic_load(&ho->t0));
+            CHECK(pthread_mutex_unlock(&ho->m) == 0);
+            atomic_store(&ho->phase, 3);
+        }
+    } else if (!strncmp(mode, "futex", 5)) {
         for (int i = 0; i < total; i++) {
             futex_wait(0); // until ping makes it 1
             futex_set(0 + 2); // 2: answered
@@ -123,7 +154,7 @@ int main(int argc, char **argv) {
     pthread_t spinners[64];
     for (int i = 0; i < spin && i < 64; i++) CHECK(pthread_create(&spinners[i], 0, spinner, 0) == 0);
 
-    int procs = !strcmp(mode, "pipe-proc") || !strcmp(mode, "unix-proc");
+    int procs = !strcmp(mode, "pipe-proc") || !strcmp(mode, "unix-proc") || !strcmp(mode, "futex-proc") || !strcmp(mode, "mutex-proc");
     if (!strncmp(mode, "pipe", 4)) {
         CHECK(pipe(a) == 0 && pipe(b) == 0);
     } else if (!strncmp(mode, "unix", 4)) {
@@ -145,6 +176,17 @@ int main(int argc, char **argv) {
             if (i >= WARMUP) t[i - WARMUP] = now_us() - t0;
         }
         goto report;
+    } else if (!strcmp(mode, "futex-proc")) {
+        wordp = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        CHECK(wordp != MAP_FAILED);
+        futex_flags = 0;
+    } else if (!strcmp(mode, "mutex-proc")) {
+        ho = mmap(0, sizeof *ho, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        CHECK(ho != MAP_FAILED);
+        pthread_mutexattr_t ma;
+        pthread_mutexattr_init(&ma);
+        CHECK(pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED) == 0);
+        CHECK(pthread_mutex_init(&ho->m, &ma) == 0);
     } else if (strcmp(mode, "futex")) {
         dprintf(2, "wakebench: unknown mode %s\n", mode);
         return 2;
@@ -169,7 +211,21 @@ int main(int argc, char **argv) {
             uint64_t v = 1;
             CHECK(write(efd[0], &v, 8) == 8);
             CHECK(read(efd[1], &v, 8) == 8);
-        } else if (!strcmp(mode, "futex")) {
+        } else if (!strcmp(mode, "mutex-proc")) {
+            // The other process blocks in pthread_mutex_lock (given 200 us
+            // to get there) while this one holds the mutex; then it's let go.
+            CHECK(pthread_mutex_lock(&ho->m) == 0);
+            atomic_store(&ho->phase, 1);
+            until_phase(2);
+            struct timespec ts = { 0, 200000 };
+            nanosleep(&ts, 0);
+            atomic_store(&ho->t0, now_us());
+            CHECK(pthread_mutex_unlock(&ho->m) == 0);
+            until_phase(3);
+            atomic_store(&ho->phase, 0);
+            if (i >= WARMUP) t[i - WARMUP] = atomic_load(&ho->took);
+            continue;
+        } else if (!strncmp(mode, "futex", 5)) {
             futex_set(1);
             futex_wait(1); // until pong makes it 2
             futex_set(0);
