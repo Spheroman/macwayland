@@ -134,7 +134,12 @@ from a static Linux binary.
    Shared mappings (`MAP_SHARED`, file or anonymous) are host `mmap`s placed
    in guest physical memory above the private pool (`crates/runtime/src/shared.rs`),
    so a host process mapping the same file — the compositor reading a `wl_shm`
-   buffer — sees the guest's writes live. Known gaps: past-EOF faults are only
+   buffer — sees the guest's writes live. Windows are the VM's, one per
+   object (file by inode, memfd or `/dev/shm` object by an id in its
+   header) and range: every process of a host mapping a library, a font or
+   a shm segment shares one host mapping (`docs/processes.md` step 7,
+   2026-11-03: 100 processes reading a 128 MiB file, host RSS 13.2 GB →
+   205 MB, 4x faster). Known gaps: past-EOF faults are only
    detected per 16 KiB host page (Linux: per 4 KiB, so up to 12 KiB past EOF
    reads as zero instead of SIGBUS); `mremap` is missing. Freed frames are
    quarantined until every vCPU's TLB has been flushed (the vCPU making the
@@ -289,6 +294,16 @@ from a static Linux binary.
    agents over `posix_spawn` giving each program the terminal itself
    (`docs/processes.md`, section 7). Mac `true` from Linux bash: 0.85–1.0
    ms a run (the Mac's own bash: 1.0 ms).
+   Step 7 done (2026-11-03): shared windows deduplicated by object and
+   range, and futexes across processes. One futex table for the host,
+   non-private futexes in shared memory keyed by object and offset:
+   process-shared mutexes, condition variables, semaphores and barriers,
+   requeues, FUTEX_WAKE_OP, PI locks, `futex_waitv` and futex2's calls
+   work between processes (a cross-process round trip 12.8 µs, as between
+   threads); robust lists are walked as threads end (EOWNERDEAD after a
+   holder's exit or SIGKILL). In 1:1, waits on shared futexes look at
+   their word every 1–32 ms instead. Firefox headless: screenshot in
+   0.6 s, peak host RSS 418–448 MB (was 487–505).
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
@@ -681,14 +696,13 @@ gets used. Audited against the runtime 2026-10-28; in the order they'd be hit:
 4. **RViz2.** Qt + Ogre, X11 only in practice (`QT_QPA_PLATFORM=xcb`), so
    it needs XWayland on macwl-compositor. With that, Mesa's llvmpipe should
    draw it without any GPU work (threads, executable mappings).
-5. **Futexes shared between processes.** Fast DDS's shared-memory transport
-   (on by default) and iceoryx (Cyclone's) keep process-shared mutexes and
-   condvars in `/dev/shm`. `futex.rs` ignores `FUTEX_PRIVATE_FLAG`, and each
-   process is its own VM, so a wake never crosses processes: key non-private
-   futexes by (shm object, offset) in a table every macwl-run process sees.
-   `set_robust_list` is a no-op (`syscall.rs`), so a node dying holding such
-   a lock hangs the rest; robust lists need walking on exit. Until then,
-   UDPv4 only (item 1).
+5. **Futexes shared between processes.** Done (2026-11-03,
+   `docs/processes.md` step 7): Fast DDS's shared-memory transport (on by
+   default) and iceoryx (Cyclone's) keep process-shared mutexes and
+   condvars in `/dev/shm`; in one host, non-private futexes are keyed by
+   (shm object, offset), and robust lists are walked as threads end, so a
+   node dying holding such a lock gives the next EOWNERDEAD. Not tried with
+   Fast DDS itself: nixpkgs' `fastdds` is marked broken (not cached).
 6. **vDSO.** DDS and executors call `clock_gettime` constantly; each is a
    trap today. Throughput, not correctness.
 7. **Gazebo.** Ogre2 wants OpenGL 3.3+. With item 11's Vulkan driver, GL

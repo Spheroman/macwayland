@@ -5,7 +5,8 @@ Status: design (2026-11-02), open questions decided (2026-11-02, see
 terminals and job control included, `macwl-run`s from outside joining a
 host as clients, and Mac programs as processes of their own standing in
 for the Linux processes that ran them; one VM is the default,
-`MACWL_ONE_VM=0` keeps 1:1). Step 7 is next. ROADMAP items 6 and 13;
+`MACWL_ONE_VM=0` keeps 1:1); step 7 done (2026-11-03: shared windows
+and futexes across processes). Step 8 is next. ROADMAP items 6 and 13;
 extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
@@ -416,10 +417,11 @@ same relay on a thread of its own, so job control works one way everywhere.
   passed on) that another process already has is the same window at the
   same IPA, counted by the address spaces using it. No host `mmap` per
   process; stage-2 faults once per host rather than once per process
-  (every Firefox process maps libxul); and the IPA is a key for futexes on
-  shared memory, as Linux keys them by page (ROS target, item 5). Private
-  read-through file windows (libraries, fonts) are shared the same way.
-  Making a window costs 0.5 µs whatever its size.
+  (every Firefox process maps libxul); and futexes on shared memory get a
+  key every process agrees on, as Linux keys them by page (ROS target,
+  item 5; as built, step 7, the key is the object and offset rather than
+  the IPA). Private read-through file windows (libraries, fonts) are
+  shared the same way. Making a window costs 0.5 µs whatever its size.
 
 ## 3. Fork: copy on write, inside the VM
 
@@ -1452,6 +1454,134 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
    object and range, private file windows shared, non-private futexes keyed
    by IPA (ROS target, item 5). Measured: Firefox's start and memory with
    and without; Fast DDS's shared-memory transport.
+
+   **Done, 2026-11-03.**
+   - **Windows by object and range** (`shared.rs`). A window knows its
+     object: a regular file by device and inode, a memfd or `/dev/shm`
+     object by an id in its header (random, made with the object; macOS's
+     `fstat` gives shm objects no inode, and `fstat` in the guest now shows
+     the id as the inode), shared anonymous memory by a number of its own.
+     A mapping of a range that a window of the same object and access
+     already shows is that window, one more user; a fork's windows are
+     shared as before. So `MAP_SHARED` of a file, POSIX shm, a memfd or a
+     `wl_shm` pool by several processes is one host mapping and one place
+     in guest physical memory, and private read-only file mappings
+     (libraries, fonts) likewise share one read-only window per file;
+     a private page's first write still makes it the process's own.
+   - **One futex table for the host process** (`linux-abi`'s `futex.rs`),
+     hashed into 256 buckets with a lock each, as Linux's: a private futex
+     is keyed by its process and address, a non-private one in a
+     `MAP_SHARED` region by the window's object and the offset in it
+     (`GuestMemory::shared_futex_key`), the same in every process mapping
+     it. Waits, wakes, bitsets and requeues work across processes; a
+     thread's exit wakes its CLONE_CHILD_CLEARTID word as a shared futex,
+     as Linux does; FUTEX_CMP_REQUEUE now compares with both queues
+     locked (it compared before taking the lock).
+   - **Robust lists**: `set_robust_list` (and `get_robust_list`) per
+     thread, walked as Linux's `exit_robust_list` does as each thread
+     ends, at the process's end for the rest (a SIGKILL included), and at
+     `execve`: each lock the thread still holds gets FUTEX_OWNER_DIED and a
+     waiter is woken (EOWNERDEAD for the next locker). Atomic updates of
+     guest words go through `GuestMemory::update_u32`, a compare-and-swap
+     on the host's view of the page.
+   - **PI futexes**: FUTEX_LOCK_PI, LOCK_PI2, TRYLOCK_PI and UNLOCK_PI:
+     the owner's tid in the word, FUTEX_WAITERS when others wait, the lock
+     handed to the first waiter on unlock, EDEADLK and EPERM as Linux;
+     restarted after a signal handler, never EINTR (Linux's
+     ERESTARTNOINTR). A robust PI lock whose owner dies goes to its first
+     waiter marked FUTEX_OWNER_DIED, whether or not the list marks it PI
+     (musl doesn't; Linux hands PI locks on regardless). No priority is
+     inherited: threads have no priorities yet (`mn-threads.md` step 5).
+   - **FUTEX_WAKE_OP, `futex_waitv`** (up to 128 futexes, Proton's fsync
+     waits on it) **and futex2's `futex_wait`, `futex_wake`,
+     `futex_requeue`**. FUTEX_WAKE for 0 wakes one, as Linux; the
+     CLOCK_REALTIME flag on an op that takes no clock is ENOSYS.
+     FUTEX_WAIT_REQUEUE_PI and CMP_REQUEUE_PI stay unimplemented: no C
+     library has used them since glibc 2.25's condition variables.
+   - **1:1** (`MACWL_ONE_VM=0`): processes are Mac processes with VMs of
+     their own, so windows aren't shared between them and a wake can't
+     reach another's waiters. A wait on a shared futex there looks at its
+     word now and then (every 1 ms, doubling to 32 ms) and ends as a
+     spurious wake when it has changed; a PI lock's wait tries to take the
+     lock. Process-shared mutexes, condition variables, semaphores,
+     barriers, PI locks and robust locks whose holder exits work, slowly
+     (a cross-process futex round trip 1.03 ms). Not in 1:1: wake and
+     requeue counts across processes (FUTEX_CMP_REQUEUE, WAKE_OP and
+     `futex_waitv` woken from another process), and a robust lock whose
+     holder is killed with SIGKILL (macOS ends that Mac process outright,
+     and nothing walks its list).
+
+   Choices the design left open, taken by the rule (2026-11-03):
+   - **Shared futexes keyed by object and offset, not IPA**: the same
+     futex even where one object has two windows (a mapping of a range no
+     window shows whole), and in 1:1, where each process has its own IPAs.
+   - **A window serves any range it contains**, not only the same range:
+     a library's segments, mapped one by one inside the range the loader
+     first reserved, are its one window.
+   - **One hashed table for every futex of the host process**, private and
+     shared alike, as Linux has, rather than a table per process plus one
+     for shared memory: a requeue between any two keys, and a waiter
+     leaving its queue, need no knowledge of whose queue it is.
+   - **PI futexes, WAKE_OP, `futex_waitv` and the futex2 calls**, all
+     implemented; robust lists walked at every way a thread can end.
+   - **1:1 polls** rather than leaving cross-process futexes unsupported
+     there, until 1:1 goes (step 8).
+
+   Measured (M5 Pro):
+   - **A file mapped by many processes**, as a library is (`guest/shmfutex
+     library`, each process mapping it privately and reading every page):
+     20 processes, 64 MiB: host mappings of the file 20 → 1, host RSS 1.33
+     GB → 83 MB (1:1: 22 Mac processes, 1.49 GB); 100 processes, 128 MiB:
+     100 → 1 mappings, RSS 13.2 GB → 205 MB, all mapped and read in
+     0.26–0.27 s → 0.06–0.07 s (the VM's stage 2 faults once, not once per
+     process). Physical footprint the same (68–74 MB): clean file pages
+     aren't counted in it, but they were mapped and faulted per process.
+   - **Latency** (`wakebench`, p50/p99 µs): a futex round trip between
+     processes in shared memory (`futex-proc`) 12.8/18.5, the same as
+     between threads (12.7/17.5); a process-shared mutex handed to a
+     process blocked in `pthread_mutex_lock` (`mutex-proc`) 16.6/25.3.
+     Before: neither ever woke (the wake went to the wrong table). 1:1:
+     1034/1089 and 797/810 (polling). The rest unchanged: pipes between
+     processes 13.6 (14.2 before), threads 13.6 (13.7), futex 12.7 (12.3),
+     a 50 µs sleep 56.2 (56.3); 1:1 12.3, 13.5, 12.7, 56.2 (11.1, 13.6,
+     12.5, 57.6). `forkbench` fork, interleaved with the old build: 0 MB
+     61–68 µs (66–75), 200 MB 198–204 µs (188–209).
+   - **Firefox** 158 (nixpkgs aarch64-linux, `--headless --screenshot` of
+     a local page, content sandbox off): 10 processes, 4 of them exec'd
+     Firefox; the screenshot in 0.6–0.7 s with and without, host RSS at its
+     peak 418–448 MB against 487–505 MB before (four runs each), 26–28
+     host threads. In 1:1 0.8 s. With either build the one-VM host stays
+     after the screenshot until killed (1:1 exits): still to look at. One
+     run of the new build, the first after building, ended early with
+     Hypervisor.framework reporting an unknown exit (reason 3) in the
+     parent; not seen again in the next eight.
+   - **Fast DDS** isn't run: nixpkgs' `fastdds` 3.6.2 is marked broken,
+     so it isn't in the binary cache, and nothing here builds aarch64-linux
+     packages. Its shared-memory transport keeps process-shared mutexes
+     and condition variables in `/dev/shm`, which `process_shared_sync`
+     covers.
+
+   arm64 Wine in both modes: `wineboot -i` exits 0 with 801 files in
+   system32, `wine cmd.exe /c 'echo hi & ver'` prints both, and 30 s of
+   leftovers print nothing of corruption.
+
+   Tests (`guest/shmfutex.c`, both modes unless said): `process_shared_sync`
+   (a process-shared mutex, condition variable, semaphore and barrier
+   among four forked processes, and between a process and a program
+   exec'd afresh, through `shm_open` and through a memfd passed over a
+   Unix socket), `process_shared_sync_between_clients` (the same between
+   two clients of one host), `robust_mutexes` (plain and PI robust
+   mutexes whose holder exits, with the next locker waiting or coming
+   later: EOWNERDEAD; one VM also with the holder killed by SIGKILL),
+   `pi_mutexes`, `futex_ops_across_processes` (CMP_REQUEUE with its
+   counts and a stale value, WAKE_OP, `futex_waitv`; one VM),
+   `shared_windows` (a file, POSIX shm, a memfd and shared anonymous
+   memory: writes seen both ways, one side unmapping, a private
+   mapping's first write its own while unwritten pages follow the file),
+   `one_window_for_a_library_in_many_processes` (30 processes, as many
+   host mappings as one; one VM); unit tests
+   `one_window_per_object_and_access` and `pi_robust_wake_op_and_waitv`.
+   Runtime 42 unit + 59 integration in both modes, linux-abi 73.
 8. **1:1 mode goes.** A host for one program (`--new-host`, the default for
    a `macwl-run` without `MACWL_HOST`) is the isolated mode, so `fork.rs`'s
    spares, Mach memory entries and control sockets, and `exec_host`'s
