@@ -1,9 +1,10 @@
 # Processes in one VM: a host per session
 
 Status: design (2026-11-02), open questions decided (2026-11-02, see
-"Decisions"); steps 1, 2, 3, 3a and 4 done (2026-11-02: processes in one
-VM work behind `MACWL_ONE_VM=1`, terminals and job control included; step
-5, clients, is next). ROADMAP items 6 and 13; extends the thread
+"Decisions"); steps 1, 2, 3, 3a, 4 and 5 done (2026-11-02: processes in one
+VM work behind `MACWL_ONE_VM=1`, terminals and job control included, and
+`macwl-run`s from outside join a host as clients; step 6, Mac programs,
+is next). ROADMAP items 6 and 13; extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
 
@@ -334,28 +335,37 @@ rule once their first client has come.
   they outlive it, when the last does), as "The host's lifetime" says.
 
 A client, like `docker exec`, sends the host its argv, environment, working
-directory, root and binds, and either its fds 0–2 (over `SCM_RIGHTS`) or a
-terminal (below), and gets back the Linux pid. Then:
+directory, root and binds, umask, the signals it ignores and blocks, and
+its fds 0–2 (over `SCM_RIGHTS`) or a terminal (below), and gets back the
+Linux pid. Then (as built at step 5):
 
 - **Exit status**: the host tells the client how its process ended; the
-  client exits with the code, or 128 + the Linux signal (as `macwl-run`
-  does now, rather than raising it).
+  client exits with the code, or raises the signal on itself, so a Mac
+  shell sees a job killed by it. Signals that would dump core (a crash
+  report for the client, not the program) are 128 + the signal instead.
 - **Signals from the Mac side** (`kill` from a Mac shell): the client
-  catches every catchable signal and forwards it to its Linux process.
-  SIGKILL ends the client: the host treats that as the terminal hanging up
-  (SIGHUP to the foreground process group of its terminal, if it had one,
-  and to the process itself). SIGSTOP stops only the client (and so its
-  relay); the Linux side carries on until its output blocks.
-- **Its terminal**, if stdin is one: the client puts it in raw mode and
-  relays bytes both ways to a pty in the host, as `ssh -t` does: the Linux
-  process's terminal is that pty, whose job control the host does (6). Its
-  initial termios and size are the Mac terminal's; SIGWINCH sends the new
-  size. Ctrl-C and Ctrl-Z are bytes the relay passes on, and the host
-  signals the foreground process group. If the client's own Linux process
-  stops (Ctrl-Z), the client restores the Mac terminal and stops itself
-  (SIGSTOP), so the Mac shell sees a stopped job; on SIGCONT it goes raw
-  again and continues the Linux process. Without a terminal there's no
-  relay: the client's fds are the process's.
+  catches every catchable signal (but SIGTTIN and SIGTTOU, which stop the
+  client itself when it touches its terminal from the background) and
+  forwards it to its Linux process's group, as a terminal sends its
+  foreground job's. SIGKILL ends the client: the host treats that as the
+  terminal hanging up (SIGHUP and SIGCONT to its session's leader, the
+  process, which as a shell hangs its jobs up; without a terminal, to the
+  process's group). SIGSTOP stops only the client (and so its relay); the
+  Linux side carries on until its output blocks.
+- **Its terminal**, if stdin is one: the Linux process's terminal is a pty
+  of the host's, whose job control the host does (6), with the Mac
+  terminal's termios and size; the client puts the Mac terminal in raw
+  mode, as `ssh -t` does. The host passes the client the pty's master: the
+  client copies its output straight to the Mac terminal, and sends what's
+  typed through the host, which writes it with the keyboard's signals for
+  the foreground group (Ctrl-C and Ctrl-Z are bytes). SIGWINCH sends the
+  new size, SIGHUP or the terminal's end hangs the pty up. If the client's
+  own Linux process stops (Ctrl-Z, or any stop), the client restores the
+  Mac terminal and stops itself (SIGSTOP), so the Mac shell sees a stopped
+  job; on SIGCONT it continues the Linux process, and goes raw again if
+  it's in the foreground (`fg`; after `bg` it leaves the terminal alone).
+  A process continued from inside continues its client too. Without a
+  terminal there's no relay: the client's fds are the process's.
 
 A host that is itself the `macwl-run` started in a Mac terminal does the
 same relay on a thread of its own, so job control works one way everywhere.
@@ -1161,6 +1171,97 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    host seeing each other's processes in `/proc`; `macwl-run --ps`; the
    host exiting 2 s after its last process and client go, and staying for
    a daemon.
+
+   **Done, 2026-11-02.** `macwl-run --serve PATH` (`host/serve.rs`) is a
+   host with no program of its own: its VM is made with nothing in it, and
+   one host thread serves every client (accepts them, starts their
+   processes, types their terminals' input, routes their signals, tells
+   them of stops, continues and ends). A client (`client.rs`; `MACWL_HOST`
+   or `--host PATH`, `--new-host` to be a host anyway) never makes a VM.
+   The protocol (`proto.rs`): framed `linux_abi::wire` messages over the
+   socket, fds alongside; what to run is a `Launch` (`launch.rs`, also
+   what a `macwl-run` that is the host builds now). A client's process is
+   init's child, leading a group and session of its own, with the client
+   standing as its Mac parent (its group isn't orphaned). `macwl-run --ps`
+   prints pid, parent, group, session, tty, state, CPU time, RSS, the
+   client's Mac pid and the command line (from the process's memory).
+   `scripts/session.sh` with `MACWL_ONE_VM=1` starts one host and exports
+   `MACWL_HOST`; dbus-daemon and foot join it, and bash and everything it
+   starts are foot's children there (`MACWL_SESSION_COMPOSITOR=headless`
+   runs it through the headless compositor, for tests).
+
+   Choices the design left open, taken by the rule (2026-11-02):
+   - **Fds are passed, not relayed**: a client's fds 0–2 go to the host
+     (`SCM_RIGHTS`) and are the process's own, so a pipe or file is used
+     with no copy and no added latency, and the process keeps it after its
+     client has gone (a killed client's process still writes to the
+     client's stdout). With a terminal, the pty's master is passed back to
+     the client, which copies its output to the Mac terminal directly; only
+     typed input goes through the host, which must see each byte for the
+     keyboard's signals. The client, not the host, touches the Mac terminal,
+     so the Mac driver's job control applies to it as to any program (a
+     background client reading the terminal gets SIGTTIN).
+   - **No host thread per client**: one service thread polls every client
+     (up to 256 at once; more are turned away), and a client's own relay
+     threads (3) are in the client.
+   - **The socket is the user's alone**: a directory the host makes for it
+     is mode 700, the socket mode 600, the peer's uid checked with
+     `getpeereid` on both ends (a client won't talk to another user's
+     host), and a lock file (`PATH.lock`) makes one host per path.
+   - **A client with no host starts one**: a plain `posix_spawn` (no
+     `SETEXEC`) of `macwl-run --serve PATH --idle-exit` in a session of its
+     own, its output to `PATH.log`, from a process that has never made a VM
+     (asserted). Two clients racing to start one: the second host finds the
+     lock taken and exits (status 3), and both clients join the first. A
+     host that goes as a client connects is tried again.
+   - **The exit status is raised**, as a shell expects, rather than 128 + the
+     signal: the Mac shell then says "terminated" or "interrupt" as for any
+     job. Core-dumping signals stay a status (raising them would make crash
+     reports for the client).
+   - **Signals go to the process's group**, as a terminal sends them to its
+     foreground job (the client is that job in the Mac shell), and the
+     signals the client was started ignoring or blocking (`nohup`, a
+     script's `&`) start out ignored or blocked in its process, as across an
+     `execve`.
+   - **Lifetime**: 2 s after the last process and client (`--ps` queries
+     don't count); a `--serve` host waits for its first client, one a
+     client started (`--idle-exit`) doesn't. As it goes, it removes the
+     socket and lets the lock go before ending, so a new host can take the
+     path at once. Socket paths are limited to 103 bytes (macOS's
+     `sun_path`).
+
+   Measured (M5 Pro): a client of a warm host starts and ends a static
+   program in 4.4 ms and coreutils' `true` in 5.5 ms, against 5.2 and 5.8
+   ms for a 1:1 `macwl-run` and 5.2 and 6.0 for a one-VM one (most of it
+   macOS starting the `macwl-run` binary). `wakebench` p50s unchanged in
+   both modes (pipes between processes 11.1–12.6 µs, threads 13.5–13.9,
+   futex 12.4–12.5, a 50 µs sleep 55.5–56.9), and the same in a client's
+   process. arm64 Wine as a client of a one-VM host: `wineboot -i` exits
+   0 with 801 files in system32 in 6.4 s (1:1: 6.3 s; a one-VM `macwl-run`
+   of its own, which waits for wineserver and services to go: 14.0 s), and
+   `wine cmd.exe /c 'echo hi & ver'` then prints both in 0.65 s (1:1:
+   0.61 s); the host goes about 9 s later, once wineserver has.
+
+   Tests (`guest/client.c`; all hosts started by the tests):
+   `client_exit_status` (codes, SIGTERM and SIGKILL raised, SIGSEGV as
+   139, fds passed, a missing program, a host started by a client and gone
+   once idle, its directory mode 700), `client_forwards_mac_signals` (`kill
+   -TERM`, `-INT`, `-HUP`, `-USR1` of the client reach the process),
+   `client_killed_hangs_its_process_up`, `clients_share_a_host` (procps
+   `ps` in one client lists the other's process; `macwl-run --ps`),
+   `host_lifetime` (waits for a first client; goes 2 s after the last; a
+   daemon keeps it until 2 s after it ends), `client_relays_its_terminal`
+   (size, Ctrl-Z stopping the client with the terminal's settings back,
+   SIGCONT, Ctrl-C ending the client by SIGINT, a resize, a hangup),
+   `session_shares_one_host` (`session.sh` headless: procps `ps` typed into
+   foot's bash lists dbus-daemon, foot, bash and itself; `--ps` shows the
+   two clients; everything gone once bash exits); `Launch`'s wire format.
+   Runtime 36 unit + 46 integration in both modes, linux-abi 71.
+   Seen once in about ten one-VM suite runs, under the full suite's load:
+   foot in `session_shares_one_host` aborted with glibc's "The futex
+   facility returned an unexpected error code" (a futex call returning an
+   error glibc treats as impossible). Not reproduced alone or in seven
+   further suite runs, with every futex error logged; still to find.
 6. **Mac programs as stand-ins.** Spawn first, the reaper, signals, tty
    agents, Mac groups following Linux ones. Tests: item 13's list
    (scripted where it was by hand: Mac `uname`, `false`, `env`, mixed

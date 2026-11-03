@@ -259,8 +259,22 @@ from a static Linux binary.
    and a `macwl-run` started in a Mac terminal relaying it to a pty of the
    host's, stopping with its first process as the Mac shell's job. foot
    with bash: Ctrl-C, Ctrl-Z, `jobs`, `bg`, `fg` and vim suspended and
-   resumed, the same in one VM and 1:1. Clients (5) and Mac programs (6:
-   refused with ENOEXEC under the flag) follow.
+   resumed, the same in one VM and 1:1. Step 5 done (2026-11-02):
+   clients. `macwl-run --serve PATH` is a host with no program of its own;
+   a `macwl-run` with `MACWL_HOST=PATH` joins it as `docker exec` joins a
+   container (starting one if none serves the path), passing its fds 0–2
+   for the process to use directly, relaying its terminal through a pty of
+   the host's, forwarding the Mac side's signals, and ending as its process
+   did (the code, or the signal raised on itself); a client killed with
+   SIGKILL hangs its process up. Hosts go 2 s after their last process and
+   client, and stay for a daemon. `macwl-run --ps` lists a host's
+   processes from the Mac. `scripts/session.sh` with `MACWL_ONE_VM=1` runs
+   the whole session (dbus-daemon, foot, bash and what it starts) in one
+   host. A client starts in 4.4 ms against 5.2 ms for a `macwl-run` of
+   its own; `wine cmd.exe` after `wineboot` returns in 0.65 s as a client
+   (1:1: 0.61 s), where a one-VM `macwl-run` of its own returns only once
+   wineserver has gone (6.1 s).
+   Mac programs (6: refused with ENOEXEC under the flag) follow.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
