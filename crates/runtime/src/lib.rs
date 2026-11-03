@@ -967,20 +967,19 @@ fn may_block(nr: u64) -> bool {
     )
 }
 
-/// Whether a signal pending as the call starts interrupts it (EINTR) before
-/// it waits, as Linux checks before it sleeps. Not for calls that wait with
-/// a signal mask of their own (they look against that), nor `openat`
-/// (only a FIFO's waits, and that one is rare: a file's open isn't
-/// interruptible).
+/// Whether a signal pending as the call starts interrupts it (EINTR) here,
+/// before it's made: only calls that wait in a host call that doesn't look
+/// for signals first (`flock` and `F_SETLKW` that may wait for a lock), where
+/// the interrupt sent as the signal came would be lost and the call would
+/// sleep through it. Every other wait looks for itself before it sleeps
+/// (linux_abi's `block`, a futex wait, `wait4`, the waits with a mask of
+/// their own), and on Linux a signal ends only a wait: a futex wake, a read
+/// or write that's ready, a nonblocking call never fail with EINTR. (They
+/// did here, whenever a signal came as the call was on its way: glibc
+/// aborts on a wake's EINTR, "The futex facility returned an unexpected
+/// error code", which foot met; a nonblocking timerfd read failed too.)
 fn interruptible(nr: u64, args: &[u64; 6]) -> bool {
-    use linux_abi::nr::*;
-    match nr {
-        RT_SIGSUSPEND | OPENAT => false,
-        PPOLL => args[3] == 0,
-        PSELECT6 => args[5] == 0,
-        EPOLL_PWAIT | EPOLL_PWAIT2 => args[4] == 0,
-        _ => true,
-    }
+    needs_worker(nr, args)
 }
 
 /// Calls that would block on something no kqueue can watch, so that with
@@ -1046,8 +1045,9 @@ fn start_fresh_on(vcpu: &mut Vcpu, entry: u64, sp: u64) -> Result<(), Error> {
 }
 
 /// Say (once) when a futex call returns what glibc takes as fatal ("The
-/// futex facility returned an unexpected error code"): anything but EAGAIN,
-/// EINTR and, for a wait with a timeout, ETIMEDOUT. Every path a futex
+/// futex facility returned an unexpected error code"): anything but EAGAIN
+/// and, for a wait, EINTR and (with a timeout) ETIMEDOUT; a wake's EINTR is
+/// as fatal as any other. Every path a futex
 /// result takes (a CPU, a worker, a wait made again after parking) ends
 /// here; the call's x1 (op) and x3 (timeout) are still the guest's.
 fn futex_result_check(vcpu: &Vcpu, process: &Process, thread: &Thread, uaddr: u64, ret: i64) {
@@ -1059,7 +1059,7 @@ fn futex_result_check(vcpu: &Vcpu, process: &Process, thread: &Thread, uaddr: u6
     let waits = cmd == 0 || cmd == 9; // FUTEX_WAIT, FUTEX_WAIT_BITSET
     // A wait returns 0 when woken: anything above is as fatal to glibc as
     // an errno it doesn't expect.
-    let fine = ret == -EAGAIN || ret == -EINTR || (ret == -ETIMEDOUT && waits && timeout != 0) || (ret > 0 && !waits);
+    let fine = ret == -EAGAIN || (ret == -EINTR && waits) || (ret == -ETIMEDOUT && waits && timeout != 0) || (ret > 0 && !waits);
     if !fine && !SAID.swap(true, Ordering::Relaxed) {
         eprintln!("macwl-run: futex returned {ret} (op {op:#x}, uaddr {uaddr:#x}, timeout {timeout:#x}) to pid {} tid {}", process.pid, thread.tid);
     }

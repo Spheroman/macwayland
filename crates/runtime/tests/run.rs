@@ -399,8 +399,9 @@ fn processes() {
 
 /// Signal handlers: frames and rt_sigreturn, masks and pending signals, the
 /// alternate stack, SIGSEGV handled, a timer interrupting a busy loop (a host
-/// signal kicking the vCPU out), SA_RESTART, signals from another process,
-/// SIGPIPE: see guest/signals.c.
+/// signal kicking the vCPU out), SA_RESTART, calls that don't wait never
+/// failing with EINTR (or skipped) while another thread signals all along,
+/// signals from another process, SIGPIPE: see guest/signals.c.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn signals() {
