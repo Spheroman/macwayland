@@ -164,7 +164,9 @@ static void calls_that_dont_wait(void) {
     CHECK(pthread_create(&t, 0, pelt, &self) == 0);
     char c;
     uint64_t v = 1;
-    for (int i = 0; i < 100000; i++) {
+    // 10000 rounds: the old bugs showed in nearly every run at this size,
+    // and it takes seconds, not minutes, under the signals.
+    for (int i = 0; i < 10000; i++) {
         long r = syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
         if (r != 0) printf("futex wake: %ld errno %d (round %d)\n", r, errno, i);
         CHECK(r == 0);
