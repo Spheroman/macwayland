@@ -682,6 +682,166 @@ fn one_vm_refuses_mac_programs_when_off() {
     assert!(out.status.success());
 }
 
+/// Mac programs from Linux bash in one VM (docs/processes.md, section 7;
+/// ROADMAP.md item 13's list, scripted in tests/mac_programs.sh): Mac
+/// `uname`, `sw_vers`, `false`, `env`; pipes mixing Mac and Linux programs
+/// both ways; exit codes and signals through `wait` (TERM, KILL, USR1, in
+/// Linux numbers); fds by guest number, redirects, cwd; a Mac binary that
+/// can't run failing execve (bash: 126); SIGSTOP, SIGCONT, SIGTSTP and
+/// `bg`, SIGINT to a Mac job; the stand-in in `/proc` and procps' `ps`; Mac
+/// `git`; `pbcopy`/`pbpaste`. Mac programs run only with one VM: this sets
+/// MACWL_ONE_VM=1 whatever the tests run with.
+#[test]
+#[ignore = "needs nix"]
+fn one_vm_mac_programs() {
+    let path = ["coreutils", "gnugrep", "procps"].map(|p| format!("{}/bin", linux_package(p).to_string_lossy())).join(":");
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let dir = tempfile::tempdir().unwrap();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mac_programs.sh");
+    let out = macwl_run()
+        .env("MACWL_ONE_VM", "1")
+        .env("MACWL_MAC_PROGRAMS", "1")
+        .arg(&bash)
+        .arg(script)
+        .arg(&path)
+        .arg(dir.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && stdout.ends_with("mac programs ok\n"), "{stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// musl's `posix_spawn` (vfork) of Mac programs in one VM, 20 in a row,
+/// output through a pipe, exit statuses; a Mac binary macOS won't run
+/// fails the spawn with ENOEXEC (guest/procs.c, spawnmac); and an execve of
+/// one replaces the program as far as the guest can tell (execmac: `true`,
+/// nothing printed).
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn one_vm_spawns_mac_programs() {
+    let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("badmac");
+    let true_bin = std::fs::read("/usr/bin/true").unwrap();
+    std::fs::write(&bad, &true_bin[..20000.min(true_bin.len())]).unwrap();
+    std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| macwl_run().env("MACWL_ONE_VM", "1").env("MACWL_MAC_PROGRAMS", "1").arg(&path).args(args).output().unwrap();
+    let out = run(&["spawnmac".as_ref(), bad.as_os_str()]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "bad mac binary: ENOEXEC\nprocs spawnmac ok\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = run(&["execmac".as_ref()]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success());
+}
+
+/// Mac programs on a terminal in one VM: Linux bash (interactive, its
+/// terminal the host's pty relayed from this one) runs Mac programs that
+/// have that pty as their controlling terminal (through a tty agent), and
+/// job control works on them as on Linux ones: Ctrl-Z stops Mac `sleep`
+/// (`jobs` says Stopped), `bg`, `fg` and Ctrl-C; a `/bin/sleep | tr`
+/// pipeline of two Mac programs stopped and continued; a background Mac
+/// `cat` reading the terminal stopped by the Mac driver (SIGTTIN); Mac
+/// `vim` suspended, `fg`, redrawn and saving; Mac `git log` through Mac
+/// `less` as its pager, quit with `q`.
+#[test]
+#[ignore = "needs nix"]
+fn one_vm_mac_programs_on_a_terminal() {
+    use std::os::fd::AsRawFd;
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let dir = tempfile::tempdir().unwrap();
+    let dir_s = dir.path().to_str().unwrap().to_string();
+    let type_in = |master: &OwnedFd, s: &str| {
+        assert_eq!(unsafe { libc::write(master.as_raw_fd(), s.as_ptr().cast(), s.len()) }, s.len() as isize);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    };
+    let env: [(&str, &std::ffi::OsStr); 3] =
+        [("MACWL_MAC_PROGRAMS", "1".as_ref()), ("MACWL_ENV_PS1", "$ ".as_ref()), ("MACWL_ENV_TERM", "xterm-256color".as_ref())];
+    let (mut child, master) = in_a_terminal(&[bash.as_os_str(), "--norc".as_ref(), "-i".as_ref()], &env, 24, 80);
+    let mut seen = Vec::new();
+    let mut at = 0;
+    // A marker the typed line doesn't contain (its echo can't match).
+    let mut mark = |master: &OwnedFd, seen: &mut Vec<u8>, at: &mut usize, what: &str| {
+        type_in(master, &format!("echo {what}-$((6*7))\n"));
+        *at = read_until(master, seen, *at, &format!("{what}-42"));
+    };
+    mark(&master, &mut seen, &mut at, "ready");
+    type_in(&master, &format!("cd {dir_s}\n"));
+
+    // The terminal is the Mac program's controlling terminal.
+    type_in(&master, "/bin/sh -c 'tty; exec 3</dev/tty && echo has-$((1+1))-tty'\n");
+    at = read_until(&master, &mut seen, at, "has-2-tty");
+
+    // Ctrl-Z, jobs, bg, fg, Ctrl-C.
+    type_in(&master, "/bin/sleep 100\n");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "\x1a");
+    at = read_until(&master, &mut seen, at, "Stopped");
+    type_in(&master, "jobs\n");
+    at = read_until(&master, &mut seen, at, "Stopped");
+    type_in(&master, "bg\n");
+    type_in(&master, "jobs\n");
+    at = read_until(&master, &mut seen, at, "Running");
+    type_in(&master, "fg\n");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_in(&master, "\x03");
+    type_in(&master, "echo status-$?\n");
+    at = read_until(&master, &mut seen, at, "status-130");
+
+    // A pipeline of two Mac programs: both stop, both continue.
+    type_in(&master, "/bin/sleep 100 | /usr/bin/tr a b\n");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "\x1a");
+    at = read_until(&master, &mut seen, at, "Stopped");
+    type_in(&master, "fg\n");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_in(&master, "\x03");
+    mark(&master, &mut seen, &mut at, "pipeline");
+
+    // A background Mac program reading the terminal: stopped (SIGTTIN).
+    type_in(&master, "/bin/cat &\n");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "jobs\n");
+    at = read_until(&master, &mut seen, at, "Stopped");
+    type_in(&master, "kill -9 %1\n");
+    mark(&master, &mut seen, &mut at, "ttin");
+
+    // Mac vim: suspended, continued (it redraws), and saving.
+    type_in(&master, "/usr/bin/vim -u NONE -N edited\n");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    type_in(&master, "ihello from vim\x1b");
+    type_in(&master, "\x1a");
+    at = read_until(&master, &mut seen, at, "Stopped");
+    type_in(&master, "jobs\n");
+    at = read_until(&master, &mut seen, at, "vim");
+    type_in(&master, "fg\n");
+    at = read_until(&master, &mut seen, at, "hello from vim");
+    type_in(&master, ":wq\n");
+    mark(&master, &mut seen, &mut at, "vim");
+    assert_eq!(std::fs::read_to_string(dir.path().join("edited")).unwrap(), "hello from vim\n");
+
+    // Mac git, with Mac less as its pager on the terminal.
+    type_in(&master, "/usr/bin/git init -q repo && /usr/bin/git -C repo -c user.name=t -c user.email=t@t commit -q --allow-empty -m paged-commit\n");
+    // LESS without F: it waits for a key (from /dev/tty: its stdin is git's
+    // pipe) even with one screen to show.
+    type_in(&master, "LESS=R PAGER=/usr/bin/less /usr/bin/git -C repo log\n");
+    at = read_until(&master, &mut seen, at, "paged-commit");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_in(&master, "q");
+    mark(&master, &mut seen, &mut at, "git");
+
+    type_in(&master, "exit\n");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let st = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(std::time::Instant::now() < end, "bash didn't exit: {}", String::from_utf8_lossy(&seen));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(st.success(), "{st:?}: {}", String::from_utf8_lossy(&seen));
+}
+
 /// Blocked guest threads cost no host thread each (docs/processes.md, step
 /// 3a): 300 threads blocked in `read` and futex waits under a host thread
 /// budget of 32, so the host's watchdog would end it at 48 host threads. See
@@ -955,9 +1115,19 @@ struct Served {
 
 impl Served {
     fn start() -> Served {
+        Served::start_with(&[])
+    }
+
+    /// The same, with `env` in the host's environment.
+    fn start_with(env: &[(&str, &str)]) -> Served {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("host");
-        let host = macwl_run().arg("--serve").arg(&path).stdin(std::process::Stdio::null()).spawn().unwrap();
+        let mut cmd = macwl_run();
+        cmd.env("MACWL_ONE_VM", "1");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let host = cmd.arg("--serve").arg(&path).stdin(std::process::Stdio::null()).spawn().unwrap();
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !path.exists() {
             assert!(std::time::Instant::now() < end, "no socket at {}", path.display());
@@ -1299,4 +1469,76 @@ fn session_shares_one_host() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Mac programs in foot, through the headless compositor (`scripts/session.sh`
+/// in one host, typed at with `MACWL_TYPE`): in bash, Ctrl-Z stops Mac
+/// `/bin/sleep` (`jobs`: Stopped), `bg` runs it (Running), `fg` and Ctrl-C
+/// end it (130); a `/bin/sleep | tr` pipeline stops whole and continues;
+/// Mac `vim` stops on Ctrl-Z, comes back with `fg` and saves.
+#[test]
+#[ignore = "needs nix and builds the release binaries"]
+fn session_runs_mac_programs() {
+    let dir = std::path::PathBuf::from(format!("/tmp/macwl-test-mac-{}", std::process::id()));
+    let d = dir.display();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/session.sh");
+    let typed = format!(
+        "/bin/sleep 100\\n\\p\\p\\cZ\\pjobs > {d}/j1\\nbg\\n\\pjobs > {d}/j2\\nfg\\n\\p\\cC\\pecho $? > {d}/s1\\n\
+         /bin/sleep 100 | /usr/bin/tr a b\\n\\p\\p\\cZ\\pjobs > {d}/j3\\nfg\\n\\p\\cC\\p\
+         /usr/bin/vim -u NONE -N {d}/v.txt\\n\\p\\p\\pihello vim\\e\\p\\cZ\\pjobs > {d}/j4\\nfg\\n\\p\\p:wq\\n\\p\
+         echo done > {d}/done\\n\\pexit\\n"
+    );
+    let mut session = std::process::Command::new(script)
+        .env("MACWL_ONE_VM", "1")
+        .env("MACWL_SESSION_COMPOSITOR", "headless")
+        .env("MACWL_SESSION_DIR", &dir)
+        .env("MACWL_TYPE", typed)
+        .env_remove("MACWL_HOST")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let errors = rest_of_in_background(session.stderr.take().unwrap());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while !dir.join("done").exists() {
+        if std::time::Instant::now() > end || session.try_wait().unwrap().is_some() {
+            let _ = session.kill();
+            let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default();
+            panic!("the session didn't finish: j1 {:?} j2 {:?} s1 {:?} j3 {:?} j4 {:?}", read("j1"), read("j2"), read("s1"), read("j3"), read("j4"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    assert!(read("j1").contains("Stopped") && read("j1").contains("/bin/sleep 100"), "{}", read("j1"));
+    assert!(read("j2").contains("Running"), "{}", read("j2"));
+    assert_eq!(read("s1"), "130\n");
+    assert!(read("j3").contains("Stopped") && read("j3").contains("/usr/bin/tr a b"), "{}", read("j3"));
+    assert!(read("j4").contains("Stopped") && read("j4").contains("vim"), "{}", read("j4"));
+    assert_eq!(read("v.txt"), "hello vim\n");
+    let st = session.wait().unwrap();
+    let errors = errors.join().unwrap();
+    let errors: Vec<&str> = errors.lines().filter(|l| !l.contains("macwl_compositor")).collect();
+    assert!(st.success(), "{st:?}: {}", errors.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in seen from the Mac: `macwl-run --ps` lists the Linux process
+/// a Mac program stands in for, with the program's command line and its
+/// Mac pid (marked `*`); and a client whose process exec'd a Mac program
+/// ends as the program did.
+#[test]
+#[ignore = "needs nix"]
+fn stand_ins_in_the_hosts_listing() {
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let host = Served::start_with(&[("MACWL_MAC_PROGRAMS", "1")]);
+    let mut client = host.client().arg(&bash).arg("-c").arg("/bin/sleep 2; /bin/sh -c 'exit 5'").stdin(std::process::Stdio::null()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let out = macwl_run().arg("--ps").arg("--host").arg(&host.path).output().unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let row = listing.lines().find(|l| l.ends_with("/bin/sleep 2")).unwrap_or_else(|| panic!("no stand-in in {listing}"));
+    let mac: i32 = row.split_whitespace().nth(8).and_then(|m| m.strip_suffix('*')).and_then(|m| m.parse().ok()).unwrap_or_else(|| panic!("{row}"));
+    assert_eq!(unsafe { libc::kill(mac, 0) }, 0, "its Mac program runs: {row}");
+    let st = client.wait().unwrap();
+    assert_eq!(st.code(), Some(5), "{st:?}");
 }

@@ -24,6 +24,10 @@
 //            another process's stat, status, statm, cmdline, environ,
 //            comm, maps, fd/, exe, cwd and task/; a zombie's state
 //   execmac  execve of a Mac program: prints its errno
+//   spawnmac musl's posix_spawn (vfork) of Mac programs, 20 in a row, their
+//            output through a pipe and their exit statuses; and of a Mac
+//            binary that can't run, which posix_spawn fails with ENOEXEC
+//            (Mac programs on, one VM)
 //
 // Prints "procs TEST ok".
 #define _GNU_SOURCE
@@ -47,6 +51,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <spawn.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -874,6 +879,44 @@ int main(int argc, char **argv) {
         procfs();
     } else if (!strcmp(test, "contain")) {
         contain();
+    } else if (!strcmp(test, "spawnmac")) {
+        extern char **environ;
+        for (int i = 0; i < 20; i++) {
+            int p[2];
+            CHECK(pipe(p) == 0);
+            posix_spawn_file_actions_t fa;
+            posix_spawn_file_actions_init(&fa);
+            posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+            posix_spawn_file_actions_addclose(&fa, p[0]);
+            char n[16];
+            snprintf(n, sizeof n, "mac %d", i);
+            char *args[] = { "/bin/echo", n, 0 };
+            pid_t pid;
+            CHECK(posix_spawn(&pid, "/bin/echo", &fa, 0, args, environ) == 0);
+            close(p[1]);
+            char buf[64] = { 0 };
+            int got = 0, r;
+            while ((r = read(p[0], buf + got, sizeof buf - 1 - got)) > 0)
+                got += r;
+            close(p[0]);
+            int st;
+            CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+            char want[32];
+            snprintf(want, sizeof want, "mac %d\n", i);
+            CHECK(!strcmp(buf, want));
+            posix_spawn_file_actions_destroy(&fa);
+            char *f[] = { "/usr/bin/false", 0 };
+            CHECK(posix_spawn(&pid, "/usr/bin/false", 0, 0, f, environ) == 0);
+            CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 1);
+        }
+        // A Mach-O file macOS won't run (cut short): the spawn fails, with
+        // the errno, as Linux's posix_spawn reports the child's execve's.
+        if (argc > 2) {
+            char *b[] = { argv[2], 0 };
+            pid_t pid;
+            int e = posix_spawn(&pid, argv[2], 0, 0, b, environ);
+            printf("bad mac binary: %s\n", e == ENOEXEC ? "ENOEXEC" : strerror(e));
+        }
     } else if (!strcmp(test, "execmac")) {
         char *args[] = { "/usr/bin/true", 0 };
         execv("/usr/bin/true", args);

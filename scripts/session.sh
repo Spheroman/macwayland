@@ -9,6 +9,9 @@
 # --serve`) and exports MACWL_HOST, so the D-Bus daemon, foot and everything
 # started from the session (a Mac terminal that sources its environment
 # too) join it as its clients. `macwl-run --ps` lists its processes.
+# Linux programs there can run Mac ones (open, pbcopy, git, ...), each a Mac
+# process of its own that the Linux process stands in for. Without one VM
+# they're off: Mac programs need the host that runs them never to exec.
 #
 # For tests: MACWL_SESSION_COMPOSITOR=headless runs the headless compositor
 # (macwl-compositor, typed at with MACWL_TYPE, its frames dumped in the
@@ -52,7 +55,8 @@ export WAYLAND_DISPLAY=wayland-mac XDG_RUNTIME_DIR=$runtime
 host=
 if [ "$MACWL_ONE_VM" = 1 ]; then
     export MACWL_HOST="$runtime/macwl-host"
-    target/release/macwl-run --serve "$MACWL_HOST" </dev/null &
+    # Mac programs are the host's to start (docs/processes.md, section 7).
+    MACWL_MAC_PROGRAMS=1 target/release/macwl-run --serve "$MACWL_HOST" </dev/null &
     host=$!
     trap 'kill $shell $host 2>/dev/null' EXIT
     while [ ! -S "$MACWL_HOST" ]; do
@@ -73,10 +77,6 @@ while [ ! -S "$runtime/bus" ]; do
     sleep 0.1
 done
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus"
-
-# Mac programs from Linux ones: not yet in one host (step 6).
-mac_programs=--mac-programs
-[ "$MACWL_ONE_VM" = 1 ] && mac_programs=
 
 if [ -n "$MACWL_ROOT" ]; then
     target/release/macwl-run --root "$MACWL_ROOT" "$foot/bin/foot"
@@ -101,5 +101,5 @@ else
     # NOSYSBASHRC: the Mac's /etc/bashrc would put the Mac's PATH back.
     MACWL_ENV_PATH=$path MACWL_ENV_NOSYSBASHRC=1 MACWL_ENV_LOCALE_ARCHIVE=$locales/lib/locale/locale-archive \
     MACWL_ENV_XDG_DATA_DIRS=$data MACWL_ENV_GDK_PIXBUF_MODULE_FILE=$pixbuf MACWL_ENV_GST_PLUGIN_SYSTEM_PATH_1_0=$gst \
-        target/release/macwl-run $mac_programs "$foot/bin/foot" "$bash/bin/bash"
+        target/release/macwl-run "$foot/bin/foot" "$bash/bin/bash"
 fi
