@@ -49,7 +49,7 @@ pub(crate) struct Relay {
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
-fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -61,17 +61,17 @@ fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok(pair)
 }
 
-fn cloexec(fd: RawFd) {
+pub(crate) fn cloexec(fd: RawFd) {
     unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
 }
 
-fn nonblocking(fd: RawFd) {
+pub(crate) fn nonblocking(fd: RawFd) {
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
 }
 
 /// `open` with `flags`, close-on-exec.
-fn open(path: &std::ffi::CStr, flags: i32) -> std::io::Result<OwnedFd> {
+pub(crate) fn open(path: &std::ffi::CStr, flags: i32) -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_NOCTTY | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -79,7 +79,7 @@ fn open(path: &std::ffi::CStr, flags: i32) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn same_terminal(a: RawFd, b: RawFd) -> bool {
+pub(crate) fn same_terminal(a: RawFd, b: RawFd) -> bool {
     let rdev = |fd: RawFd| {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         (unsafe { libc::fstat(fd, &mut st) } == 0 && st.st_mode & libc::S_IFMT == libc::S_IFCHR).then_some(st.st_rdev)
@@ -114,50 +114,10 @@ impl Relay {
         if unsafe { libc::tcgetattr(term.as_raw_fd(), &mut saved) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-        if master < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        cloexec(master.as_raw_fd());
-        if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut slave_name = [0 as libc::c_char; 128];
-        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCPTYGNAME as u64, slave_name.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let slave_path = unsafe { std::ffi::CStr::from_ptr(slave_name.as_ptr()) };
-        let slave = open(slave_path, libc::O_RDWR)?;
-        // The pty starts as the Mac terminal is: its line discipline
-        // settings (a cooked terminal, as the shell left it) and its size.
-        unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &saved) };
-        if let Some(ws) = linux_abi::syscall::tty::winsize(term.as_raw_fd()) {
-            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
-        }
-        let n = linux_abi::syscall::tty_of(master.as_raw_fd()).ok_or_else(|| std::io::Error::other("not a pty"))?.n;
-        nonblocking(master.as_raw_fd());
-        // The process's fds that were the Mac terminal are the slave, one
-        // open file, as a login sets a terminal up.
-        let path = slave_path.to_bytes().to_vec();
-        let mut shared = None;
-        for fd in 0..3u64 {
-            let Ok(host) = process.fds.host(fd) else { continue };
-            if !same_terminal(host, term.as_raw_fd()) {
-                continue;
-            }
-            match shared {
-                None => {
-                    process.fds.insert_at(fd as usize, FdEntry::new(slave.try_clone()?).path(path.clone()));
-                    shared = Some(fd);
-                }
-                Some(first) => {
-                    let _ = process.fds.dup_to(first, fd as usize, false);
-                }
-            }
-        }
-        drop(slave);
-        Ok(Relay { n, master, term, saved, input_ctl: pipe()?, output_ctl: pipe()?, threads: Mutex::new(Vec::new()) })
+        let pty = Pty::open(&saved, linux_abi::syscall::tty::winsize(term.as_raw_fd()))?;
+        let which: Vec<u64> = (0..3u64).filter(|&fd| process.fds.host(fd).is_ok_and(|host| same_terminal(host, term.as_raw_fd()))).collect();
+        pty.give(process, &which)?;
+        Ok(Relay { n: pty.n, master: pty.master, term, saved, input_ctl: pipe()?, output_ctl: pipe()?, threads: Mutex::new(Vec::new()) })
     }
 
     /// Start relaying, for the processes of `table`, with the Mac terminal
@@ -198,13 +158,8 @@ impl Relay {
     /// The Mac terminal's size changed (SIGWINCH): the pty's too, and its
     /// foreground group hears of it.
     pub fn resize(&self, table: &Table) {
-        let Some(ws) = linux_abi::syscall::tty::winsize(self.term.as_raw_fd()) else { return };
-        let old = linux_abi::syscall::tty::winsize(self.master.as_raw_fd());
-        unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
-        if old.is_none_or(|o| (o.ws_row, o.ws_col, o.ws_xpixel, o.ws_ypixel) != (ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel))
-            && let Some(fg) = table.tty_foreground(self.n)
-        {
-            let _ = table.deliver(crate::host::Target::Group(fg), linux_abi::syscall::SigInfo::user(28, 0x80, 0));
+        if let Some(ws) = linux_abi::syscall::tty::winsize(self.term.as_raw_fd()) {
+            table.resize_tty(self.n, self.master.as_raw_fd(), ws);
         }
     }
 
@@ -282,13 +237,7 @@ impl Relay {
     fn stop_with_first(&self, table: &Table) {
         // What the program wrote before it stopped (a full-screen one
         // putting the screen back) goes out first.
-        for _ in 0..50 {
-            let mut n: libc::c_int = 0;
-            if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::FIONREAD, &mut n) } != 0 || n == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        drained(self.master.as_raw_fd());
         self.restore();
         // A stop of the whole Mac process, as any job's; the call returns
         // once it's continued.
@@ -300,49 +249,125 @@ impl Relay {
 
     /// Master → Mac terminal, until the host is done.
     fn output(&self) {
-        let (term, master, ctl) = (self.term.as_raw_fd(), self.master.as_raw_fd(), self.output_ctl.0.as_raw_fd());
-        let mut buf = [0u8; 16384];
-        let mut hung_up = false;
-        loop {
-            let mut fds = [
-                libc::pollfd { fd: ctl, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: if hung_up { -1 } else { master }, events: libc::POLLIN, revents: 0 },
-            ];
-            // With no slave open, the master reads as hung up: look again
-            // now and then, for a process that opens the terminal again.
-            let timeout = if hung_up { 50 } else { -1 };
-            if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
-                continue;
-            }
-            let done = fds[0].revents != 0;
-            hung_up = !self.copy(master, term, &mut buf);
-            if done {
-                return;
-            }
+        pump_output(self.master.as_raw_fd(), self.term.as_raw_fd(), self.output_ctl.0.as_raw_fd());
+    }
+}
+
+/// A pty of the host's for a process in place of a Mac terminal: its
+/// master, kept by the host (and passed to a client to read), and its slave.
+pub(crate) struct Pty {
+    /// Its number.
+    pub n: u32,
+    pub master: OwnedFd,
+    slave: OwnedFd,
+    slave_path: Vec<u8>,
+}
+
+impl Pty {
+    /// A new pty, set up as the Mac terminal it stands for is: its line
+    /// discipline settings (`termios`: a cooked terminal, as the shell left
+    /// it) and its size. The master is non-blocking.
+    pub fn open(termios: &libc::termios, size: Option<libc::winsize>) -> std::io::Result<Pty> {
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        if master < 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        cloexec(master.as_raw_fd());
+        if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut slave_name = [0 as libc::c_char; 128];
+        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCPTYGNAME as u64, slave_name.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let slave_path = unsafe { std::ffi::CStr::from_ptr(slave_name.as_ptr()) };
+        let slave = open(slave_path, libc::O_RDWR)?;
+        unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, termios) };
+        if let Some(ws) = size {
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+        }
+        let n = linux_abi::syscall::tty_of(master.as_raw_fd()).ok_or_else(|| std::io::Error::other("not a pty"))?.n;
+        nonblocking(master.as_raw_fd());
+        Ok(Pty { n, master, slave, slave_path: slave_path.to_bytes().to_vec() })
     }
 
-    /// Copy what the master has to the Mac terminal; false if it reads as
-    /// hung up (no slave open).
-    fn copy(&self, master: RawFd, term: RawFd, buf: &mut [u8]) -> bool {
-        loop {
-            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
-            if n > 0 {
-                let mut at = 0;
-                while at < n as usize {
-                    let w = unsafe { libc::write(term, buf[at..n as usize].as_ptr().cast(), n as usize - at) };
-                    if w <= 0 {
-                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                            continue;
-                        }
-                        return true;
-                    }
-                    at += w as usize;
+    /// `process`'s fds `which` (those that were the Mac terminal) are the
+    /// slave from now on, one open file, as a login sets a terminal up.
+    pub fn give(&self, process: &Process, which: &[u64]) -> std::io::Result<()> {
+        let mut shared = None;
+        for &fd in which {
+            match shared {
+                None => {
+                    process.fds.insert_at(fd as usize, FdEntry::new(self.slave.try_clone()?).path(self.slave_path.clone()));
+                    shared = Some(fd);
                 }
-                continue;
+                Some(first) => {
+                    let _ = process.fds.dup_to(first, fd as usize, false);
+                }
             }
-            let e = std::io::Error::last_os_error().raw_os_error();
-            return n < 0 && matches!(e, Some(libc::EAGAIN | libc::EINTR));
         }
+        Ok(())
+    }
+}
+
+/// Wait (a little) for what's in `master` to have been read: what a program
+/// wrote before it stopped (a full-screen one putting the screen back)
+/// goes out before the Mac terminal gets its settings back.
+pub(crate) fn drained(master: RawFd) {
+    for _ in 0..50 {
+        let mut n: libc::c_int = 0;
+        if unsafe { libc::ioctl(master, libc::FIONREAD, &mut n) } != 0 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Master → Mac terminal, until a byte comes on `ctl`: then what's left,
+/// and done.
+pub(crate) fn pump_output(master: RawFd, term: RawFd, ctl: RawFd) {
+    let mut buf = [0u8; 16384];
+    let mut hung_up = false;
+    loop {
+        let mut fds = [
+            libc::pollfd { fd: ctl, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: if hung_up { -1 } else { master }, events: libc::POLLIN, revents: 0 },
+        ];
+        // With no slave open, the master reads as hung up: look again
+        // now and then, for a process that opens the terminal again.
+        let timeout = if hung_up { 50 } else { -1 };
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
+            continue;
+        }
+        let done = fds[0].revents != 0;
+        hung_up = !copy(master, term, &mut buf);
+        if done {
+            return;
+        }
+    }
+}
+
+/// Copy what the master has to the Mac terminal; false if it reads as hung
+/// up (no slave open).
+fn copy(master: RawFd, term: RawFd, buf: &mut [u8]) -> bool {
+    loop {
+        let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            let mut at = 0;
+            while at < n as usize {
+                let w = unsafe { libc::write(term, buf[at..n as usize].as_ptr().cast(), n as usize - at) };
+                if w <= 0 {
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return true;
+                }
+                at += w as usize;
+            }
+            continue;
+        }
+        let e = std::io::Error::last_os_error().raw_os_error();
+        return n < 0 && matches!(e, Some(libc::EAGAIN | libc::EINTR));
     }
 }

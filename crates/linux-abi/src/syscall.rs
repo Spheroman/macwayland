@@ -41,6 +41,9 @@ pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
 pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
 pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
+/// Signal numbers between Linux's and Darwin's (a client forwards the Mac
+/// side's to its Linux process, and ends as that process did).
+pub use signal::{from_darwin as signal_from_darwin, to_darwin as signal_to_darwin};
 
 use std::{
     collections::BTreeSet,

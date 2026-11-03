@@ -1,4 +1,7 @@
-//! `macwl-run [--root DIR] [--bind HOST[:GUEST]]... [--mac-programs] PROGRAM [ARGS...]`
+//! `macwl-run [--root DIR] [--bind HOST[:GUEST]]... [--mac-programs]
+//! [--host PATH | --new-host] PROGRAM [ARGS...]`
+//! `macwl-run --serve PATH`
+//! `macwl-run --ps [--host PATH]`
 //!
 //! Runs an arm64 Linux program. Without `--root` the program sees the Mac's
 //! own filesystem, which is enough for programs from Nix (their libraries are
@@ -7,6 +10,14 @@
 //! it at their own paths: the home directory, `/nix`, `/tmp`, the Wayland
 //! runtime directory and the current directory. `--bind` adds more. PROGRAM
 //! is a guest path.
+//!
+//! Hosts and clients (docs/processes.md, section 1): `--serve PATH` is a
+//! host with no program of its own, serving clients at the Unix socket
+//! PATH. With `MACWL_HOST=PATH` (or `--host PATH`) `macwl-run` is a client:
+//! it runs PROGRAM in that host (starting one if none serves PATH) and
+//! stands in for it on the Mac: its exit status, signals sent to it, its
+//! terminal. Otherwise (or with `--new-host`) `macwl-run` is the host of
+//! PROGRAM and everything it starts. `--ps` lists a host's processes.
 //!
 //! A Linux program may run Mac programs, as WSL's run Windows ones: an
 //! `execve` of a Mach-O file runs it natively in the process's place (see
@@ -19,28 +30,30 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    os::{fd::AsFd, unix::ffi::OsStrExt},
+    path::PathBuf,
     process::ExitCode,
 };
 
-use linux_abi::{
-    fs::{Resolved, Target},
-    Process,
-};
-use macwl_runtime::Exit;
+use macwl_runtime::{launch::Launch, Exit};
 
-const USAGE: &str = "usage: macwl-run [--root DIR] [--bind HOST[:GUEST]]... [--mac-programs] PROGRAM [ARGS...]";
+const USAGE: &str = "usage: macwl-run [--root DIR] [--bind HOST[:GUEST]]... [--mac-programs] [--host PATH | --new-host] PROGRAM [ARGS...]
+       macwl-run --serve PATH
+       macwl-run --ps [--host PATH]";
 
 struct Options {
     root: Option<PathBuf>,
     /// (host, guest)
     binds: Vec<(PathBuf, OsString)>,
+    /// The host to join (`--host`, else MACWL_HOST), unless `--new-host`.
+    host: Option<PathBuf>,
+    new_host: bool,
+    ps: bool,
     args: Vec<OsString>,
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut opts = Options { root: None, binds: Vec::new(), args: Vec::new() };
+    let mut opts = Options { root: None, binds: Vec::new(), host: None, new_host: false, ps: false, args: Vec::new() };
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_bytes() {
@@ -60,6 +73,9 @@ fn parse_args() -> Result<Options, String> {
             // Read where execve looks, in this process and the fork
             // children that inherit its environment.
             b"--mac-programs" => unsafe { std::env::set_var("MACWL_MAC_PROGRAMS", "1") },
+            b"--host" => opts.host = Some(args.next().ok_or("--host needs a path")?.into()),
+            b"--new-host" => opts.new_host = true,
+            b"--ps" => opts.ps = true,
             b"--" => {
                 opts.args.extend(args);
                 break;
@@ -71,6 +87,12 @@ fn parse_args() -> Result<Options, String> {
                 break;
             }
         }
+    }
+    if opts.host.is_none() && !opts.new_host {
+        opts.host = std::env::var_os("MACWL_HOST").filter(|p| !p.is_empty()).map(PathBuf::from);
+    }
+    if opts.ps {
+        return Ok(opts);
     }
     if opts.args.is_empty() {
         return Err(USAGE.into());
@@ -112,132 +134,39 @@ fn default_fonts_conf() -> Option<PathBuf> {
     Some(path)
 }
 
-fn setup(opts: &Options) -> Result<Process, String> {
+/// What to run, from the options and this process's environment, working
+/// directory and umask.
+fn launch(opts: &Options) -> Result<Launch, String> {
     let host_root = opts.root.is_none();
     let root = match &opts.root {
         Some(dir) => std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?,
         None => "/".into(),
     };
-    let mut process = Process::with_host_stdio(&root).map_err(|e| e.to_string())?;
-    let binds = if host_root { Vec::new() } else { default_binds().into_iter().chain(opts.binds.iter().cloned()).collect() };
-    for (host, guest) in &binds {
+    let wanted = if host_root { Vec::new() } else { default_binds().into_iter().chain(opts.binds.iter().cloned()).collect() };
+    let mut binds = Vec::new();
+    for (host, guest) in &wanted {
         // Binds point at real directories: macOS's /tmp is a symlink.
         let target = std::fs::canonicalize(host).map_err(|e| format!("--bind {}: {e}", host.display()))?;
-        process.fs.bind(guest.as_bytes(), target).map_err(|e| format!("--bind {}: {e}", host.display()))?;
+        binds.push((target, guest.as_bytes().to_vec()));
     }
     // The guest starts where it was run from, if it can see that directory.
-    if let Ok(cwd) = std::env::current_dir() {
-        let visible = host_root || binds.iter().any(|(_, g)| cwd.starts_with(g));
+    let cwd = std::env::current_dir().ok().and_then(|cwd| {
+        let visible = host_root || wanted.iter().any(|(_, g)| cwd.starts_with(g));
         let cwd = if host_root { std::fs::canonicalize(&cwd).unwrap_or(cwd) } else { cwd };
-        if visible {
-            process.fs.set_cwd(cwd.into_os_string().into_encoded_bytes());
-        }
-    }
-    // The guest starts with the umask it was run with. (Read by setting it:
-    // there's no other way, and nothing else runs yet.)
+        visible.then(|| cwd.into_os_string().into_encoded_bytes())
+    });
+    // The guest starts with the umask it was run with. (Read by setting it,
+    // and back: there's no other way.)
     let umask = unsafe { libc::umask(0o022) };
-    process.set_umask(umask as u32);
-    Ok(process)
+    unsafe { libc::umask(umask) };
+    let argv = opts.args.iter().map(|a| a.as_bytes().to_vec()).collect();
+    Ok(Launch { root, binds, cwd, umask: umask as u32, argv, env: environment(), ignored: 0, blocked: 0 })
 }
 
-/// The program, as a guest path: its host file and contents.
-fn read_program(process: &Process, path: &OsStr) -> Result<(Vec<u8>, Vec<u8>), String> {
-    const AT_FDCWD: u64 = -100i64 as u64;
-    let err = |e: std::io::Error| format!("{}: {e}", path.display());
-    let host = match process.fs.resolve(&process.fds, AT_FDCWD, path.as_bytes(), true) {
-        Ok(Resolved { target: Target::Host(host), .. }) => host,
-        Ok(_) => return Err(err(std::io::ErrorKind::Unsupported.into())),
-        Err(e) => return Err(err(std::io::Error::from_raw_os_error(e as i32))),
-    };
-    let host = Path::new(OsStr::from_bytes(host.as_bytes()));
-    let elf = std::fs::read(host).map_err(err)?;
-    // /proc/self/exe: the guest's name for the file, symlinks resolved.
-    let canonical = std::fs::canonicalize(host).map_err(err)?;
-    let exe = process.fs.guest_path_of_host(canonical.as_os_str().as_bytes());
-    Ok((elf, exe))
-}
-
-/// Report how the guest ended, and exit with the status a Linux shell would
-/// show.
-fn finish(result: Result<Exit, macwl_runtime::Error>) -> ExitCode {
-    match result {
-        Ok(exit) => {
-            match exit {
-                Exit::Fault { sig, esr, far, pc } => {
-                    eprintln!("macwl-run: guest fault (signal {sig}) at pc {pc:#x}: ESR {esr:#x}, FAR {far:#x}")
-                }
-                Exit::BusError { far, pc } => eprintln!("macwl-run: bus error at pc {pc:#x}: address {far:#x}"),
-                Exit::OutOfMemory => eprintln!("macwl-run: out of guest memory"),
-                Exit::Signal(_) | Exit::Code(_) => {}
-            }
-            macwl_runtime::profile::mark("process exiting");
-            ExitCode::from(exit.status() as u8)
-        }
-        Err(e) => {
-            eprintln!("macwl-run: {e}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-/// As many host fds as the Mac allows a process: each guest thread has a
-/// kqueue (its waker), and a host blocks thousands of threads (a shell's
-/// default soft limit is 256).
-fn raise_fd_limit() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return;
-    }
-    let mut max: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
-    let per_proc = if unsafe { libc::sysctlbyname(c"kern.maxfilesperproc".as_ptr(), (&raw mut max).cast(), &mut len, std::ptr::null_mut(), 0) } == 0 { max as u64 } else { 10240 };
-    let want = lim.rlim_max.min(per_proc);
-    if want > lim.rlim_cur {
-        lim.rlim_cur = want;
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
-    }
-}
-
-fn main() -> ExitCode {
-    macwl_runtime::profile::mark("main");
-    raise_fd_limit();
-    // A guest process forked by another (see the runtime's fork module).
-    if std::env::args_os().nth(1).is_some_and(|a| a == "--fork-child") {
-        return finish(macwl_runtime::run_fork_child());
-    }
-    let opts = match parse_args() {
-        Ok(opts) => opts,
-        Err(e) => {
-            eprintln!("macwl-run: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let process = match setup(&opts) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("macwl-run: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let elf = match read_program(&process, &opts.args[0]) {
-        Ok((elf, exe)) => {
-            process.set_comm(opts.args[0].as_bytes().rsplit(|&b| b == b'/').next().unwrap_or_default());
-            process.set_exe(exe);
-            elf
-        }
-        Err(e) => {
-            eprintln!("macwl-run: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    // With many processes in the VM, the terminal it was started in is
-    // relayed to a pty of the host's (in 1:1 the Mac's own driver does
-    // job control).
-    macwl_runtime::relay_terminal();
-    let argv: Vec<&[u8]> = opts.args.iter().map(|a| a.as_bytes()).collect();
-    // A minimal Linux-flavoured environment rather than the Mac's, plus what
-    // a Wayland client needs to find the compositor (and D-Bus clients the
-    // session bus).
+/// A minimal Linux-flavoured environment rather than the Mac's, plus what a
+/// Wayland client needs to find the compositor (and D-Bus clients the
+/// session bus).
+fn environment() -> Vec<Vec<u8>> {
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
     // HOME is the user's own: visible to the guest either way (bound under
     // --root), and where programs keep their config and caches.
@@ -268,7 +197,133 @@ fn main() -> ExitCode {
             env.push([name, b"=", value.as_bytes()].concat());
         }
     }
-    let envp: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    env
+}
 
+/// Report how the guest ended, and exit with the status a Linux shell would
+/// show.
+fn finish(result: Result<Exit, macwl_runtime::Error>) -> ExitCode {
+    match result {
+        Ok(exit) => {
+            if let Some(what) = exit.describe() {
+                eprintln!("macwl-run: {what}");
+            }
+            macwl_runtime::profile::mark("process exiting");
+            ExitCode::from(exit.status() as u8)
+        }
+        Err(e) => {
+            eprintln!("macwl-run: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// As many host fds as the Mac allows a process: each guest thread has a
+/// kqueue (its waker), and a host blocks thousands of threads (a shell's
+/// default soft limit is 256).
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    let mut max: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let per_proc = if unsafe { libc::sysctlbyname(c"kern.maxfilesperproc".as_ptr(), (&raw mut max).cast(), &mut len, std::ptr::null_mut(), 0) } == 0 { max as u64 } else { 10240 };
+    let want = lim.rlim_max.min(per_proc);
+    if want > lim.rlim_cur {
+        lim.rlim_cur = want;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    }
+}
+
+/// `--serve PATH [--idle-exit]`.
+fn serve(mut args: impl Iterator<Item = OsString>) -> ExitCode {
+    let Some(path) = args.next() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    // A host a client started goes 2 s after it has nothing to do, whether
+    // or not that client ever came.
+    let idle_exit = args.next().is_some_and(|a| a == "--idle-exit");
+    match macwl_runtime::serve(path.as_ref(), idle_exit) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(macwl_runtime::Error::Io(e)) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("macwl-run: {e}");
+            ExitCode::from(macwl_runtime::ALREADY_SERVING)
+        }
+        Err(e) => {
+            eprintln!("macwl-run: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    macwl_runtime::profile::mark("main");
+    raise_fd_limit();
+    let mut args = std::env::args_os().skip(1);
+    match args.next() {
+        // A guest process forked by another (see the runtime's fork module).
+        Some(a) if a == "--fork-child" => return finish(macwl_runtime::run_fork_child()),
+        Some(a) if a == "--serve" => return serve(args),
+        _ => {}
+    }
+    let opts = match parse_args() {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("macwl-run: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if opts.ps {
+        return match &opts.host {
+            Some(host) => macwl_runtime::client::ps(host),
+            None => {
+                eprintln!("macwl-run: --ps needs a host: --host PATH, or MACWL_HOST");
+                ExitCode::from(2)
+            }
+        };
+    }
+    let launch = match launch(&opts) {
+        Ok(launch) => launch,
+        Err(e) => {
+            eprintln!("macwl-run: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // A client: the host runs the program (this process never makes a VM).
+    if let Some(host) = &opts.host {
+        return macwl_runtime::client::run(host, &launch);
+    }
+    // The host: fds 0–2 its own.
+    let stdio: Vec<_> = (0..3).filter_map(|fd| {
+        let held = match fd {
+            0 => std::io::stdin().as_fd().try_clone_to_owned(),
+            1 => std::io::stdout().as_fd().try_clone_to_owned(),
+            _ => std::io::stderr().as_fd().try_clone_to_owned(),
+        };
+        held.ok().map(|h| (fd, h))
+    }).collect();
+    if stdio.len() < 3 {
+        eprintln!("macwl-run: stdin, stdout and stderr must be open");
+        return ExitCode::from(2);
+    }
+    let process = match launch.process(stdio) {
+        Ok((process, elf)) => {
+            process.set_umask(launch.umask);
+            (process, elf)
+        }
+        Err(e) => {
+            eprintln!("macwl-run: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (process, elf) = process;
+    // With many processes in the VM, the terminal it was started in is
+    // relayed to a pty of the host's (in 1:1 the Mac's own driver does
+    // job control).
+    macwl_runtime::relay_terminal();
+    let argv: Vec<&[u8]> = launch.argv.iter().map(Vec::as_slice).collect();
+    let envp: Vec<&[u8]> = launch.env.iter().map(Vec::as_slice).collect();
     finish(macwl_runtime::run(&elf, &argv, &envp, process))
 }

@@ -219,6 +219,14 @@ impl Machine {
         &self.pool
     }
 
+    /// Map guest physical memory into `vm`: the pool, and shared windows (now
+    /// and as they're created). A host serving clients does this before it
+    /// has any process.
+    pub fn map_into(&self, vm: &Vm) -> Result<(), HvError> {
+        self.pool.map_into(vm)?;
+        self.windows().attach_vm()
+    }
+
     fn asids(&self) -> MutexGuard<'_, Asids> {
         self.asids.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -533,8 +541,7 @@ impl AddressSpace {
     /// Map guest physical memory into `vm`: the pool, and shared windows (now
     /// and as they're created).
     pub fn map_into(&mut self, vm: &Vm) -> Result<(), HvError> {
-        self.machine.pool().map_into(vm)?;
-        self.machine.windows().attach_vm()
+        self.machine.map_into(vm)
     }
 
     /// Take guest physical memory out of `vm`, before it goes.

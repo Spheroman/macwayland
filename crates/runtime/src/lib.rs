@@ -15,6 +15,9 @@ mod fork;
 mod host;
 mod park;
 mod relay;
+pub mod client;
+pub mod launch;
+mod proto;
 pub mod loader;
 pub mod mach;
 pub mod memory;
@@ -95,7 +98,29 @@ impl Exit {
             _ => 128 + self.signal().unwrap(),
         }
     }
+
+    /// What `macwl-run` says of an end that isn't an exit or a signal.
+    pub fn describe(self) -> Option<String> {
+        match self {
+            Exit::Fault { sig, esr, far, pc } => Some(format!("guest fault (signal {sig}) at pc {pc:#x}: ESR {esr:#x}, FAR {far:#x}")),
+            Exit::BusError { far, pc } => Some(format!("bus error at pc {pc:#x}: address {far:#x}")),
+            Exit::OutOfMemory => Some("out of guest memory".into()),
+            Exit::Signal(_) | Exit::Code(_) => None,
+        }
+    }
 }
+
+/// `macwl-run --serve PATH`: a host with no program of its own, serving
+/// the clients that join it at PATH (docs/processes.md, step 5), until 2 s
+/// after its last process and client have gone (`idle_exit`: counting from
+/// the start rather than from its first client).
+pub fn serve(path: &std::path::Path, idle_exit: bool) -> Result<(), Error> {
+    host::serve(path, idle_exit)
+}
+
+/// The status `macwl-run --serve` exits with when another host already
+/// serves the path.
+pub const ALREADY_SERVING: u8 = host::ALREADY_SERVING;
 
 #[derive(Debug)]
 pub enum Error {

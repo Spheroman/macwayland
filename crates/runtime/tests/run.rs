@@ -849,6 +849,11 @@ fn in_a_terminal(args: &[&std::ffi::OsStr], env: &[(&str, &std::ffi::OsStr)], ro
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as u64, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // The keyboard's signals as a terminal's shell has them, even
+            // if the tests run where they're ignored (a script's `&`): a
+            // client passes ignored signals on to its process.
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
             Ok(())
         });
     }
@@ -939,4 +944,361 @@ fn one_vm_relays_its_terminal() {
     drop(master);
     let st = wait(&child, 0);
     assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 128 + 1, "{st:#x}");
+}
+
+/// A host serving clients (`macwl-run --serve PATH`, docs/processes.md step
+/// 5) at a socket in a directory of its own; on drop, given a few seconds
+/// to go by itself, then killed.
+struct Served {
+    host: std::process::Child,
+    path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Served {
+    fn start() -> Served {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host");
+        let host = macwl_run().arg("--serve").arg(&path).stdin(std::process::Stdio::null()).spawn().unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < end, "no socket at {}", path.display());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Served { host, path, _dir: dir }
+    }
+
+    /// `macwl-run` as a client of this host.
+    fn client(&self) -> std::process::Command {
+        let mut cmd = macwl_run();
+        cmd.env("MACWL_HOST", &self.path);
+        cmd
+    }
+
+    /// When the host process ends, if it does within `limit`.
+    fn ends_within(&mut self, limit: std::time::Duration) -> Option<std::time::Instant> {
+        let end = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < end {
+            if self.host.try_wait().unwrap().is_some() {
+                return Some(std::time::Instant::now());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        if self.ends_within(std::time::Duration::from_secs(5)).is_none() {
+            let _ = self.host.kill();
+            let _ = self.host.wait();
+        }
+    }
+}
+
+/// `guest/client`'s path.
+fn client_guest() -> std::path::PathBuf {
+    let path = format!("{}/../../target/guest/client", env!("CARGO_MANIFEST_DIR"));
+    std::fs::canonicalize(path).expect("run scripts/build-guest.sh first")
+}
+
+/// A client running `guest/client trap` (stdout piped): the child, its
+/// first line ("ready PID PGID SID PPID"), and a reader for the rest.
+fn trapping_client(host: &Served) -> (std::process::Child, String, std::io::BufReader<std::process::ChildStdout>) {
+    use std::io::BufRead;
+    let mut child = host.client().arg(client_guest()).arg("trap").stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    assert!(line.starts_with("ready "), "{line:?}");
+    (child, line, out)
+}
+
+/// All of `out`, read on a thread of its own.
+fn rest_of_in_background(mut out: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.read_to_end(&mut v);
+        String::from_utf8_lossy(&v).into_owned()
+    })
+}
+
+/// The rest of `out`, read on a thread of its own, for up to 20 s.
+fn rest_of(mut out: impl Read + Send + 'static) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        let _ = tx.send(s);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(20)).expect("the output to end")
+}
+
+/// A client's exit status is its process's: the code, or the signal, which
+/// the client raises on itself (one that would dump core is 128 + it); its
+/// fds 0–2 are the process's own (a pipe stays a pipe). A host a client
+/// starts because none serves the path goes 2 s after it's done.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn client_exit_status() {
+    use std::os::unix::process::ExitStatusExt;
+    let host = Served::start();
+    let run = |args: &[&str]| host.client().arg(client_guest()).args(args).output().unwrap();
+    assert_eq!(run(&["exit", "3"]).status.code(), Some(3));
+    assert_eq!(run(&["exit", "0"]).status.code(), Some(0));
+    let st = run(&["raise", "15"]).status;
+    assert_eq!(st.signal(), Some(libc::SIGTERM), "{st:?}");
+    let st = run(&["raise", "9"]).status;
+    assert_eq!(st.signal(), Some(libc::SIGKILL), "{st:?}");
+    // SIGSEGV would dump core: a status instead.
+    assert_eq!(run(&["raise", "11"]).status.code(), Some(128 + 11));
+    let out = host.client().arg(client_guest()).arg("stdio").stdin(std::process::Stdio::null()).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0 chr\n1 fifo\n2 fifo\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // A program that isn't there: the client says so, as `macwl-run` does.
+    let out = host.client().arg("/nonexistent/program").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent/program"), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // No host at the path: the client starts one, which goes once idle.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sub").join("host");
+    let out = macwl_run().env("MACWL_HOST", &path).arg(client_guest()).args(["exit", "5"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(5), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700, "the user's alone");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    while path.exists() {
+        assert!(std::time::Instant::now() < end, "the started host stayed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Signals sent to a client from the Mac side (`kill -TERM`, `-INT`,
+/// `-HUP`, `-USR1` of its pid) reach its Linux process, whose end is then
+/// the client's.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn client_forwards_mac_signals() {
+    let host = Served::start();
+    for (mac, linux) in [(libc::SIGTERM, 15), (libc::SIGINT, 2), (libc::SIGHUP, 1), (libc::SIGUSR1, 10)] {
+        let (mut child, _, out) = trapping_client(&host);
+        assert_eq!(unsafe { libc::kill(child.id() as i32, mac) }, 0);
+        let st = child.wait().unwrap();
+        assert_eq!(st.code(), Some(100 + linux), "signal {mac}: {st:?}");
+        assert_eq!(rest_of(out), format!("got {linux}\n"));
+    }
+}
+
+/// A client killed with SIGKILL hangs its process up: SIGHUP (and SIGCONT)
+/// reach it, as a terminal's going does a session's.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn client_killed_hangs_its_process_up() {
+    let host = Served::start();
+    let (mut child, _, out) = trapping_client(&host);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // Its stdout is the process's own: what it says still comes.
+    assert_eq!(rest_of(out), "got 1\n");
+}
+
+/// Two clients in one host see each other's processes in `/proc`: procps'
+/// `ps` in one lists the other. And `macwl-run --ps` lists them from the
+/// Mac, with the Mac pid of each one's client.
+#[test]
+#[ignore = "needs scripts/build-guest.sh and nix"]
+fn clients_share_a_host() {
+    use std::io::BufRead;
+    let procps = std::path::PathBuf::from(linux_package("procps")).join("bin/ps");
+    let host = Served::start();
+    let mut a = host.client().arg(client_guest()).arg("wait").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(a.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let pid: i64 = line.trim().strip_prefix("ready ").unwrap().parse().unwrap();
+    let out = host.client().arg(&procps).args(["-e", "-o", "pid=,comm="]).output().unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{listing}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(listing.lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == [pid.to_string().as_str(), "client"]), "{pid} in {listing}");
+    assert!(listing.lines().any(|l| l.ends_with(" ps")), "ps itself in {listing}");
+
+    let out = macwl_run().args(["--ps", "--host"]).arg(&host.path).output().unwrap();
+    let ps = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{ps}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(ps.starts_with("    PID    PPID"), "{ps}");
+    let row: Vec<&str> = ps.lines().find(|l| l.split_whitespace().next() == Some(&pid.to_string())).expect("its row").split_whitespace().collect();
+    // PID PPID PGID SID TTY STAT TIME RSS CLIENT CMD...
+    let me = pid.to_string();
+    assert_eq!((row[1], row[2], row[3], row[8]), ("1", me.as_str(), me.as_str(), a.id().to_string().as_str()), "{ps}");
+    assert_eq!(row[9..].join(" "), format!("{} wait", client_guest().display()));
+    drop(a.stdin.take());
+    assert!(a.wait().unwrap().success());
+    // No host at a path: --ps says so.
+    let out = macwl_run().args(["--ps", "--host", "/nonexistent/host"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// A host lives while it has processes or clients: it goes 2 s after its
+/// last client's process ends, and stays for a daemon that process left
+/// behind until 2 s after that has gone too.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn host_lifetime() {
+    let mut host = Served::start();
+    // No client yet: it waits for one.
+    assert!(host.ends_within(std::time::Duration::from_millis(2500)).is_none(), "a --serve host waits for its first client");
+    let st = host.client().arg(client_guest()).args(["exit", "0"]).status().unwrap();
+    assert!(st.success());
+    let done = std::time::Instant::now();
+    let ended = host.ends_within(std::time::Duration::from_secs(6)).expect("the host to go");
+    let after = ended - done;
+    assert!(after >= std::time::Duration::from_millis(1900) && after < std::time::Duration::from_millis(3500), "{after:?}");
+    assert!(!host.path.exists(), "its socket gone with it");
+
+    let mut host = Served::start();
+    let out = host.client().arg(client_guest()).args(["daemon", "3"]).output().unwrap();
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).starts_with("daemon "));
+    let done = std::time::Instant::now();
+    let ended = host.ends_within(std::time::Duration::from_secs(10)).expect("the host to go");
+    let after = ended - done;
+    assert!(after >= std::time::Duration::from_millis(4800) && after < std::time::Duration::from_millis(6500), "{after:?}");
+}
+
+/// A client started in a terminal relays it (docs/processes.md, "Its
+/// terminal"): its process gets a pty of the host's with the terminal's
+/// size; Ctrl-Z stops the process and the client with it, the terminal's
+/// settings given back; continued, the process reads again; Ctrl-C ends a
+/// program, and the client with SIGINT; a resize reaches the process; the
+/// terminal going hangs it up.
+#[test]
+#[ignore = "needs nix"]
+fn client_relays_its_terminal() {
+    use std::os::fd::AsRawFd;
+    // (Found first: the host would go while nix looks.)
+    let bash = std::path::PathBuf::from(linux_package("bash")).join("bin/bash");
+    let coreutils = std::path::PathBuf::from(linux_package("coreutils")).join("bin");
+    let tool = |name: &str| coreutils.join(name).into_os_string();
+    let type_in = |master: &OwnedFd, s: &str| assert_eq!(unsafe { libc::write(master.as_raw_fd(), s.as_ptr().cast(), s.len()) }, s.len() as isize);
+    let wait = |child: &std::process::Child, options: i32| {
+        let mut st = 0;
+        assert_eq!(unsafe { libc::waitpid(child.id() as i32, &mut st, options) }, child.id() as i32);
+        st
+    };
+    let host = Served::start();
+    let env = [("MACWL_HOST", host.path.as_os_str())];
+
+    // Its size.
+    let (child, master) = in_a_terminal(&[&tool("stty"), "size".as_ref()], &env, 33, 101);
+    let mut seen = Vec::new();
+    read_until(&master, &mut seen, 0, "33 101");
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "{st:#x}");
+
+    // Ctrl-Z, and `fg`.
+    let (child, master) = in_a_terminal(&[&tool("cat")], &env, 24, 80);
+    let mut seen = Vec::new();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "one\n");
+    let at = read_until(&master, &mut seen, 0, "one");
+    let at = read_until(&master, &mut seen, at, "one");
+    type_in(&master, "\x1a");
+    let st = wait(&child, libc::WUNTRACED);
+    assert!(libc::WIFSTOPPED(st), "{st:#x}");
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(master.as_raw_fd(), &mut t) };
+    assert!(t.c_lflag & libc::ICANON != 0, "the terminal's own settings back while stopped");
+    unsafe { libc::kill(child.id() as i32, libc::SIGCONT) };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_in(&master, "two\n");
+    let at = read_until(&master, &mut seen, at, "two");
+    read_until(&master, &mut seen, at, "two");
+    type_in(&master, "\x04");
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "{st:#x}");
+
+    // Ctrl-C: the client ends as its process did, by SIGINT.
+    let (child, master) = in_a_terminal(&[&tool("sleep"), "100".as_ref()], &env, 24, 80);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    type_in(&master, "\x03");
+    let st = wait(&child, 0);
+    assert!(libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGINT, "{st:#x}");
+
+    // A resize: the pty's size follows.
+    let env_bash = [("MACWL_HOST", host.path.as_os_str()), ("MACWL_ENV_PATH", coreutils.as_os_str())];
+    let (child, master) = in_a_terminal(&[bash.as_os_str(), "-c".as_ref(), "read x; stty size".as_ref()], &env_bash, 24, 80);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let ws = libc::winsize { ws_row: 40, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+    unsafe { libc::kill(child.id() as i32, libc::SIGWINCH) };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    type_in(&master, "\n");
+    let mut seen = Vec::new();
+    read_until(&master, &mut seen, 0, "40 120");
+    let st = wait(&child, 0);
+    assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "{st:#x}");
+
+    // The terminal goes: the process gets SIGHUP, and so the client ends.
+    let (child, master) = in_a_terminal(&[&tool("sleep"), "100".as_ref()], &env, 24, 80);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    drop(master);
+    let st = wait(&child, 0);
+    assert!(libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGHUP, "{st:#x}");
+}
+
+/// `scripts/session.sh` in one host (`MACWL_ONE_VM=1`), through the headless
+/// compositor: bash in foot, typed at, lists with procps' `ps` the session's
+/// processes, dbus-daemon and foot (clients) and bash (foot's child), all
+/// in the one host; `macwl-run --ps` lists them from the Mac, with the
+/// clients' Mac pids, while the session's Mac processes are the host and
+/// its two clients; and all of them go once bash exits.
+#[test]
+#[ignore = "needs nix and builds the release binaries"]
+fn session_shares_one_host() {
+    // A short path: Unix socket paths are at most 103 bytes.
+    let dir = std::path::PathBuf::from(format!("/tmp/macwl-test-session-{}", std::process::id()));
+    let ps_txt = dir.join("ps.txt");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/session.sh");
+    let mut session = std::process::Command::new(script)
+        .env("MACWL_ONE_VM", "1")
+        .env("MACWL_SESSION_COMPOSITOR", "headless")
+        .env("MACWL_SESSION_DIR", &dir)
+        .env("MACWL_TYPE", format!("ps -eo pid=,ppid=,comm= > {}; sleep 3; exit\\n", ps_txt.display()))
+        .env_remove("MACWL_HOST")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Its errors, for a failure to show (the compositor's log is long).
+    let errors = rest_of_in_background(session.stderr.take().unwrap());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while std::fs::metadata(&ps_txt).map_or(true, |m| m.len() == 0) {
+        if std::time::Instant::now() > end || session.try_wait().unwrap().is_some() {
+            let _ = session.kill();
+            panic!("no ps output from the session");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let inside = std::fs::read_to_string(&ps_txt).unwrap();
+    let comms: Vec<&str> = inside.lines().filter_map(|l| l.split_whitespace().nth(2)).collect();
+    for want in ["dbus-daemon", "foot", "bash", "ps"] {
+        assert!(comms.contains(&want), "{want} in {inside}");
+    }
+    let out = macwl_run().arg("--ps").arg("--host").arg(dir.join("macwl-host")).output().unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let clients: Vec<i32> = listing.lines().skip(1).filter_map(|l| l.split_whitespace().nth(8)?.parse().ok()).collect();
+    assert_eq!(clients.len(), 2, "dbus-daemon's and foot's clients: {listing}");
+    assert!(listing.contains("dbus-daemon") && listing.contains("bin/foot"), "{listing}");
+    let st = session.wait().unwrap();
+    let errors = errors.join().unwrap();
+    let errors: Vec<&str> = errors.lines().filter(|l| !l.contains("macwl_compositor")).collect();
+    assert!(st.success(), "{st:?}: {}", errors.join("\n"));
+    // The host goes 2 s after its last process.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while dir.join("macwl-host").exists() || clients.iter().any(|&c| unsafe { libc::kill(c, 0) } == 0) {
+        assert!(std::time::Instant::now() < end, "the session's host or clients stayed");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

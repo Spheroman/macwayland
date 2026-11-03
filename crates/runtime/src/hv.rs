@@ -120,8 +120,18 @@ unsafe extern "C" {
 /// below 512 GiB and shared windows above it (see `paging::POOL_SIZE`).
 pub const IPA_BITS: u32 = 40;
 
+/// Whether this process has ever tried to make a VM: a client, which
+/// starts hosts, must never have (see `client::spawn_host`).
+static VM_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has ever tried to make a VM.
+pub fn vm_tried() -> bool {
+    VM_TRIED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl Vm {
     pub fn new() -> Result<Self, HvError> {
+        VM_TRIED.store(true, std::sync::atomic::Ordering::SeqCst);
         let config = unsafe { hv_vm_config_create() };
         if config.is_null() {
             return Err(HvError { call: "hv_vm_config_create", code: -1 });

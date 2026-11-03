@@ -623,6 +623,29 @@ impl Process {
         self.signals.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The signals in `set` (bit n-1 for signal n) start out ignored, as a
+    /// program inherits SIG_IGN across `execve`: a client's process, those
+    /// the Mac process that started the client ignored (`nohup`, a
+    /// non-interactive shell's `&`).
+    pub fn ignore_signals(&self, set: u64) {
+        let mut s = self.signals();
+        for sig in (1..=NSIG).filter(|&sig| set & bit(sig) != 0 && bit(sig) & UNBLOCKABLE == 0) {
+            s.actions[sig as usize - 1].handler = SIG_IGN;
+        }
+        s.host_stale = true;
+        s.actions_changed();
+    }
+}
+
+impl Thread {
+    /// The thread blocks `mask` (bit n-1 for signal n) from now on: a
+    /// client's process starts with the mask the client was started with.
+    pub fn set_blocked_signals(&mut self, mask: u64) {
+        self.signals.blocked = mask & !UNBLOCKABLE;
+    }
+}
+
+impl Process {
     /// The next signal for thread `t` to act on, if any: pending (for it or
     /// the process), not blocked, not ignored. For a handler, the thread's
     /// mask is updated as the handler runs with it.

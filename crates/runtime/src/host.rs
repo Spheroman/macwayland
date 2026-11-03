@@ -15,8 +15,12 @@
 //! foreground group, keyboard signals, SIGTTIN/SIGTTOU and hangups, with
 //! Linux's rules; a host started in a Mac terminal relays it (`relay`).
 //!
-//! What stays for later steps: clients joining a host (5), Mac programs (6: an
-//! `execve` of one fails with ENOEXEC, and the host process never execs).
+//! A host can also serve clients (step 5, `serve`): `macwl-run`s started
+//! from outside that join it, each standing in on the Mac for the process
+//! it asked for.
+//!
+//! What stays for later steps: Mac programs (6: an `execve` of one fails
+//! with ENOEXEC, and the host process never execs).
 //! The table's entries are a kind ([`Kind`]) so that stand-ins for Mac
 //! programs (6) and for processes in other hosts (9) fit in beside local
 //! ones; pids come from a [`PidAllocator`] handing out ranges unique across
@@ -39,6 +43,9 @@ use linux_abi::{
     syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostSignalWait, Inbox, Kernel, ProcStatus, SigInfo, Thread, TtyOp, Waited, Waker, RUSAGE_SIZE},
     GuestMemory, Process,
 };
+
+mod serve;
+pub(crate) use serve::{serve, ALREADY_SERVING};
 
 use crate::{
     cputime::Times,
@@ -217,6 +224,9 @@ pub(crate) struct Table {
     /// The relay between the Mac terminal `macwl-run` was started in and
     /// the pty its first process has instead, if it was started in one.
     relay: std::sync::OnceLock<Arc<crate::relay::Relay>>,
+    /// A host serving clients (`--serve`): what it's told of their
+    /// processes, and of the host having no process left.
+    service: std::sync::OnceLock<Arc<serve::Notify>>,
 }
 
 struct State {
@@ -272,6 +282,9 @@ struct Entry {
     /// started `macwl-run` in a terminal (through the relay), which
     /// continues it when it stops. Its group is never orphaned.
     mac_parent: bool,
+    /// A client (a `macwl-run` joining a `--serve` host) stands in for it
+    /// on the Mac: it hears when the process stops, continues and ends.
+    client: bool,
 }
 
 /// What a table entry is. Steps 6 and 9 add stand-ins: a Mac program
@@ -368,6 +381,7 @@ impl Table {
             first_exit: Mutex::new(None),
             live: AtomicUsize::new(0),
             relay: std::sync::OnceLock::new(),
+            service: std::sync::OnceLock::new(),
         }
     }
 
@@ -407,6 +421,7 @@ impl Table {
                 start_ns,
                 ctty,
                 mac_parent: false,
+                client: false,
             },
         );
         if let Some(parent) = s.procs.get_mut(&ppid) {
@@ -537,6 +552,18 @@ impl Table {
         {
             relay.first_stopped();
         }
+        // So does the shell of a client standing in for it.
+        self.tell_client(proc.abi.pid, || serve::Event::Stopped(proc.abi.pid, sig));
+    }
+
+    /// Tell the client standing in for `pid`, if one does, of what
+    /// `event` makes.
+    fn tell_client(&self, pid: i64, event: impl FnOnce() -> serve::Event) {
+        if let Some(service) = self.service.get()
+            && self.state().procs.get(&pid).is_some_and(|e| e.client)
+        {
+            service.post(event());
+        }
     }
 
     /// `proc` continues if it was stopped (`report`: and its parent hears
@@ -550,6 +577,7 @@ impl Table {
         if report {
             self.child_changed(proc.abi.pid, CONTINUED, CLD_CONTINUED, SIGCONT as i32);
         }
+        self.tell_client(proc.abi.pid, || serve::Event::Continued(proc.abi.pid));
     }
 
     /// Child `pid` stopped or continued: `wait` can report `status`, and its
@@ -664,6 +692,11 @@ impl Table {
                 SIGHUP => return self.hangup(relay.n),
                 _ => {}
             }
+        }
+        // A serving host has no terminal of its own: its clients' resizes
+        // come from them.
+        if sig == SIGWINCH && self.service.get().is_some() {
+            return;
         }
         let info = SigInfo::user(sig, SI_USER, 0);
         let group = self.state().procs.get(&self.first).filter(|e| matches!(e.kind, Kind::Local(_))).map(|e| e.pgid);
@@ -796,6 +829,18 @@ impl Table {
     /// The foreground group of pty `n`, if a session has it.
     pub fn tty_foreground(&self, n: u32) -> Option<i64> {
         self.foreground(n).map(|(fg, _)| fg)
+    }
+
+    /// The Mac terminal pty `n` (whose master is `master`) stands for is
+    /// `ws` now: so is the pty, and its foreground group hears of a change.
+    pub fn resize_tty(&self, n: u32, master: i32, ws: libc::winsize) {
+        let old = linux_abi::syscall::tty::winsize(master);
+        unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &ws) };
+        if old.is_none_or(|o| (o.ws_row, o.ws_col, o.ws_xpixel, o.ws_ypixel) != (ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel))
+            && let Some(fg) = self.tty_foreground(n)
+        {
+            let _ = self.deliver(Target::Group(fg), SigInfo::user(SIGWINCH, SI_KERNEL, 0));
+        }
     }
 }
 
@@ -1514,6 +1559,8 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
     let pid = proc.abi.pid;
     let exit = proc.exit().take().unwrap_or(Ok(Exit::Code(0)));
     let status = wait_status(&exit);
+    // Its client, if it has one, exits as it did.
+    table.tell_client(pid, || serve::Event::Exited(pid, exit.as_ref().map(|e| *e).map_err(|e| e.to_string())));
     if pid == table.first {
         *table.first_exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(exit);
     }
@@ -1642,7 +1689,11 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
         }
     }
     if table.live.fetch_sub(1, Ordering::AcqRel) == 1 {
-        // No process left: the host is done.
-        sh.sched.stop();
+        match table.service.get() {
+            // A serving host waits a little for more clients first.
+            Some(service) => service.post(serve::Event::NoProcesses),
+            // No process left: the host is done.
+            None => drop(sh.sched.stop()),
+        }
     }
 }
