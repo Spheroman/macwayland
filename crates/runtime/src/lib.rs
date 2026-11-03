@@ -829,6 +829,19 @@ fn run_task<'scope, 'env>(
 /// mappings, and signals delivered (a handler with SA_RESTART restarts an
 /// interrupted call). Some if that ends the process.
 fn finish_call(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &mut Thread, nr: u64, arg0: u64, ret: i64) -> Result<Option<Next>, Error> {
+    // The core's own codes (PARK, OFFLOAD) never reach the guest: one that
+    // got this far is a runtime bug. Say so, and give the guest an EINTR it
+    // can retry, not an errno no C library expects (glibc aborts on one
+    // from a futex wait).
+    let ret = if ret == -linux_abi::errno::PARK || ret == -linux_abi::errno::OFFLOAD {
+        eprintln!("macwl-run: internal result {} from {} (pid {}, tid {}) reached the guest; EINTR instead", -ret, linux_abi::nr::name(nr), process.pid, thread.tid);
+        -linux_abi::errno::EINTR
+    } else {
+        ret
+    };
+    if nr == linux_abi::nr::FUTEX && ret < 0 {
+        futex_result_check(vcpu, process, thread, arg0, ret);
+    }
     vcpu.set_reg(reg::X0, ret as u64)?;
     // Mappings changed: flush every vCPU's TLB before the call returns, then
     // unmapped frames can be reused.
@@ -1014,6 +1027,24 @@ fn start_fresh_on(vcpu: &mut Vcpu, entry: u64, sp: u64) -> Result<(), Error> {
     vcpu.set_reg(reg::CPSR, 0x3c5)?; // EL1h, interrupts masked, for the flush path
     vcpu.set_reg(reg::PC, memory::VECTOR_FLUSH_PATH)?;
     Ok(())
+}
+
+/// Say (once) when a futex call returns what glibc takes as fatal ("The
+/// futex facility returned an unexpected error code"): anything but EAGAIN,
+/// EINTR and, for a wait with a timeout, ETIMEDOUT. Every path a futex
+/// result takes (a CPU, a worker, a wait made again after parking) ends
+/// here; the call's x1 (op) and x3 (timeout) are still the guest's.
+fn futex_result_check(vcpu: &Vcpu, process: &Process, thread: &Thread, uaddr: u64, ret: i64) {
+    use linux_abi::errno::{EAGAIN, EINTR, ETIMEDOUT};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let op = vcpu.reg(reg::X0 + 1).unwrap_or(0);
+    let timeout = vcpu.reg(reg::X0 + 3).unwrap_or(0);
+    let cmd = op & 0x7f;
+    let waits = cmd == 0 || cmd == 9; // FUTEX_WAIT, FUTEX_WAIT_BITSET
+    let fine = ret == -EAGAIN || ret == -EINTR || (ret == -ETIMEDOUT && waits && timeout != 0);
+    if !fine && !SAID.swap(true, Ordering::Relaxed) {
+        eprintln!("macwl-run: futex returned {ret} (op {op:#x}, uaddr {uaddr:#x}, timeout {timeout:#x}) to pid {} tid {}", process.pid, thread.tid);
+    }
 }
 
 /// Flush the running address space's TLB entries (on all vCPUs) now, from a

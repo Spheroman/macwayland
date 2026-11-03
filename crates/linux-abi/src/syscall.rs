@@ -544,7 +544,18 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         // Linux xattr names ("user.", "security."...) don't map onto Darwin's;
         // until they do, files look like they're on a filesystem without them.
         nr::SETXATTR..=nr::FREMOVEXATTR => Err(errno::EOPNOTSUPP),
-        nr::FUTEX => futex::futex(p, t, mem, a0, a1, a2, a3, a4, a5),
+        nr::FUTEX => {
+            let r = futex::futex(p, t, mem, a0, a1, a2, a3, a4, a5);
+            // What glibc takes as fatal ("The futex facility returned an
+            // unexpected error code"): said once, with what was asked.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Err(e @ (errno::EINVAL | errno::EFAULT | errno::ENOSYS)) = r
+                && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("linux-abi: futex gave {e} (op {a1:#x}, uaddr {a0:#x}, timeout {a3:#x}), which glibc takes as fatal");
+            }
+            r
+        }
         nr::CLOCK_GETTIME => misc::clock_gettime(p, mem, a0, a1, false),
         nr::CLOCK_GETRES => misc::clock_gettime(p, mem, a0, a1, true),
         nr::TIMES => misc::times(p, mem, a0),
