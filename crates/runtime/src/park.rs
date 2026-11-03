@@ -135,6 +135,11 @@ pub(crate) fn new_id() -> u64 {
 }
 
 impl Parking {
+    /// The run queue it hands tasks to (the host's).
+    pub fn sched(&self) -> &Arc<Sched> {
+        &self.sched
+    }
+
     pub fn new(sched: Arc<Sched>) -> std::io::Result<Arc<Parking>> {
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {

@@ -33,7 +33,7 @@ use std::{
 };
 
 use super::{
-    kernel::{ChildInfo, Waited},
+    kernel::{ChildInfo, MacPrograms, Waited},
     ok, path_arg, signal, Action, Process, Thread,
 };
 use crate::{
@@ -530,7 +530,11 @@ pub(super) fn execve<M: GuestMemory + ?Sized>(p: &Process, mem: &M, path: u64, a
     let comm = path.rsplit(|&b| b == b'/').next().unwrap_or_default().to_vec();
     Ok(match load_program(p, path, argv, &search, 0)? {
         Program::Linux(exec) => Action::Exec(Exec { envp, comm, ..exec }),
-        Program::Mac(path, argv) => Action::ExecHost(HostExec { path, argv, envp }),
+        Program::Mac(path, argv) => match p.kernel.mac_programs() {
+            MacPrograms::ExecHost => Action::ExecHost(HostExec { path, argv, envp }),
+            MacPrograms::StandIn => Action::MacStandIn(HostExec { path, argv, envp }),
+            MacPrograms::Refused => return Err(errno::ENOEXEC),
+        },
     })
 }
 
@@ -545,7 +549,7 @@ fn is_mach_o(head: &[u8]) -> bool {
     }
 }
 
-pub(super) fn mac_programs_allowed() -> bool {
+pub fn mac_programs_allowed() -> bool {
     std::env::var_os("MACWL_MAC_PROGRAMS").is_some_and(|v| v == "1")
 }
 
@@ -594,7 +598,7 @@ fn load_program(p: &Process, path: Vec<u8>, argv: Vec<Vec<u8>>, search: &[u8], d
     let mut head = Vec::with_capacity(256);
     std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 256), &mut head).map_err(|e| errno::from_io(&e))?;
     if is_mach_o(&head) {
-        return if p.kernel.mac_programs() { Ok(Program::Mac(host, argv)) } else { Err(errno::ENOEXEC) };
+        return if p.kernel.mac_programs() != MacPrograms::Refused { Ok(Program::Mac(host, argv)) } else { Err(errno::ENOEXEC) };
     }
     let data = head;
 
@@ -662,6 +666,64 @@ pub(super) fn mac_has_terminfo(term: &[u8], envp: &[Vec<u8>]) -> bool {
     })
 }
 
+/// The environment a Mac program gets from guest environment `envp`: the
+/// guest's, but with the Mac's `PATH` and `SHELL` (those macwl-run started
+/// with, so the programs it runs in turn are Mac ones too), and a `TERM`
+/// macOS's ncurses can read.
+pub fn mac_environment(envp: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let from_mac = ["PATH", "SHELL"];
+    let mut env: Vec<Vec<u8>> =
+        envp.iter().filter(|e| !from_mac.iter().any(|v| e.starts_with(v.as_bytes()) && e.get(v.len()) == Some(&b'='))).cloned().collect();
+    for var in from_mac {
+        if let Some(value) = std::env::var_os(var) {
+            env.push([var.as_bytes(), b"=", value.as_bytes()].concat());
+        }
+    }
+    // macOS's ncurses has no entry for foot (and can't read Linux's, which
+    // are in ncurses 6's format): give it one it knows that foot is
+    // compatible with.
+    if let Some(term) = env.iter_mut().find(|e| e.starts_with(b"TERM="))
+        && !mac_has_terminfo(&term[5..], envp)
+    {
+        *term = b"TERM=xterm-256color".to_vec();
+    }
+    env
+}
+
+/// What a Mac program started for a process (with many processes in one
+/// VM, [`Action::MacStandIn`]) gets from it, as `execve` would pass it on:
+/// see the module docs. The core spawns it as a process of its own.
+#[derive(Debug)]
+pub struct MacSpawn {
+    /// Its host path, argv and environment (the Mac's `PATH` and `SHELL`).
+    pub path: std::ffi::CString,
+    pub argv: Vec<Vec<u8>>,
+    pub env: Vec<Vec<u8>>,
+    /// The guest's working directory, as a host path.
+    pub cwd: std::ffi::CString,
+    /// The fds it inherits: guest number and open file.
+    pub fds: Vec<(usize, std::sync::Arc<crate::fs::OpenFile>)>,
+    /// Linux signals (bit `n - 1` for signal `n`) the process ignores, which
+    /// stay ignored, and the exec'ing thread's mask, which carries over.
+    pub ignored: u64,
+    pub blocked: u64,
+}
+
+/// What process `p` passes on to the Mac program `exec`, from a thread
+/// with signal mask `blocked`.
+pub fn mac_spawn(p: &Process, blocked: u64, exec: &HostExec) -> Result<MacSpawn, i64> {
+    let cwd = p.fs.host_path(&p.fs.cwd()).map_err(|_| errno::ENOENT)?;
+    Ok(MacSpawn {
+        path: exec.path.clone(),
+        argv: exec.argv.clone(),
+        env: mac_environment(&exec.envp),
+        cwd,
+        fds: p.fds.inherited_files(),
+        ignored: p.signals().ignored(),
+        blocked,
+    })
+}
+
 // Darwin's `posix_spawn_file_actions_addchdir_np` (macOS 10.15), which the
 // libc crate doesn't declare.
 unsafe extern "C" {
@@ -680,28 +742,7 @@ pub fn exec_host(p: &Process, blocked: u64, exec: &HostExec) -> i64 {
     use std::ffi::CString;
     let cstrings = |v: &[Vec<u8>]| v.iter().filter_map(|s| CString::new(s.clone()).ok()).collect::<Vec<_>>();
     let argv = cstrings(&exec.argv);
-    // The guest's environment, but the Mac's PATH and SHELL.
-    let from_mac = ["PATH", "SHELL"];
-    let mut env: Vec<Vec<u8>> = exec
-        .envp
-        .iter()
-        .filter(|e| !from_mac.iter().any(|v| e.starts_with(v.as_bytes()) && e.get(v.len()) == Some(&b'=')))
-        .cloned()
-        .collect();
-    for var in from_mac {
-        if let Some(value) = std::env::var_os(var) {
-            env.push([var.as_bytes(), b"=", value.as_bytes()].concat());
-        }
-    }
-    // macOS's ncurses has no entry for foot (and can't read Linux's, which
-    // are in ncurses 6's format): give it one it knows that foot is
-    // compatible with.
-    if let Some(term) = env.iter_mut().find(|e| e.starts_with(b"TERM="))
-        && !mac_has_terminfo(&term[5..], &exec.envp)
-    {
-        *term = b"TERM=xterm-256color".to_vec();
-    }
-    let env = cstrings(&env);
+    let env = cstrings(&mac_environment(&exec.envp));
     let ptrs = |v: &[CString]| v.iter().map(|s| s.as_ptr()).chain([std::ptr::null()]).collect::<Vec<_>>();
     let (argv_p, env_p) = (ptrs(&argv), ptrs(&env));
     let Ok(cwd) = p.fs.host_path(&p.fs.cwd()) else { return errno::ENOENT };

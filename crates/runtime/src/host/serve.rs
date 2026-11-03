@@ -614,13 +614,20 @@ impl Service {
                             (state, p.cpu.times(), Some(p.clone()), p.abi.comm())
                         }
                         Kind::Zombie { cpu, comm, .. } => ('Z', *cpu, None, comm.clone()),
+                        // A stand-in: what macOS says of its Mac program.
+                        Kind::Mac { cpu } => {
+                            let m = e.mac.as_ref().expect("a stand-in's Mac program");
+                            let (user, sys, _) = crate::mac::usage(m.pid).unwrap_or_default();
+                            (if m.stopped { 'T' } else { 'S' }, *cpu + crate::cputime::Times { user, sys }, None, m.comm.clone())
+                        }
                     };
-                    (pid, e.ppid, e.pgid, e.sid, e.ctty, state, cpu, proc, comm)
+                    let mac = e.mac.as_ref().filter(|_| matches!(e.kind, Kind::Mac { .. })).map(|m| (m.pid, m.cmdline.clone()));
+                    (pid, e.ppid, e.pgid, e.sid, e.ctty, state, cpu, proc, comm, mac)
                 })
                 .collect()
         };
         let mut out = format!("{:>7} {:>7} {:>7} {:>7} {:<7} {:<4} {:>8} {:>8} {:>6}  CMD\n", "PID", "PPID", "PGID", "SID", "TTY", "STAT", "TIME", "RSS", "CLIENT");
-        for (pid, ppid, pgid, sid, ctty, state, cpu, proc, comm) in rows {
+        for (pid, ppid, pgid, sid, ctty, state, cpu, proc, comm, mac) in rows {
             // The command line from the process's memory, as /proc's
             // cmdline; a zombie's name in brackets.
             let (cmd, rss_kb) = match proc.and_then(|p| Some((p.abi.arg_area(), p.space.lock().unwrap_or_else(|e| e.into_inner()).clone()?))) {
@@ -631,12 +638,24 @@ impl Service {
                     let cmd = if cmd.is_empty() { format!("[{}]", String::from_utf8_lossy(&comm)) } else { String::from_utf8_lossy(&cmd).into_owned() };
                     (cmd, linux_abi::GuestMemory::resident_pages(&*space) * 4)
                 }
-                None => (format!("[{}]", String::from_utf8_lossy(&comm)), 0),
+                None => match &mac {
+                    Some((mac_pid, cmdline)) => {
+                        let cmd: Vec<u8> = cmdline.strip_suffix(b"\0").unwrap_or(cmdline).iter().map(|&b| if b == 0 { b' ' } else { b }).collect();
+                        (String::from_utf8_lossy(&cmd).into_owned(), crate::mac::usage(*mac_pid).map_or(0, |u| u.2 / 1024))
+                    }
+                    None => (format!("[{}]", String::from_utf8_lossy(&comm)), 0),
+                },
             };
             let secs = cpu.total() / 1_000_000_000;
             let time = format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
             let tty = ctty.map_or_else(|| "?".to_string(), |n| format!("pts/{n}"));
-            let client = clients.get(&pid).map_or_else(|| "-".to_string(), |p| p.to_string());
+            // The Mac process standing for it: its client's, or the Mac
+            // program it stands in for (marked so).
+            let client = match (clients.get(&pid), &mac) {
+                (Some(p), _) => p.to_string(),
+                (None, Some((mac_pid, _))) => format!("{mac_pid}*"),
+                (None, None) => "-".to_string(),
+            };
             out.push_str(&format!("{pid:>7} {ppid:>7} {pgid:>7} {sid:>7} {tty:<7} {state:<4} {time:>8} {rss_kb:>8} {client:>6}  {cmd}\n"));
         }
         out

@@ -671,15 +671,13 @@ fn one_vm_more_processes_than_vms() {
     assert!(child.wait().unwrap().success());
 }
 
-/// The host process never execs: in one VM an execve of a Mac program
-/// fails with ENOEXEC (step 6 brings them back as processes of their own),
-/// even with Mac programs turned on.
+/// With Mac programs off, an execve of one fails with ENOEXEC in one VM.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
-fn one_vm_refuses_mac_programs() {
+fn one_vm_refuses_mac_programs_when_off() {
     let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
     let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
-    let out = macwl_run().env("MACWL_ONE_VM", "1").env("MACWL_MAC_PROGRAMS", "1").arg(&path).arg("execmac").output().unwrap();
+    let out = macwl_run().env("MACWL_ONE_VM", "1").env_remove("MACWL_MAC_PROGRAMS").arg(&path).arg("execmac").output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "execve: ENOEXEC\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success());
 }

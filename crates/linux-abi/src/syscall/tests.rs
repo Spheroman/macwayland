@@ -98,7 +98,7 @@ impl T {
             Action::Return(v) => v,
             Action::Exit(c) | Action::ExitThread(c) => panic!("exited with {c}"),
             Action::SigReturn => panic!("rt_sigreturn wants the core"),
-            a @ (Action::Fork(_) | Action::Exec(_) | Action::ExecHost(_) | Action::Spawn(_)) => panic!("{} wants the core: {a:?}", nr::name(nr)),
+            a @ (Action::Fork(_) | Action::Exec(_) | Action::ExecHost(_) | Action::MacStandIn(_) | Action::Spawn(_)) => panic!("{} wants the core: {a:?}", nr::name(nr)),
         }
     }
 

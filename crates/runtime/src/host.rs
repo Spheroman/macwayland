@@ -19,12 +19,14 @@
 //! from outside that join it, each standing in on the Mac for the process
 //! it asked for.
 //!
-//! What stays for later steps: Mac programs (6: an `execve` of one fails
-//! with ENOEXEC, and the host process never execs).
-//! The table's entries are a kind ([`Kind`]) so that stand-ins for Mac
-//! programs (6) and for processes in other hosts (9) fit in beside local
-//! ones; pids come from a [`PidAllocator`] handing out ranges unique across
-//! the user's hosts.
+//! Mac programs (step 6, `mac`): the host process never execs. An
+//! `execve` of a Mac program spawns it as a process of its own (by an
+//! agent), and the Linux process stays in the table as its stand-in
+//! ([`Kind::Mac`]): signals to it are host `kill`s of the Mac program, and
+//! the agents' reports of it stopping, continuing and ending are its own.
+//! Processes in other hosts (step 9) will be another kind of entry; pids
+//! come from a [`PidAllocator`] handing out ranges unique across the
+//! user's hosts.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -37,10 +39,12 @@ use std::{
     },
 };
 
+use crate::mac::{self, Change};
+
 use linux_abi::{
     errno,
     fs::OpenFile,
-    syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostSignalWait, Inbox, Kernel, ProcStatus, SigInfo, Thread, TtyOp, Waited, Waker, RUSAGE_SIZE},
+    syscall::{catch_host_signals, ChildInfo, CpuClock, Fork, HostExec, HostSignalWait, Inbox, Kernel, MacPrograms, ProcStatus, SigInfo, Thread, TtyOp, Waited, Waker, RUSAGE_SIZE},
     GuestMemory, Process,
 };
 
@@ -227,6 +231,35 @@ pub(crate) struct Table {
     /// A host serving clients (`--serve`): what it's told of their
     /// processes, and of the host having no process left.
     service: std::sync::OnceLock<Arc<serve::Notify>>,
+    /// The agents that start its Mac programs (`mac`): one per pty that is
+    /// a Linux session's terminal, and one (`None`) for sessions without.
+    agents: Mutex<HashMap<Option<u32>, Arc<mac::Agent>>>,
+    /// Held while a stand-in's reports are handled, so that they're
+    /// handled in the order they came.
+    mac_order: Mutex<()>,
+}
+
+/// The most terminals with an agent of their own at once; Mac programs of
+/// sessions past it go to the agent without a terminal.
+const MAX_TTY_AGENTS: usize = 64;
+
+/// A Mac program a process stands in for (docs/processes.md, section 7).
+#[derive(Debug)]
+struct MacLink {
+    /// Its Mac pid, and its Mac process group (its agent's for the
+    /// process's Linux group).
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+    /// The pty its agent has as its controlling terminal: the Mac driver
+    /// sends the keyboard's signals to it itself.
+    tty: Option<u32>,
+    stopped: bool,
+    /// Its `/proc` cmdline and its name.
+    cmdline: Vec<u8>,
+    comm: Vec<u8>,
+    /// Its agent's reports that came before the process's tasks had all
+    /// gone (handled once they have).
+    pending: Vec<Change>,
 }
 
 struct State {
@@ -237,6 +270,11 @@ struct State {
     /// The host's terminals (ptys, by number) that sessions have as their
     /// controlling terminal, or that were opened here.
     ttys: HashMap<u32, Tty>,
+    /// Mac programs' pids: the processes standing in for them.
+    mac_pids: HashMap<libc::pid_t, i64>,
+    /// Agents' reports of Mac programs not yet in the table (a spawn's
+    /// answer and the program's first change cross).
+    early: HashMap<libc::pid_t, Vec<Change>>,
 }
 
 /// A terminal's job control: the session it's the controlling terminal
@@ -285,13 +323,18 @@ struct Entry {
     /// A client (a `macwl-run` joining a `--serve` host) stands in for it
     /// on the Mac: it hears when the process stops, continues and ends.
     client: bool,
+    /// The Mac program it stands in for, from its spawn until it ends.
+    mac: Option<MacLink>,
 }
 
-/// What a table entry is. Steps 6 and 9 add stand-ins: a Mac program
-/// standing in for a Linux process, a process in another host.
+/// What a table entry is. Step 9 adds another: a process in another host.
 enum Kind {
     /// A process running in this host.
     Local(Arc<Proc>),
+    /// A stand-in: the process exec'd a Mac program (its `Entry::mac`),
+    /// which runs as a Mac process of its own; its tasks and memory have
+    /// gone. The CPU time it used before.
+    Mac { cpu: Times },
     /// Ended, waiting for its parent's `wait`: its wait status and the CPU
     /// time it and its reaped children used.
     Zombie { status: i32, cpu: Times, comm: Vec<u8> },
@@ -374,7 +417,7 @@ enum Which {
 impl Table {
     fn new(pids: Box<dyn PidAllocator>, first: i64, parking: Arc<crate::park::Parking>) -> Table {
         Table {
-            state: Mutex::new(State { procs: BTreeMap::new(), tids: HashMap::new(), ttys: HashMap::new() }),
+            state: Mutex::new(State { procs: BTreeMap::new(), tids: HashMap::new(), ttys: HashMap::new(), mac_pids: HashMap::new(), early: HashMap::new() }),
             pids,
             parking,
             first,
@@ -382,6 +425,8 @@ impl Table {
             live: AtomicUsize::new(0),
             relay: std::sync::OnceLock::new(),
             service: std::sync::OnceLock::new(),
+            agents: Mutex::new(HashMap::new()),
+            mac_order: Mutex::new(()),
         }
     }
 
@@ -391,10 +436,7 @@ impl Table {
 
     /// A process of the host, if it's running here.
     fn local(&self, pid: i64) -> Option<Arc<Proc>> {
-        match &self.state().procs.get(&pid)?.kind {
-            Kind::Local(p) => Some(p.clone()),
-            Kind::Zombie { .. } => None,
-        }
+        local_of(self.state().procs.get(&pid)?)
     }
 
     /// A new process `pid`, child of `ppid` (1: init), in the group and
@@ -422,6 +464,7 @@ impl Table {
                 ctty,
                 mac_parent: false,
                 client: false,
+                mac: None,
             },
         );
         if let Some(parent) = s.procs.get_mut(&ppid) {
@@ -471,17 +514,35 @@ impl Table {
     /// will be told by their own means: a Mac program's with a host `kill`,
     /// step 6; another host's through the coordinator, step 9.)
     pub fn deliver(&self, to: Target, info: SigInfo) -> Result<i64, i64> {
+        self.deliver_from(to, info, None)
+    }
+
+    /// [`Table::deliver`], for a signal pty `keyboard`'s keys raised (if
+    /// they did): Mac programs whose agent has that terminal got it from
+    /// the Mac driver already.
+    fn deliver_from(&self, to: Target, info: SigInfo, keyboard: Option<u32>) -> Result<i64, i64> {
+        // Mac programs standing in for processes: by pid, or their Mac
+        // group (which reaches the Mac processes they started too).
+        let mut macs: BTreeSet<libc::pid_t> = BTreeSet::new();
         let targets: Vec<(Arc<Proc>, Option<i64>)> = {
             let s = self.state();
-            let local = |e: &Entry| match &e.kind {
-                Kind::Local(p) => Some(p.clone()),
-                Kind::Zombie { .. } => None,
+            // A process's own (a stand-in's Mac program), or (in a group,
+            // `whole`) its Mac group's.
+            let mut local = |e: &Entry, whole: bool| {
+                if let Some(m) = &e.mac {
+                    if keyboard.is_none() || m.tty != keyboard {
+                        // Never 0 or 1, which kill() would read as "every".
+                        macs.insert(if whole && m.pgid > 1 { -m.pgid } else { m.pid });
+                    }
+                    return None;
+                }
+                local_of(e)
             };
             match to {
                 Target::Pid(1) => return Err(errno::EPERM), // init gets no signals
                 Target::Pid(pid) => match s.procs.get(&pid) {
                     // A zombie takes a signal and does nothing with it.
-                    Some(e) => local(e).map(|p| (p, None)).into_iter().collect(),
+                    Some(e) => local(e, false).map(|p| (p, None)).into_iter().collect(),
                     None => return Err(errno::ESRCH),
                 },
                 Target::Group(pgid) => {
@@ -489,12 +550,16 @@ impl Table {
                     if members.is_empty() {
                         return Err(errno::ESRCH);
                     }
-                    members.into_iter().filter_map(local).map(|p| (p, None)).collect()
+                    members.into_iter().filter_map(|e| local(e, true)).map(|p| (p, None)).collect()
                 }
                 Target::All { except } => {
-                    let all: Vec<(Arc<Proc>, Option<i64>)> =
-                        s.procs.iter().filter(|&(&pid, _)| pid != except).filter_map(|(_, e)| local(e)).map(|p| (p, None)).collect();
-                    if all.is_empty() {
+                    let mut all = Vec::new();
+                    let mut any = false;
+                    for (_, e) in s.procs.iter().filter(|&(&pid, _)| pid != except) {
+                        any = true;
+                        all.extend(local(e, true).map(|p| (p, None)));
+                    }
+                    if !any {
                         return Err(errno::ESRCH);
                     }
                     all
@@ -504,13 +569,25 @@ impl Table {
                     if tgid.is_some_and(|g| g != pid) {
                         return Err(errno::ESRCH);
                     }
-                    let proc = s.procs.get(&pid).and_then(local).ok_or(errno::ESRCH)?;
-                    vec![(proc, Some(tid))]
+                    let e = s.procs.get(&pid).ok_or(errno::ESRCH)?;
+                    if e.mac.is_some() {
+                        local(e, false);
+                        Vec::new()
+                    } else {
+                        vec![(local_of(e).ok_or(errno::ESRCH)?, Some(tid))]
+                    }
                 }
             }
         };
         if info.signo == 0 {
             return Ok(0);
+        }
+        // Signals Darwin has no number for (real-time ones) don't reach a
+        // Mac program.
+        if let Some(sig) = linux_abi::syscall::signal_to_darwin(info.signo) {
+            for target in macs {
+                unsafe { libc::kill(target, sig) };
+            }
         }
         for (proc, tid) in targets {
             match info.signo {
@@ -634,7 +711,7 @@ impl Table {
                     let e = s.procs.get_mut(&c).unwrap();
                     let cpu = e.children_cpu
                         + match &e.kind {
-                            Kind::Zombie { cpu, .. } => *cpu,
+                            Kind::Zombie { cpu, .. } | Kind::Mac { cpu } => *cpu,
                             Kind::Local(proc) => proc.cpu.times(),
                         };
                     match e.kind {
@@ -644,7 +721,7 @@ impl Table {
                             }
                             return Ok(Some((c, status, cpu)));
                         }
-                        Kind::Local(_) => {
+                        Kind::Local(_) | Kind::Mac { .. } => {
                             let wanted = match e.report {
                                 Some(CONTINUED) => want.continued,
                                 Some(_) => want.stopped,
@@ -699,7 +776,7 @@ impl Table {
             return;
         }
         let info = SigInfo::user(sig, SI_USER, 0);
-        let group = self.state().procs.get(&self.first).filter(|e| matches!(e.kind, Kind::Local(_))).map(|e| e.pgid);
+        let group = self.state().procs.get(&self.first).filter(|e| matches!(e.kind, Kind::Local(_) | Kind::Mac { .. })).map(|e| e.pgid);
         let _ = match group {
             Some(pgid) => self.deliver(Target::Group(pgid), info),
             None => self.deliver(Target::All { except: 0 }, info),
@@ -719,6 +796,8 @@ impl Table {
     /// session no longer has it, and the session's leader gets SIGHUP and
     /// SIGCONT (a shell then hangs its jobs up).
     pub fn hangup(&self, n: u32) {
+        // Its agent goes (once its Mac programs have).
+        self.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&Some(n));
         let leaders: Vec<i64> = {
             let mut s = self.state();
             let Some(tty) = s.ttys.remove(&n) else { return };
@@ -727,7 +806,7 @@ impl Table {
                 if e.ctty == Some(n) {
                     e.ctty = None;
                 }
-                if tty.sid == Some(e.sid) && e.sid == pid && matches!(e.kind, Kind::Local(_)) {
+                if tty.sid == Some(e.sid) && e.sid == pid && matches!(e.kind, Kind::Local(_) | Kind::Mac { .. }) {
                     leaders.push(pid);
                 }
             }
@@ -785,7 +864,7 @@ impl Table {
         let (r, quoted) = linux_abi::syscall::tty::write_keys(master, data, &keys, quoted, |sig| {
             // The group in the foreground as the byte is read.
             if let Some((fg, _)) = self.foreground(n) {
-                self.signal_group(fg, sig);
+                let _ = self.deliver_from(Target::Group(fg), SigInfo::user(sig, SI_KERNEL, 0), Some(n));
             }
         });
         if let Some(tty) = self.state().ttys.get_mut(&n) {
@@ -844,6 +923,155 @@ impl Table {
     }
 }
 
+impl Table {
+    /// The agent that starts Mac programs for a session with pty `tty` as
+    /// its terminal (None: without one), started if it isn't yet.
+    fn agent_for(self: &Arc<Self>, tty: Option<u32>) -> Result<Arc<mac::Agent>, i64> {
+        let mut agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(agent) = agents.get(&tty) {
+            return Ok(agent.clone());
+        }
+        if tty.is_some() && agents.len() >= MAX_TTY_AGENTS {
+            return Err(errno::EAGAIN);
+        }
+        let weak: Weak<Table> = Arc::downgrade(self);
+        let agent = Arc::new(mac::Agent::start(tty, weak).map_err(|e| errno::from_io(&e))?);
+        // Its terminal's foreground, to follow from the start (with the
+        // agents held: a `tcsetpgrp` meanwhile says so after this).
+        if let Some(n) = tty
+            && let Some(fg) = self.tty_foreground(n)
+        {
+            agent.foreground(fg);
+        }
+        agents.insert(tty, agent.clone());
+        Ok(agent)
+    }
+
+    /// Pty `n`'s foreground group changed: its agent's Mac foreground
+    /// follows.
+    fn follow_tty(&self, n: u32) {
+        let agents = self.agents.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(agent) = agents.get(&Some(n))
+            && let Some(fg) = self.tty_foreground(n)
+        {
+            agent.foreground(fg);
+        }
+    }
+
+    /// `proc`'s thread with signal mask `blocked` exec'd Mac program `exec`:
+    /// start it, as a Mac process of its own, and make `proc` its stand-in
+    /// (once its tasks have gone: see [`finished`]). The Linux errno it
+    /// couldn't be started with, for `execve` to return.
+    pub fn start_mac(self: &Arc<Self>, proc: &Proc, blocked: u64, exec: &HostExec) -> Result<(), i64> {
+        let pid = proc.abi.pid;
+        let (pgid, ctty) = self.state().procs.get(&pid).map(|e| (e.pgid, e.ctty)).ok_or(errno::ESRCH)?;
+        let spawn = linux_abi::syscall::mac_spawn(&proc.abi, blocked, exec)?;
+        // Its session's terminal's agent; past the most terminals with one,
+        // the agent without a terminal.
+        let agent = match ctty {
+            Some(n) => self.agent_for(Some(n)).or_else(|_| self.agent_for(None))?,
+            None => self.agent_for(None)?,
+        };
+        let (mac_pid, mac_pgid) = agent.spawn(&spawn, pgid)?;
+        drop(spawn);
+        let cmdline: Vec<u8> = exec.argv.iter().flat_map(|a| a.iter().copied().chain([0])).collect();
+        let name = exec.path.as_bytes().rsplit(|&b| b == b'/').next().unwrap_or_default();
+        let comm = name[..name.len().min(15)].to_vec();
+        let mut s = self.state();
+        let pending = s.early.remove(&mac_pid).unwrap_or_default();
+        s.mac_pids.insert(mac_pid, pid);
+        if let Some(e) = s.procs.get_mut(&pid) {
+            // It has exec'd: setpgid on it is EACCES from now on.
+            e.execd = true;
+            e.mac = Some(MacLink { pid: mac_pid, pgid: mac_pgid, tty: agent.tty, stopped: false, cmdline, comm, pending });
+        }
+        Ok(())
+    }
+
+    /// What a Mac program's change does to the process standing in for it
+    /// (which has become a stand-in: its tasks have gone).
+    fn mac_event(&self, pid: i64, change: Change) {
+        match change {
+            Change::Stopped(sig) => {
+                let first_time = {
+                    let mut s = self.state();
+                    match s.procs.get_mut(&pid).and_then(|e| e.mac.as_mut()) {
+                        Some(m) => !std::mem::replace(&mut m.stopped, true),
+                        None => return,
+                    }
+                };
+                if !first_time {
+                    return;
+                }
+                self.child_changed(pid, ((sig as i32) << 8) | 0x7f, CLD_STOPPED, sig as i32);
+                // As a local process's stop: the Mac shell that started the
+                // host, or the client standing in for it, sees its job stop.
+                if pid == self.first
+                    && let Some(relay) = self.relay.get()
+                {
+                    relay.first_stopped();
+                }
+                self.tell_client(pid, || serve::Event::Stopped(pid, sig));
+            }
+            Change::Continued => {
+                {
+                    let mut s = self.state();
+                    match s.procs.get_mut(&pid).and_then(|e| e.mac.as_mut()) {
+                        Some(m) => m.stopped = false,
+                        None => return,
+                    }
+                }
+                self.child_changed(pid, CONTINUED, CLD_CONTINUED, SIGCONT as i32);
+                self.tell_client(pid, || serve::Event::Continued(pid));
+            }
+            Change::Ended { status, user_ns, sys_ns } => {
+                let (cpu, comm) = {
+                    let mut s = self.state();
+                    let Some(e) = s.procs.get_mut(&pid) else { return };
+                    let Some(m) = e.mac.take() else { return };
+                    let before = match e.kind {
+                        Kind::Mac { cpu } => cpu,
+                        _ => Times::default(),
+                    };
+                    s.mac_pids.remove(&m.pid);
+                    (before + Times { user: user_ns, sys: sys_ns }, m.comm)
+                };
+                let exit = if status & 0x7f == 0 { Exit::Code(status >> 8) } else { Exit::Signal(status & 0x7f) };
+                self.tell_client(pid, || serve::Event::Exited(pid, Ok(exit)));
+                if pid == self.first {
+                    *self.first_exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(exit));
+                }
+                self.ended(pid, status, cpu, comm);
+            }
+        }
+    }
+}
+
+impl mac::MacEvents for Table {
+    fn mac_changed(&self, mac_pid: libc::pid_t, change: Change) {
+        let _order = self.mac_order.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = {
+            let mut s = self.state();
+            let Some(&pid) = s.mac_pids.get(&mac_pid) else {
+                s.early.entry(mac_pid).or_default().push(change);
+                return;
+            };
+            match s.procs.get_mut(&pid) {
+                // Still ending its tasks: once they have.
+                Some(e) if !matches!(e.kind, Kind::Mac { .. }) => {
+                    if let Some(m) = &mut e.mac {
+                        m.pending.push(change);
+                    }
+                    return;
+                }
+                Some(_) => pid,
+                None => return,
+            }
+        };
+        self.mac_event(pid, change);
+    }
+}
+
 /// Whether process group `pgid` is orphaned, not counting process `ignore`
 /// (Linux's `will_become_orphaned_pgrp`): none of its members that are
 /// running has a parent in another group of the same session, who could
@@ -853,20 +1081,22 @@ fn orphaned(s: &State, pgid: i64, ignore: i64) -> bool {
     !s.procs.iter().any(|(&pid, e)| {
         e.pgid == pgid
             && pid != ignore
-            && matches!(e.kind, Kind::Local(_))
+            && matches!(e.kind, Kind::Local(_) | Kind::Mac { .. })
             && (e.mac_parent || (e.ppid != 1 && s.procs.get(&e.ppid).is_some_and(|parent| parent.pgid != pgid && parent.sid == e.sid)))
     })
 }
 
 /// Whether a process of group `pgid` is stopped.
 fn has_stopped(s: &State, pgid: i64) -> bool {
-    s.procs.values().any(|e| e.pgid == pgid && matches!(&e.kind, Kind::Local(p) if p.stopped.load(Ordering::Acquire)))
+    s.procs.values().any(|e| {
+        e.pgid == pgid && (matches!(&e.kind, Kind::Local(p) if p.stopped.load(Ordering::Acquire)) || e.mac.as_ref().is_some_and(|m| m.stopped))
+    })
 }
 
 fn local_of(e: &Entry) -> Option<Arc<Proc>> {
     match &e.kind {
         Kind::Local(p) => Some(p.clone()),
-        Kind::Zombie { .. } => None,
+        Kind::Zombie { .. } | Kind::Mac { .. } => None,
     }
 }
 
@@ -1041,6 +1271,10 @@ impl Kernel for TableKernel {
             return Err(errno::EPERM);
         }
         s.ttys.entry(id.n).or_default().pgrp = Some(pgrp);
+        drop(s);
+        // Its Mac programs' foreground follows, before the caller goes on
+        // (and continues the job, say).
+        table.follow_tty(id.n);
         Ok(0)
     }
 
@@ -1105,6 +1339,7 @@ impl Kernel for TableKernel {
             // A new pty (its number may be an old one's): its hangup comes
             // as the last reference to its master goes.
             table.state().ttys.remove(&id.n);
+            table.agents.lock().unwrap_or_else(|e| e.into_inner()).remove(&Some(id.n));
             let weak = Arc::downgrade(&table);
             file.on_close(Box::new(move || {
                 if let Some(table) = weak.upgrade() {
@@ -1197,6 +1432,7 @@ impl Kernel for TableKernel {
             (0 | 1, Kind::Local(proc)) => (proc.cpu.times(), proc.space().lock().frames_in_use() * 4),
             (-1, _) => (e.children_cpu, 0),
             (0 | 1, Kind::Zombie { .. }) => (Times::default(), 0),
+            (0 | 1, Kind::Mac { cpu }) => (*cpu, 0),
             _ => return Err(errno::EINVAL),
         };
         Ok(rusage_of(cpu, rss))
@@ -1221,7 +1457,7 @@ impl Kernel for TableKernel {
         // A socket pair: its far end closes as the process ends, and the
         // near one (the pidfd's) reads as ready from then on.
         let (near, far) = std::os::unix::net::UnixStream::pair().map_err(|e| errno::from_io(&e))?;
-        if matches!(e.kind, Kind::Local(_)) {
+        if matches!(e.kind, Kind::Local(_) | Kind::Mac { .. }) {
             e.pidfds.push(far.into());
         }
         Ok(near.into())
@@ -1262,8 +1498,20 @@ impl Kernel for TableKernel {
                 (state, proc.abi.thread_count().max(1) as u64, proc.cpu.times(), proc.abi.comm())
             }
             Kind::Zombie { cpu, comm, .. } => (b'Z', 0, *cpu, comm.clone()),
+            Kind::Mac { cpu } => {
+                let m = e.mac.as_ref().expect("a stand-in's Mac program");
+                let (user, sys, _) = mac::usage(m.pid).unwrap_or_default();
+                (if m.stopped { b'T' } else { b'S' }, 1, *cpu + Times { user, sys }, m.comm.clone())
+            }
+        };
+        // A stand-in's command line and memory: its Mac program's.
+        let (cmdline, rss_pages) = match &e.mac {
+            Some(m) if matches!(e.kind, Kind::Mac { .. }) => (Some(m.cmdline.clone()), mac::usage(m.pid).map_or(0, |u| u.2 / 4096)),
+            _ => (None, 0),
         };
         Ok(ProcStatus {
+            cmdline,
+            rss_pages,
             comm,
             ppid: e.ppid,
             pgid: e.pgid,
@@ -1300,10 +1548,10 @@ impl Kernel for TableKernel {
         false
     }
 
-    fn mac_programs(&self) -> bool {
-        // The host process never execs (docs/processes.md): Mac programs
-        // come back as processes of their own at step 6.
-        false
+    fn mac_programs(&self) -> MacPrograms {
+        // The host process never execs (docs/processes.md): a Mac program
+        // is a process of its own, which this one stands in for.
+        if linux_abi::syscall::mac_programs_allowed() { MacPrograms::StandIn } else { MacPrograms::Refused }
     }
 }
 
@@ -1557,6 +1805,27 @@ pub(crate) fn vfork_done(sh: &Host, proc: &Proc) {
 /// parent runs on. The host ends with its last process.
 pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
     let pid = proc.abi.pid;
+    // It exec'd a Mac program: it stands in for it from now on, its tasks
+    // and memory gone, its entry kept.
+    {
+        let order = table.mac_order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = table.state();
+        if let Some(e) = s.procs.get_mut(&pid)
+            && let Some(m) = &mut e.mac
+        {
+            let pending = std::mem::take(&mut m.pending);
+            let was = std::mem::replace(&mut e.kind, Kind::Mac { cpu: proc.cpu.times() });
+            drop(s);
+            // (Its files close as it goes: not with the table held.)
+            drop(was);
+            vfork_done(sh, proc);
+            for change in pending {
+                table.mac_event(pid, change);
+            }
+            drop(order);
+            return;
+        }
+    }
     let exit = proc.exit().take().unwrap_or(Ok(Exit::Code(0)));
     let status = wait_status(&exit);
     // Its client, if it has one, exits as it did.
@@ -1565,14 +1834,24 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
         *table.first_exit.lock().unwrap_or_else(|e| e.into_inner()) = Some(exit);
     }
     vfork_done(sh, proc);
-    let cpu = proc.cpu.times();
+    table.ended(pid, status, proc.cpu.times(), proc.abi.comm());
+}
+
+impl Table {
+    /// Process `pid` has ended, with wait status `status`, having used `cpu`:
+    /// it becomes a zombie for its parent's `wait` (reaped at once if the
+    /// parent is init, or doesn't care), its children become init's (or a
+    /// subreaper's), and its parent gets its exit signal. The host ends with
+    /// its last process.
+    fn ended(&self, pid: i64, status: i32, cpu: Times, comm: Vec<u8>) {
+    let table = self;
     let (parent, exit_signal, adopted, _pidfds, _was, hangups) = {
         let mut s = table.state();
         let Some(e) = s.procs.get_mut(&pid) else { return };
         let leader = e.sid == pid;
         // (What it was goes once the table is let go: its files may close
         // with it, and a pty master's hangup takes the table.)
-        let was = std::mem::replace(&mut e.kind, Kind::Zombie { status, cpu, comm: proc.abi.comm() });
+        let was = std::mem::replace(&mut e.kind, Kind::Zombie { status, cpu, comm });
         let (ppid, exit_signal, my_pgid, my_sid) = (e.ppid, e.exit_signal, e.pgid, e.sid);
         let children = std::mem::take(&mut e.children);
         // Its pidfds read as ready from now on (once the lock is let go).
@@ -1585,7 +1864,7 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
         let linked: Vec<i64> = children
             .iter()
             .filter_map(|c| s.procs.get(c))
-            .filter(|ce| matches!(ce.kind, Kind::Local(_)) && ce.pgid != my_pgid && ce.sid == my_sid)
+            .filter(|ce| matches!(ce.kind, Kind::Local(_) | Kind::Mac { .. }) && ce.pgid != my_pgid && ce.sid == my_sid)
             .map(|ce| ce.pgid)
             .collect();
         // Orphans go to the nearest ancestor that's a subreaper, else to
@@ -1693,7 +1972,8 @@ pub(crate) fn finished(sh: &Host, table: &Table, proc: &Arc<Proc>) {
             // A serving host waits a little for more clients first.
             Some(service) => service.post(serve::Event::NoProcesses),
             // No process left: the host is done.
-            None => drop(sh.sched.stop()),
+            None => drop(table.parking.sched().stop()),
         }
+    }
     }
 }

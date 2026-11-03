@@ -62,6 +62,25 @@ pub struct ProcStatus {
     /// foreground group (-1 without one).
     pub tty: Option<u32>,
     pub tpgid: i64,
+    /// For a process whose memory the kernel doesn't hold (a Mac program
+    /// standing in for it): its command line (`cmdline`'s NUL-separated
+    /// strings) and resident 4 KiB pages.
+    pub cmdline: Option<Vec<u8>>,
+    pub rss_pages: u64,
+}
+
+/// How `execve` of a Mac program goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacPrograms {
+    /// It fails with ENOEXEC (Mac programs are off).
+    Refused,
+    /// The host process becomes the Mac program (`Action::ExecHost`): only
+    /// when the host process is this Linux process alone (1:1).
+    ExecHost,
+    /// The Mac program is spawned as a process of its own, and this one
+    /// stands in for it in the process table (`Action::MacStandIn`): with
+    /// many processes in one VM, whose host never execs.
+    StandIn,
 }
 
 /// A clock reading a process's CPU time, from any thread.
@@ -173,9 +192,8 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     fn host_signals(&self) -> bool {
         true
     }
-    /// Whether `execve` may run Mac programs (`Action::ExecHost`): only when
-    /// the host process is the Linux process alone, and can become one.
-    fn mac_programs(&self) -> bool;
+    /// Whether and how `execve` runs Mac programs: see [`MacPrograms`].
+    fn mac_programs(&self) -> MacPrograms;
     /// A host fd that reads as ready once process `pid` has ended, for a
     /// pidfd (`pidfd_open`). Here: a kqueue watching the Mac process.
     fn pidfd(&self, _p: &Process, pid: i64) -> Result<std::os::fd::OwnedFd, i64> {
@@ -228,6 +246,8 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
             start_ns: p.started_ns,
             tty: None,
             tpgid: -1,
+            cmdline: None,
+            rss_pages: 0,
         })
     }
     /// Run `f` with another process's state and memory, for its `/proc`
@@ -349,8 +369,8 @@ impl Kernel for HostKernel {
         unsafe { libc::umask(mask as libc::mode_t) };
     }
 
-    fn mac_programs(&self) -> bool {
-        process::mac_programs_allowed()
+    fn mac_programs(&self) -> MacPrograms {
+        if process::mac_programs_allowed() { MacPrograms::ExecHost } else { MacPrograms::Refused }
     }
 }
 

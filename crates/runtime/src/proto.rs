@@ -46,8 +46,9 @@ pub const LISTING: u8 = 20;
 
 /// The most a message may be: argv and environment fit easily.
 const MAX_BODY: usize = 16 << 20;
-/// The most fds a message carries (a run's three stdio fds).
-pub const MAX_FDS: usize = 3;
+/// The most fds a message carries (a run's three stdio fds; a Mac
+/// program's inherited fds go to its agent in batches of this many).
+pub const MAX_FDS: usize = 64;
 
 /// Send a message on `sock` (blocking, or bounded by its SO_SNDTIMEO).
 pub fn send(sock: RawFd, kind: u8, body: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
@@ -58,7 +59,7 @@ pub fn send(sock: RawFd, kind: u8, body: &[u8], fds: &[RawFd]) -> std::io::Resul
     msg.push(fds.len() as u8);
     msg.extend_from_slice(body);
     let mut at = 0;
-    let mut cmsg = [0u8; 64];
+    let mut cmsg = [0u8; 64 + MAX_FDS * size_of::<RawFd>()];
     while at < msg.len() {
         let mut iov = libc::iovec { iov_base: msg[at..].as_ptr() as *mut _, iov_len: msg.len() - at };
         let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -121,7 +122,8 @@ impl Reader {
     /// Read what `sock` has (`nonblocking`: without waiting for it).
     pub fn fill(&mut self, sock: RawFd, nonblocking: bool) -> Read {
         let mut buf = [0u8; 65536];
-        let mut cmsg = [0u8; 256];
+        // Room for a few messages' fds at once.
+        let mut cmsg = [0u8; 64 + 4 * MAX_FDS * size_of::<RawFd>()];
         loop {
             let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
             let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };

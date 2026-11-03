@@ -13,6 +13,7 @@ pub mod hv;
 mod cputime;
 mod fork;
 mod host;
+mod mac;
 mod park;
 mod relay;
 pub mod client;
@@ -155,6 +156,7 @@ impl From<loader::LoadError> for Error {
     }
 }
 pub use fork::run_child as run_fork_child;
+pub use mac::agent_main as run_tty_agent;
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
@@ -242,8 +244,13 @@ enum Next {
     ExitThread(i32),
     /// `execve` loaded a new program; run it in place of the old one.
     Exec(Loaded),
-    /// `execve` of a Mac program: the process becomes it, once the VM is gone.
+    /// `execve` of a Mac program: the process becomes it, once the VM is gone
+    /// (1:1 only).
     ExecHost(HostExec),
+    /// `execve` of a Mac program in a host of many processes: it has been
+    /// spawned as a process of its own, and this process is to stand in for
+    /// it (its tasks end, its entry stays).
+    StandIn,
     /// Another thread is ending the process (or exec'ing): stop.
     Stop,
     /// Its time slice is used and others wait: give up the CPU.
@@ -775,6 +782,15 @@ fn run_task<'scope, 'env>(
                 assert!(sh.table.is_none(), "a Mac program's execve in a host of many processes");
                 stop_other_threads(sh, &proc);
                 *sh.exec_host.lock().unwrap_or_else(|e| e.into_inner()) = Some((exec, thread.blocked_signals()));
+                sh.end(&proc, Ok(Exit::Code(0)));
+                return done(thread);
+            }
+            // The Mac program runs, a process of its own: as in an exec,
+            // the other threads end, and then this one; the process's
+            // memory goes with them, and its table entry stays, standing in
+            // for the Mac program (`host::finished`).
+            Next::StandIn => {
+                stop_other_threads(sh, &proc);
                 sh.end(&proc, Ok(Exit::Code(0)));
                 return done(thread);
             }
@@ -1412,6 +1428,17 @@ fn system_call<'scope, 'env>(
             // is the second lock on that door).
             Action::ExecHost(_) if sh.table.is_some() => -linux_abi::errno::ENOEXEC,
             Action::ExecHost(exec) => return Ok(Some(Next::ExecHost(exec))),
+            // A Mac program with many processes in the VM: spawned as a
+            // process of its own (never in place of this one), and this
+            // process stands in for it; if it can't start, execve says why.
+            // (1:1 never gets here: its kernel says ExecHost.)
+            Action::MacStandIn(exec) => match &sh.table {
+                Some(table) => match table.start_mac(proc, thread.blocked_signals(), &exec) {
+                    Ok(()) => return Ok(Some(Next::StandIn)),
+                    Err(e) => -e,
+                },
+                None => -linux_abi::errno::ENOEXEC,
+            },
             Action::Exec(exec) => {
                 profile::mark("exec: loading");
                 let argv: Vec<&[u8]> = exec.argv.iter().map(Vec::as_slice).collect();

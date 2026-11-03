@@ -330,6 +330,14 @@ impl FdTable {
         slots.iter().enumerate().filter_map(|(n, s)| s.as_ref().filter(|s| !s.cloexec).map(|s| (n, s.file.host.as_raw_fd()))).collect()
     }
 
+    /// The same, holding each open file (so another thread's `close`
+    /// can't free its host fd, or give the number to another file, while
+    /// it's being passed on).
+    pub fn inherited_files(&self) -> Vec<(usize, Arc<OpenFile>)> {
+        let slots = self.slots();
+        slots.iter().enumerate().filter_map(|(n, s)| s.as_ref().filter(|s| !s.cloexec).map(|s| (n, s.file.clone()))).collect()
+    }
+
     pub fn close_on_exec(&self) {
         for slot in self.slots().iter_mut() {
             if slot.as_ref().is_some_and(|s| s.cloexec) {

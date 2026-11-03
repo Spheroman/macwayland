@@ -36,10 +36,10 @@ pub use kfd::now as kevent_now;
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::{HostSignalWait, SignalFd};
 pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
-pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, ProcStatus, Waited, RUSAGE_SIZE};
+pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, MacPrograms, ProcStatus, Waited, RUSAGE_SIZE};
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
-pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
+pub use process::{answer_setpgid, ctl, exec_host, mac_environment, mac_programs_allowed, mac_spawn, Exec, Fork, HostExec, MacSpawn, Spawn};
 pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
 /// Signal numbers between Linux's and Darwin's (a client forwards the Mac
 /// side's to its Linux process, and ends as that process did).
@@ -453,6 +453,12 @@ pub enum Action {
     /// core tears down the VM and hands it to [`exec_host`], which returns
     /// only on failure.
     ExecHost(HostExec),
+    /// Run a Mac program for this process (`execve` of a Mach-O file, with
+    /// many processes in one VM): the core spawns it as a process of its
+    /// own, and this process stands in for it in the process table (see
+    /// [`MacPrograms::StandIn`]). If it can't be started, the call fails
+    /// with the errno the spawn gave.
+    MacStandIn(HostExec),
     /// Start a thread (`clone` with CLONE_THREAD). The core makes it (with
     /// [`Process::new_tid`]) and returns its tid, or fails with EAGAIN.
     Spawn(Spawn),

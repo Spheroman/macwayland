@@ -359,13 +359,13 @@ pub(crate) fn open(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Fd
         Of::Maps => file(with(p, mem, pid, |q, m| maps(q, m))?),
         Of::Mounts => file(with(p, mem, pid, |q, _| mounts(q, false))?.into_bytes()),
         Of::MountInfo => file(with(p, mem, pid, |q, _| mounts(q, true))?.into_bytes()),
-        Of::Cmdline => file(with(p, mem, pid, |q, m| strings(q, m, false)).unwrap_or_default()),
+        Of::Cmdline => file(with(p, mem, pid, |q, m| strings(q, m, false)).unwrap_or_else(|_| status.cmdline.clone().unwrap_or_default())),
         Of::Environ => file(with(p, mem, pid, |q, m| strings(q, m, true))?),
         Of::Comm => file([comm(p, mem, pid), b"\n".to_vec()].concat()),
         Of::Stat => file(pid_stat(p, mem, pid, tid.unwrap_or(pid), &status).into_bytes()),
         Of::Status => file(pid_status(p, mem, pid, tid.unwrap_or(pid), &status).into_bytes()),
         Of::Statm => {
-            let (size, rss) = with(p, mem, pid, |_, m| (vsize(m) / 4096, m.resident_pages())).unwrap_or_default();
+            let (size, rss) = with(p, mem, pid, |_, m| (vsize(m) / 4096, m.resident_pages())).unwrap_or((0, status.rss_pages));
             file(format!("{size} {rss} 0 0 0 {size} 0\n").into_bytes())
         }
     }
@@ -415,7 +415,7 @@ fn ticks(ns: u64) -> u64 {
 /// `top` and `pgrep` read, Linux's 52, in order.
 fn pid_stat(p: &Process, mem: &dyn GuestMemory, pid: i64, tid: i64, s: &ProcStatus) -> String {
     let comm = String::from_utf8_lossy(&comm(p, mem, pid)).into_owned();
-    let (vsize, rss, area) = with(p, mem, pid, |q, m| (vsize(m), m.resident_pages(), q.arg_area())).unwrap_or_default();
+    let (vsize, rss, area) = with(p, mem, pid, |q, m| (vsize(m), m.resident_pages(), q.arg_area())).unwrap_or((0, s.rss_pages, [0; 4]));
     let (blocked, ignored, caught) = with(p, mem, pid, |q, _| q.signal_masks()).unwrap_or_default();
     let fields: Vec<String> = vec![
         tid.to_string(),
@@ -486,7 +486,7 @@ fn pid_status(p: &Process, mem: &dyn GuestMemory, pid: i64, tid: i64, s: &ProcSt
         _ => "S (sleeping)",
     };
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    let (vsize, rss, umask, fds) = with(p, mem, pid, |q, m| (vsize(m), m.resident_pages(), q.umask(), q.fds.numbers().len())).unwrap_or_default();
+    let (vsize, rss, umask, fds) = with(p, mem, pid, |q, m| (vsize(m), m.resident_pages(), q.umask(), q.fds.numbers().len())).unwrap_or((0, s.rss_pages, 0, 0));
     let (blocked, ignored, caught) = with(p, mem, pid, |q, _| q.signal_masks()).unwrap_or_default();
     let kb = |b: u64| b / 1024;
     format!(
