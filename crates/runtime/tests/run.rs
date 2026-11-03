@@ -550,7 +550,7 @@ fn processes_go_when_they_end() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     };
-    // (With MACWL_ONE_VM=1 the processes are the host's: it's the one Mac
+    // (In one VM the processes are the host's: it's the one Mac
     // process, with no spare.)
     let mac_processes = if macwl_runtime::one_vm() { 1 } else { 2 };
     wait_until("ended children", &|live| live.len() == mac_processes && live.contains(&main) && !announced.iter().any(|p| live.contains(p)));
@@ -1420,7 +1420,7 @@ fn one_session() -> std::sync::MutexGuard<'static, ()> {
     SESSION.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `scripts/session.sh` in one host (`MACWL_ONE_VM=1`), through the headless
+/// `scripts/session.sh` in one host (as by default), through the headless
 /// compositor: bash in foot, typed at, lists with procps' `ps` the session's
 /// processes, dbus-daemon and foot (clients) and bash (foot's child), all
 /// in the one host; `macwl-run --ps` lists them from the Mac, with the

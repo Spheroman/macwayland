@@ -1,5 +1,5 @@
-//! Many Linux processes in one VM (docs/processes.md, step 3), behind
-//! `MACWL_ONE_VM=1`.
+//! Many Linux processes in one VM (docs/processes.md, step 3): the default
+//! since step 6 (`MACWL_ONE_VM=0` for 1:1).
 //!
 //! A host is one Mac process with one VM that runs every Linux process of a
 //! `macwl-run` tree: the processes' tasks share its CPUs, their address

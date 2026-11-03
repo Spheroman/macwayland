@@ -182,7 +182,7 @@ fn read_guest_file(process: &Process, path: &[u8]) -> Result<Vec<u8>, loader::Lo
 /// Creates (and destroys) the process's one VM, so only one call can be in
 /// flight per host process.
 ///
-/// With `MACWL_ONE_VM=1`, the VM is a host for every Linux process this
+/// By default (unless `MACWL_ONE_VM=0`), the VM is a host for every Linux process this
 /// one starts, forks inside it included (docs/processes.md, step 3); the
 /// result is the first process's, once all of them have ended. Otherwise
 /// each Linux process is a Mac process with a VM of its own (1:1).
@@ -199,11 +199,11 @@ pub fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], process: Process) -> Resu
     execute(program.space, Start::Fresh { entry: program.entry, sp: program.sp }, process, thread)
 }
 
-/// Whether Linux processes share one VM (`MACWL_ONE_VM=1`): a host per
-/// `macwl-run` and everything it starts. Off by default while it's built
-/// (docs/processes.md, steps 3 to 6); 1:1 is the fallback.
+/// Whether Linux processes share one VM: a host per `macwl-run` and
+/// everything it starts. The default since docs/processes.md step 6;
+/// `MACWL_ONE_VM=0` keeps 1:1 (a VM per process) for a release.
 pub fn one_vm() -> bool {
-    std::env::var_os("MACWL_ONE_VM").is_some_and(|v| v == "1")
+    std::env::var_os("MACWL_ONE_VM").is_none_or(|v| v != "0")
 }
 
 /// A program loaded into a new address space, ready to start.
