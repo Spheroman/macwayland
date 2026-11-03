@@ -761,7 +761,7 @@ fn one_vm_mac_programs_on_a_terminal() {
     let mut seen = Vec::new();
     let mut at = 0;
     // A marker the typed line doesn't contain (its echo can't match).
-    let mut mark = |master: &OwnedFd, seen: &mut Vec<u8>, at: &mut usize, what: &str| {
+    let mark = |master: &OwnedFd, seen: &mut Vec<u8>, at: &mut usize, what: &str| {
         type_in(master, &format!("echo {what}-$((6*7))\n"));
         *at = read_until(master, seen, *at, &format!("{what}-42"));
     };
@@ -1413,6 +1413,13 @@ fn client_relays_its_terminal() {
     assert!(libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGHUP, "{st:#x}");
 }
 
+/// One `scripts/session.sh` at a time: each builds and signs the release
+/// binaries, which another session would be running.
+fn one_session() -> std::sync::MutexGuard<'static, ()> {
+    static SESSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SESSION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `scripts/session.sh` in one host (`MACWL_ONE_VM=1`), through the headless
 /// compositor: bash in foot, typed at, lists with procps' `ps` the session's
 /// processes, dbus-daemon and foot (clients) and bash (foot's child), all
@@ -1422,6 +1429,7 @@ fn client_relays_its_terminal() {
 #[test]
 #[ignore = "needs nix and builds the release binaries"]
 fn session_shares_one_host() {
+    let _one = one_session();
     // A short path: Unix socket paths are at most 103 bytes.
     let dir = std::path::PathBuf::from(format!("/tmp/macwl-test-session-{}", std::process::id()));
     let ps_txt = dir.join("ps.txt");
@@ -1479,6 +1487,7 @@ fn session_shares_one_host() {
 #[test]
 #[ignore = "needs nix and builds the release binaries"]
 fn session_runs_mac_programs() {
+    let _one = one_session();
     let dir = std::path::PathBuf::from(format!("/tmp/macwl-test-mac-{}", std::process::id()));
     let d = dir.display();
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/session.sh");

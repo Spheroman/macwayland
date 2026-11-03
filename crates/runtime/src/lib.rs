@@ -855,7 +855,7 @@ fn finish_call(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &mut T
     } else {
         ret
     };
-    if nr == linux_abi::nr::FUTEX && ret < 0 {
+    if nr == linux_abi::nr::FUTEX && ret != 0 {
         futex_result_check(vcpu, process, thread, arg0, ret);
     }
     vcpu.set_reg(reg::X0, ret as u64)?;
@@ -1057,7 +1057,9 @@ fn futex_result_check(vcpu: &Vcpu, process: &Process, thread: &Thread, uaddr: u6
     let timeout = vcpu.reg(reg::X0 + 3).unwrap_or(0);
     let cmd = op & 0x7f;
     let waits = cmd == 0 || cmd == 9; // FUTEX_WAIT, FUTEX_WAIT_BITSET
-    let fine = ret == -EAGAIN || ret == -EINTR || (ret == -ETIMEDOUT && waits && timeout != 0);
+    // A wait returns 0 when woken: anything above is as fatal to glibc as
+    // an errno it doesn't expect.
+    let fine = ret == -EAGAIN || ret == -EINTR || (ret == -ETIMEDOUT && waits && timeout != 0) || (ret > 0 && !waits);
     if !fine && !SAID.swap(true, Ordering::Relaxed) {
         eprintln!("macwl-run: futex returned {ret} (op {op:#x}, uaddr {uaddr:#x}, timeout {timeout:#x}) to pid {} tid {}", process.pid, thread.tid);
     }
