@@ -274,7 +274,21 @@ from a static Linux binary.
    its own; `wine cmd.exe` after `wineboot` returns in 0.65 s as a client
    (1:1: 0.61 s), where a one-VM `macwl-run` of its own returns only once
    wineserver has gone (6.1 s).
-   Mac programs (6: refused with ENOEXEC under the flag) follow.
+   Step 6 done (2026-11-02): Mac programs in one VM, and **one VM is the
+   default** (`MACWL_ONE_VM=0` keeps 1:1 for a release; every test passes
+   in both modes). An `execve` of a Mac program spawns it as a Mac process
+   of its own, by an agent (`macwl-run --tty-agent`, never a VM): one per
+   pty that is a Linux session's terminal, with it as the Mac programs'
+   controlling terminal, and one without a terminal. The Linux process
+   stays in the table as its stand-in; agents report their children's
+   stops, continues and exits, which the stand-in takes as its own, and
+   signals to it are host kills of the Mac program (its Mac group, for a
+   group). An agent keeps a Mac group per Linux group and makes the Mac
+   foreground follow the Linux one, so Ctrl-Z, `bg`, `fg` and SIGTTIN work
+   on Mac programs natively. The host never execs. An experiment chose
+   agents over `posix_spawn` giving each program the terminal itself
+   (`docs/processes.md`, section 7). Mac `true` from Linux bash: 0.85–1.0
+   ms a run (the Mac's own bash: 1.0 ms).
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
@@ -415,7 +429,12 @@ from a static Linux binary.
 13. **Mach-O passthrough.** Let Linux programs run native Mac binaries, as
     WSL runs Windows ones, so a shell in foot can run macOS tools (`open`,
     `pbcopy`, `git`, Xcode's) next to Linux ones. **Works** (tested
-    below; on in `scripts/session.sh`, opt-in in `macwl-run`).
+    below; on in `scripts/session.sh`, opt-in in `macwl-run`). Since
+    2026-11-02 (`docs/processes.md` step 6) a Mac program runs as a Mac
+    process of its own in a host of many Linux processes, the Linux
+    process standing in for it; the 1:1 path below (the process replaced
+    with `SETEXEC`) is used only with `MACWL_ONE_VM=0`, where Mac programs
+    are off in `scripts/session.sh` and every test.
     - Done in code: `execve` reads a file's first 256 bytes; a Mach-O
       (thin 64-bit, or universal with < 20 architectures, which tells it
       from a Java class file) becomes `Action::ExecHost`, as does a `#!`
@@ -477,11 +496,19 @@ from a static Linux binary.
       after the Linux directories.
     - Limits: Mac programs can't start Linux ones (macOS's `execve` has no
       hook for ELF files); under `--root` they see the Mac's file system,
-      not the guest's, and path arguments aren't translated. A Mac binary
-      that fails to exec can't return the error to the caller (the VM is
-      torn down first), so `execve`/`posix_spawn` "succeed" and the process
-      exits 127 (Linux bash would say 126). Still off by default in
+      not the guest's, and path arguments aren't translated. In 1:1 a Mac
+      binary that fails to exec can't return the error to the caller (the
+      VM is torn down first), so `execve`/`posix_spawn` "succeed" and the
+      process exits 127; in one VM the spawn comes first and `execve`
+      returns its errno (bash says 126). Still off by default in
       `macwl-run` itself.
+    - **Tested in one VM** (2026-11-02, scripted: tests
+      `one_vm_mac_programs`, `one_vm_spawns_mac_programs`,
+      `one_vm_mac_programs_on_a_terminal`, `session_runs_mac_programs`,
+      `stand_ins_in_the_hosts_listing`): everything in the two lists above
+      but `brew` and Xcode's tools (not repeated), with the stand-in in
+      `/proc`, `ps` and `macwl-run --ps`, and a Mac binary that can't run
+      now failing `execve` with ENOEXEC.
 
 14. **The long tail: a real kernel for what's missing?** System calls the
     runtime doesn't implement could go to the real Linux kernel, run as a

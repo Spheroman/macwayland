@@ -1,10 +1,12 @@
 # Processes in one VM: a host per session
 
 Status: design (2026-11-02), open questions decided (2026-11-02, see
-"Decisions"); steps 1, 2, 3, 3a, 4 and 5 done (2026-11-02: processes in one
-VM work behind `MACWL_ONE_VM=1`, terminals and job control included, and
-`macwl-run`s from outside join a host as clients; step 6, Mac programs,
-is next). ROADMAP items 6 and 13; extends the thread
+"Decisions"); steps 1 to 6 done (2026-11-02: processes in one VM,
+terminals and job control included, `macwl-run`s from outside joining a
+host as clients, and Mac programs as processes of their own standing in
+for the Linux processes that ran them; one VM is the default,
+`MACWL_ONE_VM=0` keeps 1:1). Step 7 is next. ROADMAP items 6 and 13;
+extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
 
@@ -33,8 +35,11 @@ powerful but takes longer to build, take it.** So:
   one process per host, which is fine given those (section "Visibility").
 - **A host lives while it has processes or clients**, and exits shortly
   after the last goes (section 1).
-- **Tty agent or `posix_spawn` with a controlling terminal**: still open,
-  settled by experiment at step 6.
+- **Tty agents**, not `posix_spawn` giving each Mac program the terminal
+  itself: settled by experiment at step 6 (section 7).
+- **Mac programs are always started by an agent**, a terminal's or the
+  host's agent without one, never by the host itself (step 6, by the
+  rule).
 
 ## The problem
 
@@ -581,7 +586,99 @@ host runs many Linux sessions (a bash per foot window). So:
    ignores keyboard signals). Ctrl-Z then stops Mac `vim` natively
    (it restores the terminal first, as it does), the reaper sees it stop,
    Linux bash's `wait` says Stopped, `fg` continues it. Without a terminal,
-   the host spawns Mac programs itself.
+   a Mac program is started by the host's agent without one (as built: see
+   below).
+
+**The experiment (step 6, 2026-11-02): tty agents.** A C program on the
+Mac (macOS 27.0) opened a pty and tried what `posix_spawn` alone can do:
+
+- `POSIX_SPAWN_SETSID` with the slave opened (without `O_NOCTTY`) in the
+  file actions: the child **has** the pty as its controlling terminal
+  (`/dev/tty` opens; `ps` shows the tty, and the child's group in the
+  foreground).
+- A second child spawned the same way while the first lives: **no**
+  controlling terminal (`/dev/tty` fails): a pty is one session's. So
+  two Mac programs of one Linux session at once (`/bin/sleep | tr`, a
+  background Mac job and a foreground one) can't both have it.
+- `tcsetpgrp` from a process outside the Mac session, through the slave
+  and through the master: **ENOTTY**. Only a process in the session can
+  make the Mac foreground group follow `fg`, `bg` and bash taking the
+  terminal back.
+
+So `posix_spawn` with a controlling terminal works for one Mac program at
+a time and can't do job control; agents can, and were built. Three more
+findings shaped them: `POSIX_SPAWN_START_SUSPENDED` starts a child stopped
+(its parent's `waitpid` sees the stop; SIGCONT starts it), which lets an
+agent put a new Mac group in the foreground before its program first
+touches the terminal; macOS sends a parent **no SIGCHLD when a child
+continues** (`EVFILT_PROC`'s `NOTE_SIGNAL` fires, and `waitpid` then
+reports `WCONTINUED`), so agents watch their children's signals as well as
+SIGCHLD; and SIGCHLD must stay at its default in an agent (ignoring it
+would reap its children before it could report them).
+
+**As built (step 6).**
+
+- **Agents start every Mac program** (`crates/runtime/src/mac.rs`):
+  `macwl-run --tty-agent [TTY]`, started by the host with a plain
+  `posix_spawn` in a Mac session of its own (`POSIX_SPAWN_SETSID`), two
+  sockets to the host (requests; reports of its children). With TTY (a
+  Linux session's pty) it takes the pty as its controlling terminal
+  (`TIOCSCTTY`); the host has one agent per such pty (64 at most; past
+  that, a session's Mac programs go to the next kind) and one without a
+  terminal, for sessions with none, so the host never spawns a Mac
+  program itself and never changes its own signal dispositions for one.
+  An agent never makes a VM (asserted at its start and at each spawn).
+- **Spawn first.** The `execve` sends the agent the program, argv, the
+  environment (the Mac's `PATH` and `SHELL`, `TERM` one macOS's ncurses
+  reads), the guest's cwd, its inherited fds (`SCM_RIGHTS`, in batches of
+  64) with their guest numbers, its ignored signals and the thread's mask,
+  and the process's Linux group; the agent spawns it (fds at their guest
+  numbers by way of fds above all of them, `CLOEXEC_DEFAULT`,
+  `addchdir_np`, `SETSIGDEF` for all but the ignored ones, which it
+  ignores itself around the spawn, `SETSIGMASK`, `SETPGROUP`) and answers
+  with the Mac pid and group, or the errno: `execve` returns that errno
+  (a Mach-O macOS won't run is ENOEXEC: bash says 126, "cannot execute
+  binary file"). Then the process's threads end as in an exec, its memory
+  goes, and its entry becomes a stand-in (`Kind::Mac`), with `execd` set
+  (`setpgid` on it: EACCES). A vfork parent runs on then.
+- **Groups and the foreground.** An agent keeps a Mac group per Linux group
+  (the first Mac program of a Linux group leads a new one; later ones
+  join it, or lead a new one if it has gone). The host tells a terminal's
+  agent each `tcsetpgrp` and waits for the answer, so the Mac foreground
+  has followed before bash goes on to continue the job; a new Mac group
+  for the Linux foreground group starts suspended, is put in the
+  foreground, then continued.
+- **Reports.** An agent `wait4`s its children (WNOHANG, WUNTRACED,
+  WCONTINUED) on SIGCHLD and on each child's signals, and sends the host
+  each change with the Darwin status (and CPU time on exit); the host's
+  **reaper** (one thread per host process, in the thread budget) hands
+  them to the table, which translates them to Linux numbers and makes the
+  stand-in stop, continue (SIGCHLD to its parent, `wait`'s reports, the
+  relay or client told) or end (a zombie as any other; the first
+  process's exit status, a client's). Reports that come before the
+  process's tasks have all gone wait in its entry.
+- **Signals to a stand-in** are a host `kill` of its Mac program (by pid;
+  for a group, `kill` of the Mac group, which reaches the Mac processes it
+  started, as `less` under `git`), with the Darwin number; signals Darwin
+  has no number for (real-time ones) don't reach it. A keyboard signal
+  for a terminal's foreground group goes to the Linux members only: the
+  Mac driver has signalled the Mac foreground group itself.
+- **What the table shows**: `/proc/<pid>` of a stand-in has its state (S,
+  or T while stopped), parent, group, session, terminal, the Mac
+  program's command line and name, and its CPU time and resident memory
+  from macOS (`proc_pid_rusage`); `ps` and `top` list it. `macwl-run --ps`
+  shows the Mac program's pid, marked `*`, in the column that has a
+  client's.
+- **Never an exec.** Every process the runtime starts for this (agents,
+  Mac programs) goes through one function, `mac::spawn`, which asserts
+  that its flags, as set and as read back from the attributes, don't
+  include `POSIX_SPAWN_SETEXEC` (unit tests `a_spawn_never_replaces_its_caller`,
+  `spawn_checks_its_flags_before_it_spawns`). The 1:1 path (`exec_host`,
+  `Action::ExecHost`) stays 1:1's alone: the dispatcher asks the kernel,
+  which says `StandIn` in a host of many processes, a new action
+  (`Action::MacStandIn`, `Next::StandIn`); the CPU loop still turns an
+  `ExecHost` into ENOEXEC when there is a table, and `Next::ExecHost`
+  still asserts there is none.
 
 Everything item 13 tested keeps working this way: exit codes and signals
 through `wait`, fds by guest number, pipes mixing Mac and Linux programs,
@@ -711,7 +808,7 @@ listing; Activity Monitor's one process per host is fine given those.
 
 ## Steps
 
-Each ships with all tests passing; 1:1 mode stays the default until step 6.
+Each ships with all tests passing; 1:1 mode was the default until step 6.
 
 1. **Host state out of `linux-abi`, no behaviour change.** The `Kernel`
    trait for what the dispatcher asks of the outside (pids, `kill`, `wait`,
@@ -1274,6 +1371,83 @@ Each ships with all tests passing; 1:1 mode stays the default until step 6.
    first in the child's file actions), is settled here by trying both
    against that list (still open, see Open questions). Then
    **one VM becomes the default**; `MACWL_ONE_VM=0` keeps 1:1 for a release.
+
+   **Done, 2026-11-02**, as section 7 says ("As built"), with tty agents,
+   chosen by the experiment recorded there. **One VM is the default**:
+   every test passes in both modes. Mac programs are still opt-in
+   (`--mac-programs`, `MACWL_MAC_PROGRAMS=1`, read by the host), and run
+   only in one VM; `scripts/session.sh` turns them on for its host, and
+   leaves them off with `MACWL_ONE_VM=0`.
+
+   Choices the design left open, taken by the rule (2026-11-02):
+   - **Agents for every Mac program**, a terminal's or one without a
+     terminal, rather than the host spawning those of sessions without
+     one: the host never touches its own signal dispositions for a spawn
+     (ignored signals are set in the agent, which has one thread), every
+     Mac program has a parent that reaps only its own children, and a Mac
+     program of a session without a terminal has none (its `/dev/tty`
+     fails, as on Linux), whatever terminal the host has.
+   - **Mac groups follow Linux groups for signals too**: a signal to a
+     Linux group reaches its Mac programs' Mac groups, so the Mac
+     processes those started (`less` under `git`) get it, as members of
+     the job.
+   - **The foreground follows before `tcsetpgrp` returns**, and a new Mac
+     group in the foreground is put there before its program runs
+     (started suspended), so a Mac `vim` never meets a terminal whose
+     foreground it isn't.
+   - **Stand-ins in `/proc` and `ps` with what macOS knows**: the Mac
+     program's CPU time and resident memory, its command line.
+
+   Tests (all with `MACWL_ONE_VM=1` and Mac programs on, whatever the
+   suite runs with): `one_vm_mac_programs` (item 13's list scripted in
+   `tests/mac_programs.sh`: Mac `uname`, `sw_vers`, `false`, `env`; pipes
+   both ways and Mac to Mac; exit codes; TERM, KILL, USR1 and USR2
+   through `wait` in Linux numbers; fds by guest number, redirects, cwd; a
+   Mac binary that can't run failing `execve` (126); SIGSTOP, SIGCONT,
+   SIGTSTP and `bg`, SIGINT to a Mac job; the stand-in in `/proc` and
+   procps' `ps`; `git`; `pbcopy`/`pbpaste`, the user's pasteboard put
+   back; 50 Mac programs in a row), `one_vm_spawns_mac_programs` (musl
+   `posix_spawn` of Mac programs 20 times, through a pipe, with exit
+   statuses; a spawn of a Mach-O macOS won't run fails with ENOEXEC),
+   `one_vm_mac_programs_on_a_terminal` (interactive Linux bash relayed
+   from a pty: a Mac program's `/dev/tty`; Ctrl-Z, `jobs`, `bg`, `fg`,
+   Ctrl-C on Mac `sleep`; a `/bin/sleep | tr` pipeline stopped and
+   continued; a background Mac `cat` stopped by SIGTTIN; Mac `vim`
+   suspended, redrawn after `fg`, saving; `git log` through Mac `less`,
+   quit with `q`), `session_runs_mac_programs` (foot in `session.sh`
+   through the headless compositor, typed with `MACWL_TYPE`: Ctrl-Z on
+   Mac `/bin/sleep`, `jobs` Stopped, `bg` Running, `fg`, Ctrl-C (130); a
+   `/bin/sleep | tr` pipeline stopped; Mac `vim` stopped, `fg`, saved),
+   `stand_ins_in_the_hosts_listing` (`macwl-run --ps` lists a stand-in
+   with its Mac pid; a client whose process exec'd a Mac program exits
+   with its status), `one_vm_refuses_mac_programs_when_off`; unit tests of
+   the spawn check, Darwin statuses in Linux numbers and spawn errnos.
+   Runtime 41 unit + 51 integration, the default (one VM) and
+   `MACWL_ONE_VM=0`; linux-abi 71. The two `session.sh` tests run one at
+   a time (each builds and signs the release binaries).
+
+   Measured (M5 Pro): Mac `/usr/bin/true` from Linux bash, 100 in a row:
+   0.85–1.0 ms each (the Mac's own bash: 1.0 ms; Linux coreutils' `true`
+   in one VM: 0.73–0.88 ms). The first Mac program of a host costs about
+   3.5 ms more (11.2 ms for a whole `macwl-run bash -c /usr/bin/true`
+   against 7.6 ms with a Linux `true`): its agent's launch. (1:1's Mac
+   programs weren't measured again: they run only in one VM now.)
+   `wakebench` p50s, before and after, 1:1 then one VM: pipes between
+   processes 11.1–13.7 → 11.1–11.3 and 12.7–13.9 → 13.7–14.1 µs
+   (interleaved runs of both builds: 12.7–15.0 against 13.7–16.7, noise),
+   threads 13.8–14.2 → 13.7 and 13.8–14.0 → 13.8–15.0, futex 12.5–12.7 →
+   12.5–12.6 and 12.5–12.9 → 12.5–12.6, a 50 µs sleep 56.2–57.3 → 56.2–56.9
+   either way. arm64 Wine: `wineboot -i` exits 0 with 801 files in
+   system32, and `wine cmd.exe /c 'echo hi & ver'` prints both, in one VM
+   with Mac programs on and in 1:1 with them off.
+   Seen while the two `session.sh` tests ran at once (before they were
+   made to take turns): foot once aborted with glibc's "The futex facility
+   returned an unexpected error code" with no `futex returned` line from
+   the runtime, and once printed "failed to read timeout timer:
+   Interrupted system call". The futex report now covers a wait returning
+   more than 0 as well; neither was seen in 20 later runs of the session
+   tests. And in 1:1, Wine's processes left after `wine cmd.exe` printed
+   "corrupted double-linked list" (the build before step 6 does too).
 7. **Shared windows and futexes across processes.** Windows deduplicated by
    object and range, private file windows shared, non-private futexes keyed
    by IPA (ROS target, item 5). Measured: Firefox's start and memory with
@@ -1334,12 +1508,9 @@ Decided (see "Decisions"): fault containment (per-call containment, and
 federated hosts for apps that want their own), pids across hosts (unique,
 by ranges), fairness (hierarchical), blocked tasks (kqueues, step 3a),
 Activity Monitor (`/proc` and `macwl-run --ps`), the host's lifetime (while
-it has processes or clients). Still open:
+it has processes or clients), Mac programs and their terminal (tty agents,
+step 6). Still open:
 
-- **Mac programs and the controlling terminal**: can `posix_spawn` give one
-  its terminal (`POSIX_SPAWN_SETSID` and opening the slave), or is the tty
-  agent required? Its launch costs ~2–3 ms, once per terminal session that
-  runs a Mac program. Settled by experiment at step 6.
 - **Memory pressure**: macOS's memory pressure handling sees one large
   process; the host's own out-of-memory policy (step 3) decides which Linux
   process goes.
