@@ -1065,6 +1065,12 @@ fn futex_result_check(vcpu: &Vcpu, process: &Process, thread: &Thread, uaddr: u6
     }
 }
 
+/// Whether the vCPU has taken an exception from EL0 into our vector and is
+/// at the entry's `hvc`, not yet run (stopped by a kick on its way in).
+fn vcpu_entering_vector(vcpu: &Vcpu) -> Result<bool, Error> {
+    Ok(vcpu.reg(reg::CPSR)? & 0xf != 0 && memory::at_vector_entry(vcpu.reg(reg::PC)?))
+}
+
 /// Flush the running address space's TLB entries (on all vCPUs) now, from a
 /// vCPU stopped in our vector after a system call: run the vector's flush
 /// path, returning not to EL0 but to an `hvc` at EL1, then put the vCPU back
@@ -1138,9 +1144,25 @@ fn run_loop<'scope, 'env>(
             return Ok(Next::Stop);
         }
         process.sync_host_signals();
+        // Kicked on its way into our vector (a system call or fault taken,
+        // its hvc not yet run), the guest is in the middle of an exception,
+        // which comes first: it runs on to the hvc, and what's below waits
+        // until the call returns. Its ELR_EL1 is already past the `svc`, so
+        // a signal frame, a stop or the TLB flush's return made now would
+        // resume the guest there with the call never made and x0 still its
+        // first argument (a futex wake "returned" its address, and glibc
+        // aborted: "The futex facility returned an unexpected error code").
+        let mut known = None;
+        let mut entering = |vcpu: &Vcpu| -> Result<bool, Error> {
+            if known.is_none() {
+                known = Some(vcpu_entering_vector(vcpu)?);
+            }
+            Ok(known == Some(true))
+        };
         // A signal came in (perhaps kicking the vCPU out) that this thread can
         // take: act on it.
         if process.signal_ready(thread)
+            && !entering(vcpu)?
             && let Some(exit) = deliver_signals(vcpu, space, process, thread, None)?
         {
             return Ok(Next::Exit(exit));
@@ -1150,11 +1172,11 @@ fn run_loop<'scope, 'env>(
         place_ready(sh, scope);
         if sh.table.is_some() {
             // A stopped process's task goes no further.
-            if proc.stopped.load(Ordering::Acquire) {
+            if proc.stopped.load(Ordering::Acquire) && !entering(vcpu)? {
                 return Ok(Next::Park(host::Why::Stopped));
             }
         }
-        if space.lock().take_tlb_stale() {
+        if space.lock().tlb_stale() && !entering(vcpu)? && space.lock().take_tlb_stale() {
             // Return to EL0 through the vector's TLB-flushing path (which
             // erets to ELR_EL1/SPSR_EL1). Those hold where EL0 resumes only
             // when the vCPU stopped in the vector; stopped in the program (a

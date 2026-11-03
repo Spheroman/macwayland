@@ -329,6 +329,12 @@ pub fn flush_path_borrows_x0(pc: u64) -> bool {
     (VECTOR_FLUSH_PATH + 2 * 4..=VECTOR_FLUSH_PATH + 8 * 4).contains(&pc)
 }
 
+/// Whether a vCPU about to execute `pc` is at the start of a vector entry:
+/// it has taken the exception, and the entry's `hvc` to the host is next.
+pub fn at_vector_entry(pc: u64) -> bool {
+    (VECTORS_VA..VECTORS_VA + 16 * 0x80).contains(&pc) && (pc - VECTORS_VA).is_multiple_of(0x80)
+}
+
 /// The ASID size this CPU supports, in bits, once a vCPU has said: 8 or 16.
 static ASID_BITS: AtomicU8 = AtomicU8::new(0);
 
@@ -609,6 +615,11 @@ impl AddressSpace {
     /// the flag).
     pub fn take_tlb_stale(&mut self) -> bool {
         std::mem::take(&mut self.tlb_stale)
+    }
+
+    /// Whether [`AddressSpace::take_tlb_stale`] would say so, left as it is.
+    pub fn tlb_stale(&self) -> bool {
+        self.tlb_stale
     }
 
     /// Whether a system call changed mappings such that this address
