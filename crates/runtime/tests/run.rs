@@ -1539,6 +1539,146 @@ fn stand_ins_in_the_hosts_listing() {
     assert_eq!(st.code(), Some(5), "{st:?}");
 }
 
+/// `macwl-run --ps --all` (docs/processes.md, step 9): every host's
+/// processes, through the user's coordinator, which it starts if none
+/// runs; hosts that were running before it link to it as it starts. Here
+/// two hosts of their own, each holding a few processes.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn ps_all_lists_every_host() {
+    use std::io::{BufRead, BufReader};
+    let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let mut hosts = Vec::new();
+    for n in ["2", "3"] {
+        let mut child = macwl_run()
+            .args([path.as_os_str(), "many".as_ref(), n.as_ref(), "hold".as_ref()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(lines.next().map(Result::unwrap), Some(format!("{n} alive")));
+        hosts.push((child, lines, n));
+    }
+    let out = macwl_run().args(["--ps", "--all"]).output().unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{listing}, stderr: {}", String::from_utf8_lossy(&out.stderr));
+    for (child, _, n) in &hosts {
+        // The host's section: its processes, the first and its n children.
+        let section: Vec<&str> = listing
+            .split("host ")
+            .find(|s| s.starts_with(&format!("{}\n", child.id())))
+            .unwrap_or_else(|| panic!("no host {} in {listing}", child.id()))
+            .lines()
+            .collect();
+        let rows = section.iter().filter(|l| l.ends_with(&format!("procs many {n} hold"))).count();
+        assert_eq!(rows, n.parse::<usize>().unwrap() + 1, "{listing}");
+    }
+    for (mut child, mut lines, n) in hosts {
+        drop(child.stdin.take());
+        assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procs many ok"), "{n}");
+        assert!(child.wait().unwrap().success());
+    }
+}
+
+/// A program set to have a host of its own moves to one as it's exec'd
+/// (docs/processes.md, step 9), and stays its parent's child: `wait`, exit
+/// codes, killed-by-signal statuses, signals by pid, stops and continues
+/// (`jobs`), its parent's pid; one the new host can't load fails its
+/// `execve` (bash: 126); `~/.config/macwl/hosts` names programs too; and
+/// a moved process whose parent's host dies is its own host's init's.
+/// Linux bash and coreutils from nixpkgs.
+#[test]
+#[ignore = "needs nix"]
+fn moved_to_a_host_of_its_own() {
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::Path::new(&linux_package("coreutils")).join("bin");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("bad"), b"\x7fELF\x02\x01\x01 not a program, not for any machine at all, and long enough").unwrap();
+    std::fs::set_permissions(dir.path().join("bad"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    // A program named in the hosts file: `cat` (moved, its parent isn't in
+    // its host, so it can't see the parent's /proc).
+    std::fs::create_dir_all(dir.path().join(".config/macwl")).unwrap();
+    std::fs::write(dir.path().join(".config/macwl/hosts"), "# programs with a host of their own\ncat\n").unwrap();
+    let script = format!(
+        "set -m; export PATH={cu}; d={d}
+         MACWL_NEW_HOST=1 sleep 10 & p=$!; sleep 0.3; kill -TERM $p; wait $p; echo term $?
+         MACWL_NEW_HOST=1 {bash} -c 'exit 5'; echo code $?
+         MACWL_NEW_HOST=1 {bash} -c 'kill -KILL $$' 2>/dev/null; echo killed $?
+         MACWL_NEW_HOST=1 {bash} -c 'echo ppid $PPID; test -e /proc/$PPID; echo parent seen $?'; echo parent $$
+         MACWL_NEW_HOST=1 $d/bad 2>/dev/null; echo bad $?
+         MACWL_NEW_HOST=1 sleep 3 & p=$!; sleep 0.3; kill -STOP $p; sleep 0.2; jobs -l > $d/j; [[ $(<$d/j) == *Stopped* ]] && echo Stopped; kill -CONT $p; sleep 0.2; jobs -l > $d/j; [[ $(<$d/j) == *Running* ]] && echo Running; kill -INT $p; wait $p; echo int $?
+         test -e /proc/$$; echo self seen $?
+         echo x | cat /proc/$$/stat >/dev/null 2>&1; echo cat moved $?",
+        cu = cu.display(),
+        d = dir.path().display(),
+        bash = bash.display(),
+    );
+    let out = macwl_run().env("HOME", dir.path()).arg(&bash).arg("-c").arg(&script).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout,
+        "term 143\ncode 5\nkilled 137\nppid 100000\nparent seen 1\nparent 100000\nbad 126\nStopped\nRunning\nint 130\nself seen 0\ncat moved 1\n"
+            .replace("100000", stdout.lines().find_map(|l| l.strip_prefix("parent ").filter(|p| p.bytes().all(|b| b.is_ascii_digit()))).unwrap_or("?")),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success());
+
+    // Its parent's host killed: the moved process is its own host's init's.
+    let file = dir.path().join("orphan");
+    // (In single quotes: the moved bash's $$, not this one's.)
+    let inner = format!("echo $(cut -d\" \" -f4 /proc/$$/stat) > {f}; sleep 1; echo $(cut -d\" \" -f4 /proc/$$/stat) >> {f}", f = file.display());
+    let script = format!("export PATH={}; MACWL_NEW_HOST=1 {} -c '{inner}' & sleep 0.4; kill -KILL $$", cu.display(), bash.display());
+    let out = macwl_run().arg(&bash).arg("-c").arg(&script).output().unwrap();
+    assert_eq!(out.status.code(), Some(128 + 9), "{out:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let seen = loop {
+        let seen = std::fs::read_to_string(&file).unwrap_or_default();
+        if seen.lines().count() == 2 || std::time::Instant::now() > deadline {
+            break seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let ppids: Vec<&str> = seen.lines().collect();
+    assert_eq!(ppids.len(), 2, "{seen:?}");
+    assert_ne!(ppids[0], "1", "{seen:?}");
+    assert_eq!(ppids[1], "1", "{seen:?}");
+}
+
+/// A moved process's host dying ends it in its parent's eyes as killed by
+/// SIGKILL (docs/processes.md, step 9, "A host's failure").
+#[test]
+#[ignore = "needs nix"]
+fn a_moved_hosts_death_is_a_sigkill() {
+    use std::io::Read;
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::Path::new(&linux_package("coreutils")).join("bin");
+    let script = format!("MACWL_NEW_HOST=1 {}/sleep 30; echo died $?", cu.display());
+    let mut child = macwl_run().arg(&bash).arg("-c").arg(&script).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    // The moved process's host, from the listing: the stand-in's mark.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let moved: i32 = loop {
+        let out = macwl_run().args(["--ps", "--all"]).output().unwrap();
+        let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+        let found = listing
+            .lines()
+            .filter(|l| l.ends_with("sleep 30"))
+            .find_map(|l| l.split_whitespace().nth(8)?.strip_suffix('@')?.parse().ok());
+        if let Some(pid) = found {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no moved process in {listing}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(unsafe { libc::kill(moved, libc::SIGKILL) }, 0);
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    assert_eq!(out, "died 137\n");
+    assert!(child.wait().unwrap().success());
+}
+
 fn shmfutex_guest() -> std::path::PathBuf {
     let path = format!("{}/../../target/guest/shmfutex", env!("CARGO_MANIFEST_DIR"));
     std::fs::canonicalize(path).expect("run scripts/build-guest.sh first")
