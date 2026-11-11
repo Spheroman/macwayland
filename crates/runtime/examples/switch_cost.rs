@@ -245,6 +245,5 @@ mod processes {
             println!("{:>6} {:>8.2} {:>8.2} {:>8.2} {:>8.2}", pages, row[0], row[1], row[2], row[3]);
         }
         drop(vcpu);
-        pool.unmap_from_vm().unwrap();
     }
 }
