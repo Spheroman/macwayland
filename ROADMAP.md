@@ -40,7 +40,7 @@ remains the fallback if B stalls.
 | Spike 1: full-screen Metal shell | `crates/shell` | Hosts the compositor and blits client frames. On-demand rendering (present immediately on input or commit). |
 | Native latency baseline | `crates/native-probe` | Measures drawRect, CALayer and CAMetalLayer paths via ScreenCaptureKit `displayTime`, cross-checked against `MTLDrawable.presentedTime` (agree to <1 ms). |
 | B1: vCPU limit | `crates/hv-limits`, `scripts/sign-hv.sh` | 64 vCPUs per VM, one VM per process (M4, macOS 27.2; same on M5 Pro, macOS 26.6). |
-| B1: VM limit | `hv-limits vms` | 128 VMs at once, system-wide (M5 Pro, macOS 27.0.1): `kern.hv.max_address_spaces`, read-only. A count of VMs only: the same 128 with no memory mapped or 64 GiB each, no vCPUs or 16 each, IPA 32 to 40 bits. Track B uses one per live Linux process; zombies and idle fork spares hold none (test `processes_go_when_they_end`). Other hypervisor users share the 128. |
+| B1: VM limit | `hv-limits vms` | 128 VMs at once, system-wide (M5 Pro, macOS 27.0.1): `kern.hv.max_address_spaces`, read-only. A count of VMs only: the same 128 with no memory mapped or 64 GiB each, no vCPUs or 16 each, IPA 32 to 40 bits. Track B uses one per host, however many Linux processes it runs (`docs/processes.md`; test `one_vm_more_processes_than_vms`: 301 processes, one Mac process). Other hypervisor users share the 128. |
 | `linux-abi` building blocks | `crates/linux-abi` | arm64 syscall numbers, Darwin→Linux errno, `stat`/`timespec`/open-flag layouts, fd table, guest→host path mapping, `GuestMemory` interface. 8 unit tests. |
 | B0 scaffold: core runtime | `crates/runtime` (`macwl-run`) | Loads a static ELF, runs it at EL0 under our own page tables (see item 3); `svc` traps to an EL1 vector that does `hvc` to the host, which calls `linux_abi::dispatch` (`write`, `writev`, `exit_group`, `set_tid_address`, `brk`). Tested with hand-assembled ELFs: hello world, -ENOSYS, null-pointer fault. |
 | B2: Linux Wayland client on the Mac | `crates/runtime`, `scripts/build-guest.sh` | The unmodified `hello-client`, built for `aarch64-unknown-linux-musl`, runs under `macwl-run`, connects to macwl-compositor, shares its pool through `/dev/shm` and `SCM_RIGHTS`, and draws in the full-screen macwl-shell (~90 fps). Frames arrive pixel-exact (test `b2_linux_wayland_client_draws_on_the_mac_compositor`). |
@@ -200,34 +200,19 @@ from a static Linux binary.
    blocked, so they'd rarely wait.
 6. **Processes.** Done: `clone` as fork and vfork (`posix_spawn`), `execve`
    (with `#!` scripts), `wait4`/`waitid`, `kill` to other processes. Ubuntu's
-   bash runs scripts with pipelines, subshells and background jobs
-   (`crates/runtime/src/fork.rs`, test `processes`). How:
-   - A host `fork()` can't be used: Hypervisor.framework state doesn't survive
-     it (the child's `hv_vcpu_create` crashed in `os_log` ~6% of the time). A
-     fork child is a fresh `macwl-run --fork-child` that's handed the process.
-   - Guest memory goes over as a copy-on-write Mach memory entry
-     (`MAP_MEM_VM_COPY`), in RAM. Not a file: macOS writes dirty file-backed
-     pages back to disk, ~4 GB/min for a busy 1 GiB guest
-     (`examples/disk_writes.rs`). Shared mappings, fds and the rest go over a
-     Unix socket with `SCM_RIGHTS`.
-   - Launching any non-Apple binary costs ~2–3 ms on macOS, so a process that
-     has forked keeps a spare child launched ahead of time.
-     fork + exec + wait of `/bin/true` takes ~2.5 ms in a tight loop (native
-     Linux: ~0.5 ms); fork alone ~0.5 ms with a spare ready. `exec` reuses
-     the VM. `MACWL_PROFILE=1` prints where the time goes.
-   - Wait statuses carry Linux signal numbers (a guest killed by a signal
-     tells its parent over the control socket; host signals are translated).
-   - Each live process holds one of the Mac's 128 VMs (B1 in Done); ended
-     ones give theirs back at once (test `processes_go_when_they_end`). A
-     Wine session (10–20 processes) fits; a full desktop with a browser
-     may not. If it binds: a process blocked in a system call for a while
-     could give up its VM and create a new one when it wakes (its page
-     tables and memory are host-side, so only the vCPUs' registers need
-     saving), making the cap 128 *running* processes.
-   Not yet in 1:1 mode: threads in a forked process (item 5), `CLONE_VM`
-   without vfork, `pidfd_getfd`, `kill(-1)` (refused: on a Mac that's the
-   whole login session); one VM has them (below).
-   **Next: many processes in one VM** (design: `docs/processes.md`). A
+   bash runs scripts with pipelines, subshells and background jobs (test
+   `processes`). Until 2026-11-10 (`docs/processes.md` step 8) each Linux
+   process was a Mac process with a VM of its own (1:1): a host `fork()`
+   can't be used (Hypervisor.framework state doesn't survive it: the
+   child's `hv_vcpu_create` crashed in `os_log` ~6% of the time), so a fork
+   child was a fresh `macwl-run --fork-child` handed the process, guest
+   memory going over as a copy-on-write Mach memory entry (in RAM: macOS
+   writes dirty file-backed pages back to disk, ~4 GB/min for a busy 1 GiB
+   guest, `examples/disk_writes.rs`) and the rest over a Unix socket, with
+   a spare child launched ahead (launching any non-Apple binary costs ~2–3
+   ms on macOS). fork + exec + wait of `/bin/true` took ~2.5 ms, and each
+   live process held one of the Mac's 128 VMs.
+   **Many processes in one VM** (design: `docs/processes.md`). A
    *host* (one Mac process, one VM) runs every Linux process of a session,
    each with its own page tables and ASID: a switch between processes
    measured as cheap as one between threads (1.4 µs a round either way,
@@ -301,9 +286,16 @@ from a static Linux binary.
    requeues, FUTEX_WAKE_OP, PI locks, `futex_waitv` and futex2's calls
    work between processes (a cross-process round trip 12.8 µs, as between
    threads); robust lists are walked as threads end (EOWNERDEAD after a
-   holder's exit or SIGKILL). In 1:1, waits on shared futexes look at
+   holder's exit or SIGKILL). In 1:1, waits on shared futexes looked at
    their word every 1–32 ms instead. Firefox headless: screenshot in
    0.6 s, peak host RSS 418–448 MB (was 487–505).
+   Step 8 done (2026-11-10): **1:1 mode is gone**; one VM is the only
+   mode. `MACWL_ONE_VM` and `macwl-run --fork-child` are gone, and with
+   them the fork machinery (spare children, Mach memory entries, the
+   pool's snapshots, control sockets, the fd table's encoding for another
+   process) and the Mac program that replaced its process (`exec_host`).
+   A `macwl-run` without `MACWL_HOST` is the host of its program alone,
+   the isolated mode. Every test runs in the one mode.
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
@@ -446,36 +438,25 @@ from a static Linux binary.
     `pbcopy`, `git`, Xcode's) next to Linux ones. **Works** (tested
     below; on in `scripts/session.sh`, opt-in in `macwl-run`). Since
     2026-11-02 (`docs/processes.md` step 6) a Mac program runs as a Mac
-    process of its own in a host of many Linux processes, the Linux
-    process standing in for it; the 1:1 path below (the process replaced
-    with `SETEXEC`) is used only with `MACWL_ONE_VM=0`, where Mac programs
-    are off in `scripts/session.sh` and every test.
+    process of its own, the Linux process standing in for it; the host
+    never execs. (Until step 8, 2026-11-10, 1:1 mode instead replaced the
+    process with the Mac program, `posix_spawn` with
+    `POSIX_SPAWN_SETEXEC` once its VM was gone; that path went with 1:1.)
     - Done in code: `execve` reads a file's first 256 bytes; a Mach-O
       (thin 64-bit, or universal with < 20 architectures, which tells it
-      from a Java class file) becomes `Action::ExecHost`, as does a `#!`
-      script whose interpreter is one. `linux_abi::syscall::exec_host`
-      replaces the process with it for real: `posix_spawn` with
-      `POSIX_SPAWN_SETEXEC` (same pid, so the parent's `wait`, the
-      terminal and job control carry on), `CLOEXEC_DEFAULT` plus `adddup2`
-      putting each inherited guest fd at its guest number (by way of fds
-      above all of them, so no move clobbers a later source),
-      `addchdir_np` to the guest cwd, the guest's ignored signals kept
-      ignored and the rest defaulted, the guest's mask as its mask. The
-      environment is the guest's but with the Mac's `PATH` and `SHELL`
-      (those macwl-run started with), so Mac `git` finds Mac `less` and
-      `vim`. A parent's `setpgid` on a child that has gone Mac gets EACCES
-      (Linux's answer for an exec'd child). Off by default;
-      `--mac-programs` / `MACWL_MAC_PROGRAMS=1` turn it on.
-    - **The VM goes first:** before `SETEXEC` (see `execute` in
-      `crates/runtime/src/lib.rs`) the exec'ing thread stops the others,
-      each vCPU is destroyed on its own thread, then guest memory is
-      unmapped, the VM destroyed, the memory, fork memory entries and spare
-      child dropped; the exec is refused if `hv_vm_destroy` fails, so the
-      Mac program starts from a clean process with nothing of the guest
-      left in it. With
-      `SETEXEC`, close-on-exec fds are closed *before* the file actions
-      run, so `dup2` from one fails with EBADF, and every host fd is
-      close-on-exec: the flag is cleared on the fds passed on.
+      from a Java class file) becomes `Action::MacStandIn`, as does a `#!`
+      script whose interpreter is one. An agent spawns it
+      (`posix_spawn`, never `SETEXEC`: `mac::spawn` checks) with
+      `CLOEXEC_DEFAULT` plus `adddup2` putting each inherited guest fd at
+      its guest number, `addchdir_np` to the guest cwd, the guest's
+      ignored signals kept ignored and the rest defaulted, the guest's
+      mask as its mask; the stand-in keeps the pid, so the parent's
+      `wait`, the terminal and job control carry on. The environment is
+      the guest's but with the Mac's `PATH` and `SHELL` (those macwl-run
+      started with), so Mac `git` finds Mac `less` and `vim`. A parent's
+      `setpgid` on a child that has gone Mac gets EACCES (Linux's answer
+      for an exec'd child). Off by default; `--mac-programs` /
+      `MACWL_MAC_PROGRAMS=1` turn it on.
     - `#!/usr/bin/env NAME` (and `/bin/env`) with a plain NAME looks NAME
       up on the guest's `PATH` itself, as Linux `env` would, so portable
       scripts run on Linux when a Linux NAME exists, falling back to `env`
@@ -511,12 +492,10 @@ from a static Linux binary.
       after the Linux directories.
     - Limits: Mac programs can't start Linux ones (macOS's `execve` has no
       hook for ELF files); under `--root` they see the Mac's file system,
-      not the guest's, and path arguments aren't translated. In 1:1 a Mac
-      binary that fails to exec can't return the error to the caller (the
-      VM is torn down first), so `execve`/`posix_spawn` "succeed" and the
-      process exits 127; in one VM the spawn comes first and `execve`
-      returns its errno (bash says 126). Still off by default in
-      `macwl-run` itself.
+      not the guest's, and path arguments aren't translated. (A Mac
+      binary that fails to start makes `execve` fail with its errno: bash
+      says 126. In 1:1 the process exited 127 instead.) Still off by
+      default in `macwl-run` itself.
     - **Tested in one VM** (2026-11-02, scripted: tests
       `one_vm_mac_programs`, `one_vm_spawns_mac_programs`,
       `one_vm_mac_programs_on_a_terminal`, `session_runs_mac_programs`,

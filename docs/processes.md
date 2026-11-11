@@ -4,9 +4,10 @@ Status: design (2026-11-02), open questions decided (2026-11-02, see
 "Decisions"); steps 1 to 6 done (2026-11-02: processes in one VM,
 terminals and job control included, `macwl-run`s from outside joining a
 host as clients, and Mac programs as processes of their own standing in
-for the Linux processes that ran them; one VM is the default,
-`MACWL_ONE_VM=0` keeps 1:1); step 7 done (2026-11-03: shared windows
-and futexes across processes). Step 8 is next. ROADMAP items 6 and 13;
+for the Linux processes that ran them; one VM the default); step 7 done
+(2026-11-03: shared windows and futexes across processes); step 8 done
+(2026-11-10: 1:1 mode gone, one VM the only mode). Step 9 is next.
+ROADMAP items 6 and 13;
 extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
@@ -46,19 +47,20 @@ powerful but takes longer to build, take it.** So:
 
 Hypervisor.framework allows **128 VMs system-wide**
 (`kern.hv.max_address_spaces`, read-only; `hv-limits vms`) and one VM per
-Mac process. Today each live Linux process is a Mac process with a VM of its
-own (`crates/runtime/src/fork.rs`), so at most ~128 Linux processes can be
-alive at once, on the whole Mac, shared with every other hypervisor user. A
-Wine session uses 10–20; a desktop with a browser (Firefox: a parent and ten
-or so children) and a few terminals full of tools gets close; a program
-respawning children in a loop takes the machine's VMs from everybody.
+Mac process. Before this design (until step 8) each live Linux process was
+a Mac process with a VM of its own (1:1 mode), so at most ~128 Linux processes could be
+be alive at once, on the whole Mac, shared with every other hypervisor
+user. A Wine session uses 10–20; a desktop with a browser (Firefox: a
+parent and ten or so children) and a few terminals full of tools gets
+close; a program respawning children in a loop takes the machine's VMs
+from everybody.
 
-A Mac process per Linux process costs time too. A fork launches (or takes a
-pre-launched) `macwl-run --fork-child`, snapshots guest memory as a Mach
-memory entry, sends the fd table over a socket and builds a new VM: 2.6 ms
+A Mac process per Linux process cost time too. A fork launched (or took a
+pre-launched) `macwl-run --fork-child`, snapshotted guest memory as a Mach
+memory entry, sent the fd table over a socket and built a new VM: 2.6 ms
 per fork in a loop, against 0.5 ms for the Mac's own bash (below). And the
-Linux process model leans on the Mac's: pids, process groups, sessions,
-`wait`, signals and job control are the Mac's own, adjusted where they
+Linux process model leaned on the Mac's: pids, process groups, sessions,
+`wait`, signals and job control were the Mac's own, adjusted where they
 differ (a control socket for `setpgid` on a child, another for "killed by
 signal N").
 
@@ -261,7 +263,7 @@ pieces that make that work:
   host, and the owner of any pid is a lookup of its range.
 - **Moving at `execve`.** An `execve` of a program set to have its own host
   is where it moves: the host starts one (a fresh `macwl-run --host`, ~3 ms,
-  as a fork's spare is today), and sends it the exec: argv, environment,
+  as a 1:1 fork's spare child took), and sends it the exec: argv, environment,
   cwd, root and binds, credentials, rlimits, umask, signal dispositions and
   mask, the pid, parent, group and session, and the fds (`SCM_RIGHTS`; one
   open file description each, as for a Mac program). The new host gives
@@ -444,10 +446,10 @@ more is just made writable again.
 - **vfork** (`CLONE_VM | CLONE_VFORK`, every `posix_spawn`): the child runs
   in the parent's address space, nothing copied, and the parent's task
   waits until the child execs or exits, as on Linux.
-- **`CLONE_VM` without vfork** (not supported today): two processes sharing
-  one address space, now possible.
-- `fork.rs`'s spares, Mach memory entries and control sockets are used only
-  by 1:1 mode while it lasts (9).
+- **`CLONE_VM` without vfork** (not supported in 1:1): two processes
+  sharing one address space, now possible.
+- `fork.rs`'s spares, Mach memory entries and control sockets were 1:1
+  mode's alone, and went with it (step 8).
 
 The estimate (above): fork + exit + wait 10–50x faster, fork + exec of a
 dynamic program ~6x, and no parent stall that grows with its size.
@@ -561,8 +563,8 @@ host runs many Linux sessions (a bash per foot window). So:
    the close-on-exec juggling goes), P's working directory, environment
    (the Mac's `PATH` and `SHELL`, `TERM` adjusted, as now), signal mask, and
    ignored signals (`posix_spawnattr_setsigdefault`/`setsigmask`). If it
-   fails, `execve` returns the errno, which it can't today (item 13's "exits
-   127" limitation goes).
+   fails, `execve` returns the errno, which 1:1's exec couldn't (item 13's
+   "exits 127" limitation goes).
 2. **P becomes a stand-in**: its tasks end and its address space is freed,
    as in an exec; its table entry stays, with pid, parent, group and session,
    marked as Mac process M.
@@ -675,12 +677,10 @@ would reap its children before it could report them).
   Mac programs) goes through one function, `mac::spawn`, which asserts
   that its flags, as set and as read back from the attributes, don't
   include `POSIX_SPAWN_SETEXEC` (unit tests `a_spawn_never_replaces_its_caller`,
-  `spawn_checks_its_flags_before_it_spawns`). The 1:1 path (`exec_host`,
-  `Action::ExecHost`) stays 1:1's alone: the dispatcher asks the kernel,
-  which says `StandIn` in a host of many processes, a new action
-  (`Action::MacStandIn`, `Next::StandIn`); the CPU loop still turns an
-  `ExecHost` into ENOEXEC when there is a table, and `Next::ExecHost`
-  still asserts there is none.
+  `spawn_checks_its_flags_before_it_spawns`). The dispatcher asks the
+  kernel, which says `StandIn`, an action of its own (`Action::MacStandIn`,
+  `Next::StandIn`). 1:1's path (`exec_host`, `Action::ExecHost`, the
+  process replaced with `SETEXEC`) went with it at step 8.
 
 Everything item 13 tested keeps working this way: exit codes and signals
 through `wait`, fds by guest number, pipes mixing Mac and Linux programs,
@@ -740,8 +740,9 @@ struct Proc {
 `linux_abi::Process` keeps the per-process state; what it asks the host
 (`kill`, `wait`, groups, the terminal) goes through a trait the runtime
 implements (the `Kernel` the dispatcher gets with the process), so
-`linux-abi` stays free of Hypervisor.framework, and 1:1 mode can implement
-the same trait with host calls during the transition.
+`linux-abi` stays free of Hypervisor.framework. (1:1 mode implemented the
+same trait with host calls during the transition; since step 8 only
+`linux-abi`'s own tests do, for a process on its own: `HostKernel`.)
 
 ### Task
 
@@ -1586,6 +1587,34 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
    a `macwl-run` without `MACWL_HOST`) is the isolated mode, so `fork.rs`'s
    spares, Mach memory entries and control sockets, and `exec_host`'s
    `SETEXEC` path, are deleted.
+   (Done, 2026-11-10.) `MACWL_ONE_VM` is gone, and `macwl_runtime::run`
+   is always `host::run`; `Host::table` is the table, no longer an
+   `Option`, so every "with many processes" branch of the CPU loop is the
+   only one (CPU time per turn, ASID flushes between tasks, a stopped
+   process parking, a runtime error ending its process alone). Deleted
+   with 1:1: `execute` (a VM per process), `Next::ExecHost` and the
+   host's `exec_host`; `fork.rs` (`macwl-run --fork-child`, spare
+   children) and `mach.rs` (memory entries), the pool's and address
+   space's snapshots and their encoding, shared windows' encoding (and the
+   fd each window kept for a child: the mapping holds what it maps);
+   in `linux-abi`, `Action::ExecHost`, `MacPrograms::ExecHost` and
+   `exec_host`, the control sockets (`ctl`, `Children`, `tell_parent`,
+   `setpgid` by proxy), `Process::encode_for_fork`/`decode_forked`, the
+   fd table's encoding (and the eventfd, timerfd and inotify copies it
+   made), and the waits for host children. The waiters' host-signal
+   wakeup (1:1's `host_signals_for`) went too: a host's signals reach its
+   processes through the table (`route_host_signals`). `HostKernel` stays
+   as the kernel of a process on its own, for `linux-abi`'s tests: no
+   children (`wait4`, `waitid`: ECHILD), the host's own calls for the
+   rest, Mac programs refused. `Proc::space` is always there. Tests: the
+   1:1-only cases and modes went (`tgkill_reaches_another_process_thread`
+   in one mode, the `one_vm_` duplicates of `terminals_and_job_control`
+   and `bash_job_control`, `guest/tty.c`'s 1:1 branches);
+   `fork_state_round_trips` became
+   `a_fork_child_inherits_its_parents_state` and
+   `inotify_goes_to_a_forked_child` forks in the host. `scripts/session.sh`
+   always runs one host. In code, 2,273 lines deleted and 269 added.
+   Runtime 39 unit + 57 integration, linux-abi 73.
 9. **Federated hosts** (section 1). The coordinator (pid ranges moved into
    it, the directory of ranges and spanning groups), `--new-host` and the
    per-program setting, moving at `execve` with remote stand-ins, `wait`
@@ -1630,7 +1659,8 @@ processes.
 - Isolation: a guest that faults ends alone; a runtime error unwinding in
   a system call (a test-only call that fails an assertion) ends only its
   process.
-- The existing runtime and `linux-abi` tests, in both modes while 1:1 exists.
+- The existing runtime and `linux-abi` tests, in both modes while 1:1
+  existed (until step 8).
 
 ## Open questions
 
