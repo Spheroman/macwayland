@@ -1519,6 +1519,55 @@ fn session_runs_mac_programs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The session (scripts/session.sh, foot typed at through the headless
+/// compositor) with programs in hosts of their own (docs/processes.md,
+/// step 9): a pipeline across hosts in the foreground, stopped with
+/// Ctrl-Z, in `jobs`, `fg`, ended with Ctrl-C (130); a moved job in the
+/// background that `ps -ef` in foot's host lists; `kill %1` ending it
+/// (143).
+#[test]
+#[ignore = "needs nix and builds the release binaries"]
+fn session_federates() {
+    let _one = one_session();
+    let dir = std::path::PathBuf::from(format!("/tmp/macwl-test-fed-{}", std::process::id()));
+    let d = dir.display();
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/session.sh");
+    let typed = format!(
+        "MACWL_NEW_HOST=1 sleep 100 | cat\\n\\p\\p\\cZ\\pjobs > {d}/j1\\nfg\\n\\p\\cC\\pecho $? > {d}/s1\\n\
+         MACWL_NEW_HOST=1 sleep 101 &\\n\\p\\pps -ef > {d}/ps\\n\\pkill %1; wait %1; echo $? > {d}/s2\\n\\p\
+         echo done > {d}/done\\n\\pexit\\n"
+    );
+    let mut session = std::process::Command::new(script)
+        .env("MACWL_SESSION_COMPOSITOR", "headless")
+        .env("MACWL_SESSION_DIR", &dir)
+        .env("MACWL_TYPE", typed)
+        .env_remove("MACWL_HOST")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let errors = rest_of_in_background(session.stderr.take().unwrap());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default();
+    while !dir.join("done").exists() {
+        if std::time::Instant::now() > end || session.try_wait().unwrap().is_some() {
+            let _ = session.kill();
+            panic!("the session didn't finish: j1 {:?} s1 {:?} ps {:?} s2 {:?}", read("j1"), read("s1"), read("ps"), read("s2"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(read("j1").contains("Stopped") && read("j1").contains("sleep 100 | cat"), "{}", read("j1"));
+    assert_eq!(read("s1"), "130\n");
+    assert!(read("ps").lines().any(|l| l.ends_with("sleep 101")), "{}", read("ps"));
+    assert_eq!(read("s2"), "143\n");
+    let st = session.wait().unwrap();
+    let errors = errors.join().unwrap();
+    let errors: Vec<&str> = errors.lines().filter(|l| !l.contains("macwl_compositor")).collect();
+    assert!(st.success(), "{st:?}: {}", errors.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A stand-in seen from the Mac: `macwl-run --ps` lists the Linux process
 /// a Mac program stands in for, with the program's command line and its
 /// Mac pid (marked `*`); and a client whose process exec'd a Mac program
@@ -1542,7 +1591,8 @@ fn stand_ins_in_the_hosts_listing() {
 /// `macwl-run --ps --all` (docs/processes.md, step 9): every host's
 /// processes, through the user's coordinator, which it starts if none
 /// runs; hosts that were running before it link to it as it starts. Here
-/// two hosts of their own, each holding a few processes.
+/// two hosts of their own, each holding a few processes; and the
+/// coordinator killed, a new one that they link to again.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn ps_all_lists_every_host() {
@@ -1575,6 +1625,18 @@ fn ps_all_lists_every_host() {
         let rows = section.iter().filter(|l| l.ends_with(&format!("procs many {n} hold"))).count();
         assert_eq!(rows, n.parse::<usize>().unwrap() + 1, "{listing}");
     }
+    // The coordinator killed: the next listing starts another, which the
+    // hosts link to as it does (step 9e).
+    let coordinator = String::from_utf8_lossy(&std::process::Command::new("pgrep").args(["-f", "macwl-run --coordinator"]).output().unwrap().stdout).into_owned();
+    for pid in coordinator.split_whitespace().filter_map(|p| p.parse::<i32>().ok()) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let out = macwl_run().args(["--ps", "--all"]).output().unwrap();
+    let again = String::from_utf8_lossy(&out.stdout);
+    for (child, _, _) in &hosts {
+        assert!(again.contains(&format!("host {}\n", child.id())), "after a new coordinator: {again}");
+    }
     for (mut child, mut lines, n) in hosts {
         drop(child.stdin.take());
         assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procs many ok"), "{n}");
@@ -1598,7 +1660,8 @@ fn moved_to_a_host_of_its_own() {
     std::fs::write(dir.path().join("bad"), b"\x7fELF\x02\x01\x01 not a program, not for any machine at all, and long enough").unwrap();
     std::fs::set_permissions(dir.path().join("bad"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     // A program named in the hosts file: `cat` (moved, its parent isn't in
-    // its host, so it can't see the parent's /proc).
+    // its host: its /proc entry is there, from the parent's host, but not
+    // its memory, so not its environ).
     std::fs::create_dir_all(dir.path().join(".config/macwl")).unwrap();
     std::fs::write(dir.path().join(".config/macwl/hosts"), "# programs with a host of their own\ncat\n").unwrap();
     let script = format!(
@@ -1606,11 +1669,11 @@ fn moved_to_a_host_of_its_own() {
          MACWL_NEW_HOST=1 sleep 10 & p=$!; sleep 0.3; kill -TERM $p; wait $p; echo term $?
          MACWL_NEW_HOST=1 {bash} -c 'exit 5'; echo code $?
          MACWL_NEW_HOST=1 {bash} -c 'kill -KILL $$' 2>/dev/null; echo killed $?
-         MACWL_NEW_HOST=1 {bash} -c 'echo ppid $PPID; test -e /proc/$PPID; echo parent seen $?'; echo parent $$
+         MACWL_NEW_HOST=1 {bash} -c 'echo ppid $PPID; test -e /proc/$PPID; echo parent listed $?; cat /proc/$PPID/environ >/dev/null 2>&1; echo parent environ $?'; echo parent $$
          MACWL_NEW_HOST=1 $d/bad 2>/dev/null; echo bad $?
          MACWL_NEW_HOST=1 sleep 3 & p=$!; sleep 0.3; kill -STOP $p; sleep 0.2; jobs -l > $d/j; [[ $(<$d/j) == *Stopped* ]] && echo Stopped; kill -CONT $p; sleep 0.2; jobs -l > $d/j; [[ $(<$d/j) == *Running* ]] && echo Running; kill -INT $p; wait $p; echo int $?
          test -e /proc/$$; echo self seen $?
-         echo x | cat /proc/$$/stat >/dev/null 2>&1; echo cat moved $?",
+         cat /proc/$$/environ >/dev/null 2>&1; echo cat moved $?",
         cu = cu.display(),
         d = dir.path().display(),
         bash = bash.display(),
@@ -1619,7 +1682,7 @@ fn moved_to_a_host_of_its_own() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         stdout,
-        "term 143\ncode 5\nkilled 137\nppid 100000\nparent seen 1\nparent 100000\nbad 126\nStopped\nRunning\nint 130\nself seen 0\ncat moved 1\n"
+        "term 143\ncode 5\nkilled 137\nppid 100000\nparent listed 0\nparent environ 1\nparent 100000\nbad 126\nStopped\nRunning\nint 130\nself seen 0\ncat moved 1\n"
             .replace("100000", stdout.lines().find_map(|l| l.strip_prefix("parent ").filter(|p| p.bytes().all(|b| b.is_ascii_digit()))).unwrap_or("?")),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
