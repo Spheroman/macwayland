@@ -24,11 +24,12 @@
 //! process's parent has gone, and it's the new host's init's.
 
 use std::{
+    collections::{BTreeSet, HashMap},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, net::UnixStream},
     },
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Condvar, Mutex, Weak},
     time::Duration,
 };
 
@@ -42,8 +43,8 @@ use linux_abi::{
 use super::{Elsewhere, First, RangePids, StandIn, Table, Target};
 use crate::{mac::Change, proto, Error, Exit, Proc};
 
-/// Old host to new: the process (body: [`encode_adopt`]; its fds with it,
-/// and in [`FDS`] messages after it).
+/// Old host to new: the process (its fds with it, and in [`FDS`] messages
+/// after it).
 const ADOPT: u8 = 1;
 /// Old host to new: more of the fds.
 const FDS: u8 = 2;
@@ -58,9 +59,64 @@ const ADOPTED: u8 = 16;
 const REFUSED: u8 = 17;
 /// New host to old: the process stopped, continued or ended.
 const CHANGED: u8 = 18;
+/// New host to old: the process is in this group and session now
+/// (`setpgid`, `setsid` there).
+const MEMBER: u8 = 19;
+/// Either way: what this host reaches, its own and through its other
+/// links ([`Reach`]).
+const REACH: u8 = 32;
+/// Either way: a signal for a process group, for the members over there.
+const TO_GROUP: u8 = 33;
+/// Either way: a signal for every process (`kill(-1)`).
+const TO_ALL: u8 = 34;
+/// Either way: a signal for a pid or tid over there, answered.
+const ASK: u8 = 35;
+/// The answer: the signal's result (or the errno, negated).
+const ANSWER: u8 = 36;
 
-/// How long the old host waits for the new one's answer.
+/// How long the old host waits for the new one's answer to a hand-off.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
+/// How long a signal to another host's process waits for its answer.
+const ASK_WITHIN: Duration = Duration::from_secs(2);
+
+/// What a host reaches through a link: the process groups (with their
+/// sessions) that have members there or beyond, and the pids (ranges,
+/// `[start, end)`) that are processes and threads there or beyond.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Reach {
+    pub groups: BTreeSet<(i64, i64)>,
+    pub pids: BTreeSet<(i64, i64)>,
+}
+
+impl Reach {
+    fn encode(&self, e: &mut Encoder) {
+        for set in [&self.groups, &self.pids] {
+            e.u64(set.len() as u64);
+            for &(a, b) in set {
+                e.i64(a).i64(b);
+            }
+        }
+    }
+
+    fn decode(d: &mut Decoder) -> Result<Reach, Truncated> {
+        let mut r = Reach::default();
+        for set in [&mut r.groups, &mut r.pids] {
+            for _ in 0..d.count(16)? {
+                set.insert((d.i64()?, d.i64()?));
+            }
+        }
+        Ok(r)
+    }
+
+    fn has_pid(&self, pid: i64) -> bool {
+        self.pids.range(..=(pid, i64::MAX)).next_back().is_some_and(|&(start, end)| start <= pid && pid < end)
+    }
+
+    fn extend(&mut self, other: &Reach) {
+        self.groups.extend(other.groups.iter().copied());
+        self.pids.extend(other.pids.iter().copied());
+    }
+}
 
 /// The other end of a link between two hosts.
 #[derive(Debug)]
@@ -68,20 +124,79 @@ pub(crate) struct Peer {
     /// The other host's Mac pid.
     pub mac_pid: libc::pid_t,
     sock: Mutex<UnixStream>,
+    /// What it said it reaches.
+    reach: Mutex<Reach>,
+    /// What this host last told it it reaches.
+    told: Mutex<Option<Reach>>,
+    /// Signals asked of it, by id: their answers once they come.
+    asks: Mutex<(u64, HashMap<u64, Option<i64>>)>,
+    answered: Condvar,
 }
 
 impl Peer {
+    fn new(mac_pid: libc::pid_t, sock: UnixStream) -> Arc<Peer> {
+        Arc::new(Peer {
+            mac_pid,
+            sock: Mutex::new(sock),
+            reach: Mutex::default(),
+            told: Mutex::new(None),
+            asks: Mutex::default(),
+            answered: Condvar::new(),
+        })
+    }
+
     fn send(&self, kind: u8, body: &[u8]) {
         let sock = self.sock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = proto::send(sock.as_raw_fd(), kind, body, &[]);
     }
 
-    /// Signal `pid` there (or its thread `tid`).
+    /// Signal `pid` there (or its thread `tid`), not waiting to hear.
     pub fn signal(&self, pid: i64, tid: Option<i64>, info: SigInfo) {
         let mut e = Encoder::default();
         e.i64(pid).bool(tid.is_some()).i64(tid.unwrap_or(0));
-        e.u64(info.signo).i64(info.code as i64).i64(info.pid as i64).u64(info.uid as u64).i64(info.status as i64);
+        encode_info(&mut e, &info);
         self.send(SIGNAL, &e.0);
+    }
+
+    /// `to` (a pid or a thread there) gets `info`: how that went.
+    fn ask(&self, to: Target, info: SigInfo) -> Result<i64, i64> {
+        let id = {
+            let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+            asks.0 += 1;
+            let id = asks.0;
+            asks.1.insert(id, None);
+            id
+        };
+        let mut e = Encoder::default();
+        e.u64(id);
+        encode_target(&mut e, to);
+        encode_info(&mut e, &info);
+        self.send(ASK, &e.0);
+        let deadline = std::time::Instant::now() + ASK_WITHIN;
+        let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(Some(r)) = asks.1.get(&id) {
+                let r = *r;
+                asks.1.remove(&id);
+                return if r < 0 { Err(-r) } else { Ok(r) };
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                asks.1.remove(&id);
+                return Err(errno::ESRCH);
+            }
+            asks = self.answered.wait_timeout(asks, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    /// The link has gone: whatever was asked of it is answered with ESRCH.
+    fn gone(&self) {
+        let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        for r in asks.1.values_mut() {
+            r.get_or_insert(-errno::ESRCH);
+        }
+        self.answered.notify_all();
+        *self.reach.lock().unwrap_or_else(|e| e.into_inner()) = Reach::default();
     }
 
     /// `pid`'s parent is `ppid` from now on.
@@ -102,6 +217,57 @@ impl Peer {
         };
         self.send(CHANGED, &e.0);
     }
+
+    /// `pid` (here, whose parent is the other host's) is in group `pgid`
+    /// and session `sid` now.
+    pub fn member(&self, pid: i64, pgid: i64, sid: i64) {
+        let mut e = Encoder::default();
+        e.i64(pid).i64(pgid).i64(sid);
+        self.send(MEMBER, &e.0);
+    }
+
+    pub fn reaches_group(&self, pgid: i64) -> bool {
+        self.reach.lock().unwrap_or_else(|e| e.into_inner()).groups.range((pgid, i64::MIN)..=(pgid, i64::MAX)).next().is_some()
+    }
+
+    pub fn reaches_group_in(&self, pgid: i64, sid: i64) -> bool {
+        self.reach.lock().unwrap_or_else(|e| e.into_inner()).groups.contains(&(pgid, sid))
+    }
+
+    fn reaches_pid(&self, pid: i64) -> bool {
+        self.reach.lock().unwrap_or_else(|e| e.into_inner()).has_pid(pid)
+    }
+}
+
+fn encode_info(e: &mut Encoder, info: &SigInfo) {
+    e.u64(info.signo).i64(info.code as i64).i64(info.pid as i64).u64(info.uid as u64).i64(info.status as i64);
+}
+
+fn decode_info(d: &mut Decoder) -> Result<SigInfo, Truncated> {
+    let (signo, code, from, uid, status) = (d.u64()?, d.i64()? as i32, d.i64()?, d.u64()? as u32, d.i64()? as i32);
+    Ok(SigInfo { uid, status, ..SigInfo::user(signo, code, from) })
+}
+
+fn encode_target(e: &mut Encoder, to: Target) {
+    match to {
+        Target::Pid(pid) => e.u64(0).i64(pid),
+        Target::Thread { tgid, tid } => e.u64(1).bool(tgid.is_some()).i64(tgid.unwrap_or(0)).i64(tid),
+        Target::Group(pgid) => e.u64(2).i64(pgid),
+        Target::All { except } => e.u64(3).i64(except),
+    };
+}
+
+fn decode_target(d: &mut Decoder) -> Result<Target, Truncated> {
+    Ok(match d.u64()? {
+        0 => Target::Pid(d.i64()?),
+        1 => {
+            let (has, tgid, tid) = (d.bool()?, d.i64()?, d.i64()?);
+            Target::Thread { tgid: has.then_some(tgid), tid }
+        }
+        2 => Target::Group(d.i64()?),
+        3 => Target::All { except: d.i64()? },
+        _ => return Err(Truncated),
+    })
 }
 
 fn decode_change(d: &mut Decoder) -> Result<Change, Truncated> {
@@ -111,6 +277,167 @@ fn decode_change(d: &mut Decoder) -> Result<Change, Truncated> {
         2 => Change::Ended { status: d.i64()? as i32, user_ns: d.u64()?, sys_ns: d.u64()? },
         _ => return Err(Truncated),
     })
+}
+
+impl Table {
+    /// The hosts this one is linked to.
+    fn peers(&self) -> Vec<Arc<Peer>> {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether a linked host but `except` reaches group `pgid`.
+    pub(super) fn reached(&self, pgid: i64, except: Option<&Arc<Peer>>) -> bool {
+        self.peers().iter().any(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)) && p.reaches_group(pgid))
+    }
+
+    /// Whether a linked host reaches group `pgid` of session `sid`.
+    pub(super) fn reached_in(&self, pgid: i64, sid: i64) -> bool {
+        self.peers().iter().any(|p| p.reaches_group_in(pgid, sid))
+    }
+
+    /// Whether this host is linked to one but `except`.
+    pub(super) fn has_peers(&self, except: Option<&Arc<Peer>>) -> bool {
+        self.peers().iter().any(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)))
+    }
+
+    /// A signal for a pid or thread not here: asked of the linked host
+    /// (but `except`) that reaches it, or ESRCH.
+    pub(super) fn route(&self, to: Target, info: SigInfo, except: Option<&Arc<Peer>>) -> Result<i64, i64> {
+        let id = match to {
+            Target::Pid(pid) => pid,
+            Target::Thread { tid, .. } => tid,
+            _ => return Err(errno::ESRCH),
+        };
+        let peer = self.peers().into_iter().find(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)) && p.reaches_pid(id));
+        match peer {
+            Some(peer) => peer.ask(to, info),
+            None => Err(errno::ESRCH),
+        }
+    }
+
+    /// Group `pgid`'s signal, for its members in the linked hosts (but
+    /// `except`) that reach it.
+    pub(super) fn fan_out_group(&self, pgid: i64, info: SigInfo, except: Option<&Arc<Peer>>) {
+        for p in self.peers() {
+            if except.is_none_or(|x| !Arc::ptr_eq(&p, x)) && p.reaches_group(pgid) {
+                let mut e = Encoder::default();
+                e.i64(pgid);
+                encode_info(&mut e, &info);
+                p.send(TO_GROUP, &e.0);
+            }
+        }
+    }
+
+    /// `kill(-1)`'s signal, for every linked host but `except`.
+    pub(super) fn fan_out_all(&self, except_pid: i64, info: SigInfo, except: Option<&Arc<Peer>>) {
+        for p in self.peers() {
+            if except.is_none_or(|x| !Arc::ptr_eq(&p, x)) {
+                let mut e = Encoder::default();
+                e.i64(except_pid);
+                encode_info(&mut e, &info);
+                p.send(TO_ALL, &e.0);
+            }
+        }
+    }
+
+    /// What this host reaches itself: the groups of its processes, and its
+    /// pid ranges and the pids it has from elsewhere (its moved first
+    /// process). Moved processes' stand-ins don't count: their hosts say.
+    fn own_reach(&self) -> Reach {
+        let mut r = Reach::default();
+        r.pids.extend(self.pids.ranges());
+        let s = self.state();
+        for (&pid, e) in &s.procs {
+            if matches!(&e.stand, Some(StandIn { of: Elsewhere::Host(_), .. })) {
+                continue;
+            }
+            r.groups.insert((e.pgid, e.sid));
+            if !r.has_pid(pid) {
+                r.pids.insert((pid, pid + 1));
+            }
+        }
+        r
+    }
+
+    /// Tell each linked host what this one reaches (its own, and through
+    /// its other links), if that has changed since it was last told.
+    /// (Never with the table held.)
+    pub(super) fn advertise(&self) {
+        let peers = self.peers();
+        if peers.is_empty() {
+            return;
+        }
+        let own = self.own_reach();
+        for p in &peers {
+            let mut r = own.clone();
+            for q in peers.iter().filter(|q| !Arc::ptr_eq(q, p)) {
+                r.extend(&q.reach.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+            let mut told = p.told.lock().unwrap_or_else(|e| e.into_inner());
+            if told.as_ref() != Some(&r) {
+                let mut e = Encoder::default();
+                r.encode(&mut e);
+                p.send(REACH, &e.0);
+                *told = Some(r);
+            }
+        }
+    }
+
+    fn add_peer(&self, peer: &Arc<Peer>) {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).push(peer.clone());
+    }
+
+    fn remove_peer(&self, peer: &Arc<Peer>) {
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| !Arc::ptr_eq(p, peer));
+        peer.gone();
+    }
+
+    /// What either end of a link says that both ends handle: reaches,
+    /// signals for groups, everyone, pids, and their answers. True if it
+    /// was one of those.
+    fn common_message(&self, peer: &Arc<Peer>, msg: &proto::Msg) -> bool {
+        let mut d = Decoder(&msg.body);
+        match msg.kind {
+            REACH => {
+                if let Ok(r) = Reach::decode(&mut d) {
+                    *peer.reach.lock().unwrap_or_else(|e| e.into_inner()) = r;
+                    // What the other links reach through this one changed.
+                    self.advertise();
+                }
+            }
+            TO_GROUP => {
+                if let (Ok(pgid), Ok(info)) = (d.i64(), decode_info(&mut d)) {
+                    let _ = self.deliver_from(Target::Group(pgid), info, None, Some(peer));
+                }
+            }
+            TO_ALL => {
+                if let (Ok(except), Ok(info)) = (d.i64(), decode_info(&mut d)) {
+                    let _ = self.deliver_from(Target::All { except }, info, None, Some(peer));
+                }
+            }
+            ASK => {
+                let Ok((id, to, info)) = (|| Ok::<_, Truncated>((d.u64()?, decode_target(&mut d)?, decode_info(&mut d)?)))() else { return true };
+                let r = self.deliver_from(to, info, None, Some(peer));
+                let mut e = Encoder::default();
+                e.u64(id).i64(match r {
+                    Ok(v) => v,
+                    Err(e) => -e,
+                });
+                peer.send(ANSWER, &e.0);
+            }
+            ANSWER => {
+                if let (Ok(id), Ok(r)) = (d.u64(), d.i64()) {
+                    let mut asks = peer.asks.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(slot) = asks.1.get_mut(&id) {
+                        *slot = Some(r);
+                    }
+                    peer.answered.notify_all();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
 }
 
 /// Whether `exec` names a program set to have a host of its own: by
@@ -181,7 +508,7 @@ impl Table {
             gone(sock);
             return Err(errno::EAGAIN);
         };
-        let peer = Arc::new(Peer { mac_pid, sock: Mutex::new(send) });
+        let peer = Peer::new(mac_pid, send);
         // Terminals' masters it passed stay held here as well: their last
         // reference going here would hang them up.
         let held: Vec<_> = files.into_iter().map(|(_, f)| f).filter(|f| f.tty().is_some_and(|t| t.master)).collect();
@@ -194,12 +521,24 @@ impl Table {
                 e.stand = Some(StandIn { of: Elsewhere::Host(peer.clone()), stopped: false, cmdline, comm: exec.comm.clone(), pending: Vec::new(), _held: held });
             }
         }
+        self.add_peer(&peer);
         let weak = Arc::downgrade(self);
         let spawned = linux_abi::host_threads::spawn("host link", move || from_child_host(weak, pid, peer, sock, reader));
         if spawned.is_err() {
             eprintln!("macwl-run: pid {pid}: no thread for its host's link");
         }
+        self.advertise();
         Ok(())
+    }
+
+    /// Process `pid` is in group `pgid` and session `sid` now: the host of
+    /// its parent hears of it if that's another (`remote`), and linked
+    /// hosts of what this one reaches.
+    pub(super) fn group_changed(&self, pid: i64, remote: bool, pgid: i64, sid: i64) {
+        if remote && let Some(peer) = self.parent_peer.get() {
+            peer.member(pid, pgid, sid);
+        }
+        self.advertise();
     }
 
     /// The host's first process, `pid`, moved here from the host at the
@@ -210,11 +549,13 @@ impl Table {
             e.remote_parent = true;
             e.execd = true;
         }
-        let _ = self.parent_peer.set(peer);
+        let _ = self.parent_peer.set(peer.clone());
+        self.add_peer(&peer);
         let weak = Arc::downgrade(self);
-        if linux_abi::host_threads::spawn("parent host link", move || from_parent_host(weak, link)).is_err() {
+        if linux_abi::host_threads::spawn("parent host link", move || from_parent_host(weak, peer, link)).is_err() {
             eprintln!("macwl-run: no thread for the link to the parent host");
         }
+        self.advertise();
     }
 
     /// Tell the host of `pid`'s parent, if that's another host, of its
@@ -247,14 +588,30 @@ fn from_child_host(table: Weak<Table>, pid: i64, peer: Arc<Peer>, sock: UnixStre
     loop {
         let Some(msg) = reader.recv(sock.as_raw_fd()) else { break };
         let Some(table) = table.upgrade() else { break };
-        if msg.kind == CHANGED {
-            let mut d = Decoder(&msg.body);
-            if let (Ok(p), Ok(change)) = (d.i64(), decode_change(&mut Decoder(&msg.body[8..]))) {
-                table.stand_in_changed(p, change);
+        if table.common_message(&peer, &msg) {
+            continue;
+        }
+        let mut d = Decoder(&msg.body);
+        match msg.kind {
+            CHANGED => {
+                if let (Ok(p), Ok(change)) = (d.i64(), decode_change(&mut d)) {
+                    table.stand_in_changed(p, change);
+                }
             }
+            MEMBER => {
+                if let (Ok(p), Ok(pgid), Ok(sid)) = (d.i64(), d.i64(), d.i64()) {
+                    if let Some(e) = table.state().procs.get_mut(&p) {
+                        e.pgid = pgid;
+                        e.sid = sid;
+                    }
+                    table.advertise();
+                }
+            }
+            _ => {}
         }
     }
     if let Some(table) = table.upgrade() {
+        table.remove_peer(&peer);
         let ours = {
             let s = table.state();
             s.procs.get(&pid).and_then(|e| e.stand.as_ref()).is_some_and(|m| matches!(&m.of, Elsewhere::Host(p) if Arc::ptr_eq(p, &peer)))
@@ -262,30 +619,30 @@ fn from_child_host(table: Weak<Table>, pid: i64, peer: Arc<Peer>, sock: UnixStre
         if ours {
             table.stand_in_changed(pid, Change::Ended { status: 9, user_ns: 0, sys_ns: 0 });
         }
+        table.advertise();
+    } else {
+        peer.gone();
     }
     let mut status = 0;
     while unsafe { libc::waitpid(peer.mac_pid, &mut status, 0) } < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {}
 }
 
 /// The new host's side of a link: signals and reparentings for its
-/// processes from the old host, until it goes; then the processes whose
-/// parent was there are init's.
-fn from_parent_host(table: Weak<Table>, sock: UnixStream) {
+/// processes from the old host, and what both ends say, until it goes;
+/// then the processes whose parent was there are init's.
+fn from_parent_host(table: Weak<Table>, peer: Arc<Peer>, sock: UnixStream) {
     let mut reader = proto::Reader::default();
     while let Some(msg) = reader.recv(sock.as_raw_fd()) {
         let Some(table) = table.upgrade() else { return };
+        if table.common_message(&peer, &msg) {
+            continue;
+        }
         let mut d = Decoder(&msg.body);
         match msg.kind {
             SIGNAL => {
-                let Ok((pid, has_tid, tid)) = (|| Ok::<_, Truncated>((d.i64()?, d.bool()?, d.i64()?)))() else { continue };
-                let Ok(info) = (|| {
-                    let (signo, code, from, uid, status) = (d.u64()?, d.i64()? as i32, d.i64()?, d.u64()? as u32, d.i64()? as i32);
-                    Ok::<_, Truncated>(SigInfo { uid, status, ..SigInfo::user(signo, code, from) })
-                })() else {
-                    continue;
-                };
+                let Ok((pid, has_tid, tid, info)) = (|| Ok::<_, Truncated>((d.i64()?, d.bool()?, d.i64()?, decode_info(&mut d)?)))() else { continue };
                 let to = if has_tid { Target::Thread { tgid: Some(pid), tid } } else { Target::Pid(pid) };
-                let _ = table.deliver(to, info);
+                let _ = table.deliver_from(to, info, None, Some(&peer));
             }
             REPARENT => {
                 if let (Ok(pid), Ok(ppid)) = (d.i64(), d.i64())
@@ -299,11 +656,17 @@ fn from_parent_host(table: Weak<Table>, sock: UnixStream) {
     }
     // The old host has gone: its processes can't wait for these any more.
     if let Some(table) = table.upgrade() {
-        let mut s = table.state();
-        for e in s.procs.values_mut().filter(|e| e.remote_parent) {
-            e.remote_parent = false;
-            e.ppid = 1;
+        table.remove_peer(&peer);
+        {
+            let mut s = table.state();
+            for e in s.procs.values_mut().filter(|e| e.remote_parent) {
+                e.remote_parent = false;
+                e.ppid = 1;
+            }
         }
+        table.advertise();
+    } else {
+        peer.gone();
     }
 }
 
@@ -389,7 +752,7 @@ pub fn run_adopted() -> Result<Exit, Error> {
         refuse(&sock, errno::EAGAIN);
         return Err(Error::Unexpected("no socket".into()));
     };
-    let peer = Arc::new(Peer { mac_pid: unsafe { libc::getppid() }, sock: Mutex::new(send) });
+    let peer = Peer::new(unsafe { libc::getppid() }, send);
     let loaded: Box<dyn FnOnce(Result<(), i64>)> = Box::new(move |r| match r {
         Ok(()) => drop(proto::send(answer.as_raw_fd(), ADOPTED, &[], &[])),
         Err(e) => {

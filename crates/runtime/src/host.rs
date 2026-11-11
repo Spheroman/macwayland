@@ -76,6 +76,11 @@ pub(crate) trait PidAllocator: Send + Sync {
     fn alloc(&self) -> Option<i64>;
     /// `pid` is free again.
     fn free(&self, pid: i64);
+    /// The ranges it hands pids out of (start, end), for other hosts to
+    /// know which pids are this host's.
+    fn ranges(&self) -> Vec<(i64, i64)> {
+        Vec::new()
+    }
 }
 
 /// The first pid: above macOS's (99999), so a Linux pid handed to a Mac
@@ -225,6 +230,10 @@ impl PidAllocator for RangePids {
     fn free(&self, pid: i64) {
         self.lock().used.remove(&pid);
     }
+
+    fn ranges(&self) -> Vec<(i64, i64)> {
+        self.lock().ranges.iter().map(|&s| (s, s + RANGE)).collect()
+    }
 }
 
 /// The process table of a host.
@@ -257,6 +266,9 @@ pub(crate) struct Table {
     /// The host its first process moved here from, where that process's
     /// parent is (step 9).
     parent_peer: std::sync::OnceLock<Arc<fed::Peer>>,
+    /// Every host it's linked to: its parent host, and those its
+    /// processes moved to (step 9).
+    peers: Mutex<Vec<Arc<fed::Peer>>>,
 }
 
 /// The most terminals with an agent of their own at once; Mac programs of
@@ -476,6 +488,7 @@ impl Table {
             mac_order: Mutex::new(()),
             link: std::sync::OnceLock::new(),
             parent_peer: std::sync::OnceLock::new(),
+            peers: Mutex::new(Vec::new()),
         }
     }
 
@@ -573,22 +586,26 @@ impl Table {
     /// will be told by their own means: a Mac program's with a host `kill`,
     /// step 6; another host's through the coordinator, step 9.)
     pub fn deliver(&self, to: Target, info: SigInfo) -> Result<i64, i64> {
-        self.deliver_from(to, info, None)
+        self.deliver_from(to, info, None, None)
     }
 
     /// [`Table::deliver`], for a signal pty `keyboard`'s keys raised (if
     /// they did): Mac programs whose agent has that terminal got it from
-    /// the Mac driver already.
-    fn deliver_from(&self, to: Target, info: SigInfo, keyboard: Option<u32>) -> Result<i64, i64> {
+    /// the Mac driver already. `from`: it came from that linked host,
+    /// which isn't told again (step 9).
+    fn deliver_from(&self, to: Target, info: SigInfo, keyboard: Option<u32>, from: Option<&Arc<fed::Peer>>) -> Result<i64, i64> {
         // Mac programs standing in for processes: by pid, or their Mac
         // group (which reaches the Mac processes they started too).
         let mut macs: BTreeSet<libc::pid_t> = BTreeSet::new();
-        // Processes moved to other hosts: told there.
+        // Processes moved to other hosts, by pid: told there.
         let mut remote: Vec<(Arc<fed::Peer>, i64, Option<i64>)> = Vec::new();
+        // Not here: the linked host that has it, asked.
+        let mut elsewhere: Option<Target> = None;
         let targets: Vec<(Arc<Proc>, Option<i64>)> = {
             let s = self.state();
             // A process's own (a stand-in's Mac program), or (in a group,
-            // `whole`) its Mac group's; a moved process's, by its host.
+            // `whole`) its Mac group's; a moved process's, by its host (in
+            // a group, the group's signal reaches its host anyway).
             let mut local = |pid: i64, e: &Entry, whole: bool| {
                 match e.stand.as_ref().map(|m| &m.of) {
                     Some(&Elsewhere::Mac { pid: mac, pgid, tty }) => {
@@ -599,7 +616,9 @@ impl Table {
                         return None;
                     }
                     Some(Elsewhere::Host(peer)) => {
-                        remote.push((peer.clone(), pid, None));
+                        if !whole {
+                            remote.push((peer.clone(), pid, None));
+                        }
                         return None;
                     }
                     None => {}
@@ -611,11 +630,14 @@ impl Table {
                 Target::Pid(pid) => match s.procs.get(&pid) {
                     // A zombie takes a signal and does nothing with it.
                     Some(e) => local(pid, e, false).map(|p| (p, None)).into_iter().collect(),
-                    None => return Err(errno::ESRCH),
+                    None => {
+                        elsewhere = Some(to);
+                        Vec::new()
+                    }
                 },
                 Target::Group(pgid) => {
                     let members: Vec<(&i64, &Entry)> = s.procs.iter().filter(|(_, e)| e.pgid == pgid).collect();
-                    if members.is_empty() {
+                    if members.is_empty() && !self.reached(pgid, from) {
                         return Err(errno::ESRCH);
                     }
                     members.into_iter().filter_map(|(&pid, e)| local(pid, e, true)).map(|p| (p, None)).collect()
@@ -627,30 +649,42 @@ impl Table {
                         any = true;
                         all.extend(local(pid, e, true).map(|p| (p, None)));
                     }
-                    if !any {
+                    if !any && !self.has_peers(from) {
                         return Err(errno::ESRCH);
                     }
                     all
                 }
                 Target::Thread { tgid, tid } => {
-                    let pid = if s.procs.contains_key(&tid) { tid } else { *s.tids.get(&tid).ok_or(errno::ESRCH)? };
-                    if tgid.is_some_and(|g| g != pid) {
-                        return Err(errno::ESRCH);
-                    }
-                    let e = s.procs.get(&pid).ok_or(errno::ESRCH)?;
-                    if e.stand.is_some() {
-                        local(pid, e, false);
-                        // A moved process's thread: its host knows it.
-                        if let Some(r) = remote.last_mut() {
-                            r.2 = Some(tid);
+                    let pid = if s.procs.contains_key(&tid) { Some(tid) } else { s.tids.get(&tid).copied() };
+                    match pid {
+                        None => {
+                            elsewhere = Some(to);
+                            Vec::new()
                         }
-                        Vec::new()
-                    } else {
-                        vec![(local_of(e).ok_or(errno::ESRCH)?, Some(tid))]
+                        Some(pid) => {
+                            if tgid.is_some_and(|g| g != pid) {
+                                return Err(errno::ESRCH);
+                            }
+                            let e = s.procs.get(&pid).ok_or(errno::ESRCH)?;
+                            if e.stand.is_some() {
+                                local(pid, e, false);
+                                // A moved process's thread: its host knows it.
+                                if let Some(r) = remote.last_mut() {
+                                    r.2 = Some(tid);
+                                }
+                                Vec::new()
+                            } else {
+                                vec![(local_of(e).ok_or(errno::ESRCH)?, Some(tid))]
+                            }
+                        }
                     }
                 }
             }
         };
+        // A pid (or tid) of another host's: that host says how it went.
+        if let Some(to) = elsewhere {
+            return self.route(to, info, from);
+        }
         if info.signo == 0 {
             return Ok(0);
         }
@@ -663,6 +697,12 @@ impl Table {
         }
         for (peer, pid, tid) in remote {
             peer.signal(pid, tid, info);
+        }
+        // A group or everyone: the linked hosts that reach them too.
+        match to {
+            Target::Group(pgid) => self.fan_out_group(pgid, info, from),
+            Target::All { except } => self.fan_out_all(except, info, from),
+            _ => {}
         }
         for (proc, tid) in targets {
             match info.signo {
@@ -944,7 +984,7 @@ impl Table {
         let (r, quoted) = linux_abi::syscall::tty::write_keys(master, data, &keys, quoted, |sig| {
             // The group in the foreground as the byte is read.
             if let Some((fg, _)) = self.foreground(n) {
-                let _ = self.deliver_from(Target::Group(fg), SigInfo::user(sig, SI_KERNEL, 0), Some(n));
+                let _ = self.deliver_from(Target::Group(fg), SigInfo::user(sig, SI_KERNEL, 0), Some(n), None);
             }
         });
         if let Some(tty) = self.state().ttys.get_mut(&n) {
@@ -1332,10 +1372,15 @@ impl Kernel for TableKernel {
         if target.sid == pid {
             return Err(errno::EPERM);
         }
-        if pgid != pid && !s.procs.values().any(|e| e.pgid == pgid && e.sid == my_sid) {
+        // (A group in the session may have its members in another host.)
+        if pgid != pid && !s.procs.values().any(|e| e.pgid == pgid && e.sid == my_sid) && !table.reached_in(pgid, my_sid) {
             return Err(errno::EPERM);
         }
-        s.procs.get_mut(&pid).unwrap().pgid = pgid;
+        let e = s.procs.get_mut(&pid).unwrap();
+        e.pgid = pgid;
+        let (remote, sid) = (e.remote_parent, e.sid);
+        drop(s);
+        table.group_changed(pid, remote, pgid, sid);
         Ok(0)
     }
 
@@ -1356,6 +1401,9 @@ impl Kernel for TableKernel {
         me.pgid = p.pid;
         // A new session has no controlling terminal.
         me.ctty = None;
+        let remote = me.remote_parent;
+        drop(s);
+        table.group_changed(p.pid, remote, p.pid, p.pid);
         Ok(p.pid)
     }
 
@@ -1385,7 +1433,10 @@ impl Kernel for TableKernel {
             p => Which::Pid(p),
         };
         let want = Want { exited: true, stopped: options & WUNTRACED != 0, continued: options & WCONTINUED != 0, nohang: options & WNOHANG != 0, nowait: false };
-        let Some((pid, status, cpu)) = self.table()?.wait(p, t, which, want)? else { return Ok(None) };
+        let table = self.table()?;
+        let Some((pid, status, cpu)) = table.wait(p, t, which, want)? else { return Ok(None) };
+        // A group may have gone with the child reaped.
+        table.advertise();
         Ok(Some(Waited { pid, status, rusage: rusage_of(cpu, 0) }))
     }
 
@@ -1407,7 +1458,9 @@ impl Kernel for TableKernel {
             nohang: options & WNOHANG != 0,
             nowait: options & WNOWAIT != 0,
         };
-        let Some((pid, status, _)) = self.table()?.wait(p, t, which, want)? else { return Ok(None) };
+        let table = self.table()?;
+        let Some((pid, status, _)) = table.wait(p, t, which, want)? else { return Ok(None) };
+        table.advertise();
         let (code, status) = child_info(status);
         Ok(Some(ChildInfo { pid, uid: unsafe { libc::getuid() }, code, status }))
     }
@@ -1962,6 +2015,8 @@ pub(crate) fn fork<'scope, 'env>(
         (me.map_or(pid, |e| e.pgid), me.map_or(pid, |e| e.sid), me.and_then(|e| e.ctty))
     };
     table.insert(pid, proc.abi.pid, pgid, sid, ctty, child.clone(), f.exit_signal);
+    // Its pid is one linked hosts reach now.
+    table.advertise();
     ctx.x[0] = 0;
     if f.stack != 0 {
         ctx.sp = f.stack;
@@ -2203,6 +2258,8 @@ impl Table {
             parent.abi.post(None, info);
         }
     }
+    // A group may have gone with it.
+    table.advertise();
     if table.live.fetch_sub(1, Ordering::AcqRel) == 1 {
         match table.service.get() {
             // A serving host waits a little for more clients first.
