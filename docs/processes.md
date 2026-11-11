@@ -1676,12 +1676,31 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
      codes, 143 for SIGTERM by pid, 137 for SIGKILL from inside, `$PPID`,
      STOP and CONT seen by `jobs`, a refused load, the hosts file, its
      parent's host killed) and `a_moved_hosts_death_is_a_sigkill`.
-   - Next: 9c (groups and sessions spanning hosts: `kill(-pgid)` and
-     `kill(-1)` across links, each host telling its links which groups it
-     has members of; `setpgid`/`setsid` there), 9d (terminals and job
-     control with remote members), 9e (a coordinator that restarts),
-     9f (`/proc` and `ps -ef` listing other hosts' processes; the session
-     test in foot).
+   - **9c, groups and signals across hosts** (done, 2026-11-10). Linked
+     hosts form a tree (a link is made only by a move, from the host
+     moved from), so a signal for many is sent on along it, never back.
+     Each host tells each of its links what it reaches (`Reach`: the
+     groups, with their sessions, that have members there or beyond, and
+     the pid ranges there or beyond), its own and through its other
+     links, whenever that changes (a fork, an end, a reap, `setpgid`,
+     `setsid`, a link coming or going; the coordinator plays no part).
+     `Table::deliver_from` routes on it: a group's signal reaches its
+     local members and goes on to the links that reach the group (a
+     moved process's stand-in isn't signalled itself, its host being one
+     of those), and `kill(-pgid)` is ESRCH only when no host has the
+     group; `kill(-1)` goes on to every link; a pid or tid that isn't here
+     is asked of the link that reaches its range (`ASK`, answered: the
+     result, ESRCH included, is the remote host's). A moved process's
+     `setpgid` or `setsid` in its new host tells the old one
+     (`MEMBER`), whose stand-in follows; `setpgid` into a group whose
+     members are all in another host of the session works. Not yet:
+     orphaned groups counted across hosts, `getpgid`/`getsid` of another
+     host's process. Test `signals_across_hosts` (`kill -TERM -$pgid` of
+     a job half moved; from a moved process: its parent by pid, a pid no
+     host has, `kill 0`, `kill -1`).
+   - Next: 9d (terminals and job control with remote members), 9e (a
+     coordinator that restarts), 9f (`/proc` and `ps -ef` listing other
+     hosts' processes; the session test in foot).
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's
