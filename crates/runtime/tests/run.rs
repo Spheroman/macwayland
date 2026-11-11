@@ -1680,6 +1680,62 @@ fn signals_across_hosts() {
     assert!(start.elapsed() < std::time::Duration::from_secs(15), "{:?}: a sleep wasn't ended", start.elapsed());
 }
 
+/// Terminals and job control with members in another host (docs/
+/// processes.md, step 9d), bash on a terminal (`macwl-run` relaying it): a
+/// pipeline across hosts stopped with Ctrl-Z, `jobs`, `fg`, ended with
+/// Ctrl-C; a moved `cat &` stopped by SIGTTIN reading from the background,
+/// then reading in the foreground; and a moved interactive bash doing job
+/// control on the terminal of the host it came from (its `tcsetpgrp`
+/// asked of that host): Ctrl-Z, `fg`, Ctrl-C.
+#[test]
+#[ignore = "needs nix"]
+fn job_control_across_hosts() {
+    use std::os::fd::AsRawFd;
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::PathBuf::from(linux_package("coreutils")).join("bin");
+    let type_in = |master: &OwnedFd, s: &str| assert_eq!(unsafe { libc::write(master.as_raw_fd(), s.as_ptr().cast(), s.len()) }, s.len() as isize);
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let (mut child, master) = in_a_terminal(&[bash.as_os_str(), "--norc".as_ref(), "-i".as_ref()], &[("HOME", &home)], 24, 80);
+    let mut seen = Vec::new();
+    // Each step, once the prompt says the last one is done.
+    let mut at = 0;
+    let mut step = |s: &str, want: &str, at: &mut usize, seen: &mut Vec<u8>| {
+        type_in(&master, s);
+        *at = read_until(&master, seen, *at, want);
+    };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    step(&format!("export PATH={}; PS1='P> '\n", cu.display()), "P> ", &mut at, &mut seen);
+    step("MACWL_NEW_HOST=1 sleep 30 | cat\n", "cat", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    step("\x1a", "Stopped", &mut at, &mut seen);
+    step("jobs\n", "Stopped", &mut at, &mut seen);
+    step("fg\n", "sleep 30 | cat", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    step("\x03", "P> ", &mut at, &mut seen);
+    step("echo st $?\n", "st 130", &mut at, &mut seen);
+    step("MACWL_NEW_HOST=1 cat &\n", "P> ", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    step("jobs\n", "Stopped", &mut at, &mut seen);
+    step("fg\n", "cat", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    step("hello\n", "hello", &mut at, &mut seen);
+    step("", "hello", &mut at, &mut seen);
+    step("\x04", "P> ", &mut at, &mut seen);
+    step("echo st $?\n", "st 0", &mut at, &mut seen);
+    step(&format!("MACWL_NEW_HOST=1 {} --norc -i\n", bash.display()), "$ ", &mut at, &mut seen);
+    step("PS1='M> '; sleep 30\n", "sleep 30", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    step("\x1a", "Stopped", &mut at, &mut seen);
+    step("fg\n", "sleep 30", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    step("\x03", "M> ", &mut at, &mut seen);
+    step("exit\n", "P> ", &mut at, &mut seen);
+    step("echo back $?\n", "back 130", &mut at, &mut seen);
+    type_in(&master, "exit\n");
+    let st = child.wait().unwrap();
+    assert!(st.success(), "{st:?}: {}", String::from_utf8_lossy(&seen));
+}
+
 /// A moved process's host dying ends it in its parent's eyes as killed by
 /// SIGKILL (docs/processes.md, step 9, "A host's failure").
 #[test]
