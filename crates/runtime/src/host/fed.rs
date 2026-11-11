@@ -24,7 +24,7 @@
 //! process's parent has gone, and it's the new host's init's.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{ffi::OsStrExt, net::UnixStream},
@@ -73,6 +73,9 @@ const TO_ALL: u8 = 34;
 const ASK: u8 = 35;
 /// The answer: the signal's result (or the errno, negated).
 const ANSWER: u8 = 36;
+/// Either way: make a process group a terminal's foreground (`tcsetpgrp`
+/// from another host than the terminal's), answered.
+const ASK_FOREGROUND: u8 = 37;
 
 /// How long the old host waits for the new one's answer to a hand-off.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
@@ -80,12 +83,15 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 const ASK_WITHIN: Duration = Duration::from_secs(2);
 
 /// What a host reaches through a link: the process groups (with their
-/// sessions) that have members there or beyond, and the pids (ranges,
-/// `[start, end)`) that are processes and threads there or beyond.
+/// sessions) that have members there or beyond, the pids (ranges,
+/// `[start, end)`) that are processes and threads there or beyond, and
+/// the terminals whose job control is there or beyond: each pty's
+/// session and foreground group (-1 for none).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Reach {
     pub groups: BTreeSet<(i64, i64)>,
     pub pids: BTreeSet<(i64, i64)>,
+    pub ttys: BTreeMap<u32, (i64, i64)>,
 }
 
 impl Reach {
@@ -96,6 +102,10 @@ impl Reach {
                 e.i64(a).i64(b);
             }
         }
+        e.u64(self.ttys.len() as u64);
+        for (&n, &(sid, pgrp)) in &self.ttys {
+            e.u64(n as u64).i64(sid).i64(pgrp);
+        }
     }
 
     fn decode(d: &mut Decoder) -> Result<Reach, Truncated> {
@@ -104,6 +114,9 @@ impl Reach {
             for _ in 0..d.count(16)? {
                 set.insert((d.i64()?, d.i64()?));
             }
+        }
+        for _ in 0..d.count(24)? {
+            r.ttys.insert(d.u64()? as u32, (d.i64()?, d.i64()?));
         }
         Ok(r)
     }
@@ -115,6 +128,9 @@ impl Reach {
     fn extend(&mut self, other: &Reach) {
         self.groups.extend(other.groups.iter().copied());
         self.pids.extend(other.pids.iter().copied());
+        for (&n, &t) in &other.ttys {
+            self.ttys.entry(n).or_insert(t);
+        }
     }
 }
 
@@ -160,6 +176,22 @@ impl Peer {
 
     /// `to` (a pid or a thread there) gets `info`: how that went.
     fn ask(&self, to: Target, info: SigInfo) -> Result<i64, i64> {
+        let mut e = Encoder::default();
+        encode_target(&mut e, to);
+        encode_info(&mut e, &info);
+        self.request(ASK, &e.0)
+    }
+
+    /// Pty `n`'s foreground is group `pgrp` (asked by a process of session
+    /// `sid`): how that went.
+    pub fn ask_foreground(&self, n: u32, pgrp: i64, sid: i64) -> Result<i64, i64> {
+        let mut e = Encoder::default();
+        e.u64(n as u64).i64(pgrp).i64(sid);
+        self.request(ASK_FOREGROUND, &e.0)
+    }
+
+    /// A request (`kind`, its id then `body`), and its answer.
+    fn request(&self, kind: u8, body: &[u8]) -> Result<i64, i64> {
         let id = {
             let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
             asks.0 += 1;
@@ -169,9 +201,8 @@ impl Peer {
         };
         let mut e = Encoder::default();
         e.u64(id);
-        encode_target(&mut e, to);
-        encode_info(&mut e, &info);
-        self.send(ASK, &e.0);
+        e.0.extend_from_slice(body);
+        self.send(kind, &e.0);
         let deadline = std::time::Instant::now() + ASK_WITHIN;
         let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -236,6 +267,10 @@ impl Peer {
 
     fn reaches_pid(&self, pid: i64) -> bool {
         self.reach.lock().unwrap_or_else(|e| e.into_inner()).has_pid(pid)
+    }
+
+    fn tty(&self, n: u32) -> Option<(i64, i64)> {
+        self.reach.lock().unwrap_or_else(|e| e.into_inner()).ttys.get(&n).copied()
     }
 }
 
@@ -315,13 +350,27 @@ impl Table {
         }
     }
 
+    /// Pty `n`'s job control, if it's another host's: its session and
+    /// foreground group (-1: none), as its host last said.
+    pub(super) fn remote_tty(&self, n: u32) -> Option<(i64, Option<i64>)> {
+        self.peers().iter().find_map(|p| p.tty(n)).map(|(sid, pgrp)| (sid, (pgrp >= 0).then_some(pgrp)))
+    }
+
+    /// `tcsetpgrp` on pty `n`, another host's: asked of it.
+    pub(super) fn remote_foreground(&self, n: u32, pgrp: i64, sid: i64) -> Result<i64, i64> {
+        match self.peers().into_iter().find(|p| p.tty(n).is_some()) {
+            Some(peer) => peer.ask_foreground(n, pgrp, sid),
+            None => Err(errno::ENOTTY),
+        }
+    }
+
     /// Group `pgid`'s signal, for its members in the linked hosts (but
-    /// `except`) that reach it.
-    pub(super) fn fan_out_group(&self, pgid: i64, info: SigInfo, except: Option<&Arc<Peer>>) {
+    /// `except`) that reach it; `keyboard`: pty that raised it.
+    pub(super) fn fan_out_group(&self, pgid: i64, info: SigInfo, keyboard: Option<u32>, except: Option<&Arc<Peer>>) {
         for p in self.peers() {
             if except.is_none_or(|x| !Arc::ptr_eq(&p, x)) && p.reaches_group(pgid) {
                 let mut e = Encoder::default();
-                e.i64(pgid);
+                e.i64(pgid).bool(keyboard.is_some()).u64(keyboard.unwrap_or(0) as u64);
                 encode_info(&mut e, &info);
                 p.send(TO_GROUP, &e.0);
             }
@@ -347,6 +396,11 @@ impl Table {
         let mut r = Reach::default();
         r.pids.extend(self.pids.ranges());
         let s = self.state();
+        for (&n, t) in &s.ttys {
+            if let Some(sid) = t.sid {
+                r.ttys.insert(n, (sid, t.pgrp.unwrap_or(-1)));
+            }
+        }
         for (&pid, e) in &s.procs {
             if matches!(&e.stand, Some(StandIn { of: Elsewhere::Host(_), .. })) {
                 continue;
@@ -406,8 +460,8 @@ impl Table {
                 }
             }
             TO_GROUP => {
-                if let (Ok(pgid), Ok(info)) = (d.i64(), decode_info(&mut d)) {
-                    let _ = self.deliver_from(Target::Group(pgid), info, None, Some(peer));
+                if let Ok((pgid, kb, n, info)) = (|| Ok::<_, Truncated>((d.i64()?, d.bool()?, d.u64()?, decode_info(&mut d)?)))() {
+                    let _ = self.deliver_from(Target::Group(pgid), info, kb.then_some(n as u32), Some(peer));
                 }
             }
             TO_ALL => {
@@ -418,6 +472,16 @@ impl Table {
             ASK => {
                 let Ok((id, to, info)) = (|| Ok::<_, Truncated>((d.u64()?, decode_target(&mut d)?, decode_info(&mut d)?)))() else { return true };
                 let r = self.deliver_from(to, info, None, Some(peer));
+                let mut e = Encoder::default();
+                e.u64(id).i64(match r {
+                    Ok(v) => v,
+                    Err(e) => -e,
+                });
+                peer.send(ANSWER, &e.0);
+            }
+            ASK_FOREGROUND => {
+                let Ok((id, n, pgrp, sid)) = (|| Ok::<_, Truncated>((d.u64()?, d.u64()? as u32, d.i64()?, d.i64()?)))() else { return true };
+                let r = self.set_foreground(n, pgrp, sid, Some(peer));
                 let mut e = Encoder::default();
                 e.u64(id).i64(match r {
                     Ok(v) => v,

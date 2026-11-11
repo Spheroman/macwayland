@@ -700,7 +700,7 @@ impl Table {
         }
         // A group or everyone: the linked hosts that reach them too.
         match to {
-            Target::Group(pgid) => self.fan_out_group(pgid, info, from),
+            Target::Group(pgid) => self.fan_out_group(pgid, info, keyboard, from),
             Target::All { except } => self.fan_out_all(except, info, from),
             _ => {}
         }
@@ -932,6 +932,7 @@ impl Table {
             }
             leaders
         };
+        self.advertise();
         for pid in leaders {
             for sig in [SIGHUP, SIGCONT] {
                 let _ = self.deliver(Target::Pid(pid), SigInfo::user(sig, SI_KERNEL, 0));
@@ -1023,6 +1024,44 @@ impl Table {
         if let Some(pgid) = pgid {
             self.signal_group(pgid, SIGCONT);
         }
+    }
+
+    /// `tcsetpgrp` on pty `n` by a process of session `sid`: group `pgrp`
+    /// is its foreground, if `n` is the session's terminal and the group
+    /// is one of the session's (here or in a linked host). Another host's
+    /// terminal is that host's to change (asked of it, but not of `from`,
+    /// which asked).
+    pub(super) fn set_foreground(&self, n: u32, pgrp: i64, sid: i64, from: Option<&Arc<fed::Peer>>) -> Result<i64, i64> {
+        {
+            let mut s = self.state();
+            let Some(tty_sid) = s.ttys.get(&n).map(|t| t.sid) else {
+                drop(s);
+                return match self.remote_tty(n) {
+                    Some((owner_sid, _)) if owner_sid == sid && from.is_none() => self.remote_foreground(n, pgrp, sid),
+                    _ => Err(errno::ENOTTY),
+                };
+            };
+            if tty_sid != Some(sid) {
+                return Err(errno::ENOTTY);
+            }
+            // The group's session: a member's, else (as Linux) that of the
+            // process with that pid; or a linked host's group's.
+            let local = s.procs.values().find(|e| e.pgid == pgrp).or_else(|| s.procs.get(&pgrp)).map(|e| e.sid);
+            match local {
+                Some(g) if g != sid => return Err(errno::EPERM),
+                Some(_) => {}
+                None if self.reached_in(pgrp, sid) => {}
+                None if self.reached(pgrp, None) => return Err(errno::EPERM),
+                None => return Err(errno::ESRCH),
+            }
+            s.ttys.entry(n).or_default().pgrp = Some(pgrp);
+        }
+        // Linked hosts with members of its session hear of it before the
+        // caller goes on (and continues the job, say), on the links its
+        // signals take too; so do its Mac programs.
+        self.advertise();
+        self.follow_tty(n);
+        Ok(0)
     }
 
     /// The foreground group of pty `n`, if a session has it.
@@ -1477,7 +1516,8 @@ impl Kernel for TableKernel {
         if !id.master && s.procs.get(&p.pid).and_then(|e| e.ctty) != Some(id.n) {
             return Err(errno::ENOTTY);
         }
-        Ok(s.ttys.get(&id.n).and_then(|t| t.pgrp).unwrap_or(0))
+        // (Another host's terminal: as that host last said.)
+        Ok(s.ttys.get(&id.n).and_then(|t| t.pgrp).or_else(|| table.remote_tty(id.n).and_then(|t| t.1)).unwrap_or(0))
     }
 
     fn tcsetpgrp(&self, p: &Process, t: &Thread, file: &OpenFile, pgrp: i64) -> Result<i64, i64> {
@@ -1486,27 +1526,18 @@ impl Kernel for TableKernel {
         // then goes ahead).
         self.tty_access(p, t, file, TtyOp::Change).map_err(|e| if e == errno::EIO { errno::ENOTTY } else { e })?;
         let table = self.table()?;
-        let mut s = table.state();
-        let me = s.procs.get(&p.pid).ok_or(errno::ESRCH)?;
-        let (my_sid, ctty) = (me.sid, me.ctty);
-        if ctty != Some(id.n) || s.ttys.get(&id.n).and_then(|t| t.sid) != Some(my_sid) {
-            return Err(errno::ENOTTY);
-        }
+        let my_sid = {
+            let s = table.state();
+            let me = s.procs.get(&p.pid).ok_or(errno::ESRCH)?;
+            if me.ctty != Some(id.n) {
+                return Err(errno::ENOTTY);
+            }
+            me.sid
+        };
         if pgrp < 0 {
             return Err(errno::EINVAL);
         }
-        // The group's session: a member's, else (as Linux) that of the
-        // process with that pid.
-        let sid = s.procs.values().find(|e| e.pgid == pgrp).or_else(|| s.procs.get(&pgrp)).map(|e| e.sid).ok_or(errno::ESRCH)?;
-        if sid != my_sid {
-            return Err(errno::EPERM);
-        }
-        s.ttys.entry(id.n).or_default().pgrp = Some(pgrp);
-        drop(s);
-        // Its Mac programs' foreground follows, before the caller goes on
-        // (and continues the job, say).
-        table.follow_tty(id.n);
-        Ok(0)
+        table.set_foreground(id.n, pgrp, my_sid, None)
     }
 
     fn tcgetsid(&self, p: &Process, file: &OpenFile) -> Result<i64, i64> {
@@ -1516,7 +1547,7 @@ impl Kernel for TableKernel {
         if !id.master && s.procs.get(&p.pid).and_then(|e| e.ctty) != Some(id.n) {
             return Err(errno::ENOTTY);
         }
-        s.ttys.get(&id.n).and_then(|t| t.sid).ok_or(errno::ENOTTY)
+        s.ttys.get(&id.n).and_then(|t| t.sid).or_else(|| table.remote_tty(id.n).map(|t| t.0)).ok_or(errno::ENOTTY)
     }
 
     fn set_ctty(&self, p: &Process, file: &OpenFile, _steal: bool) -> Result<i64, i64> {
@@ -1539,6 +1570,8 @@ impl Kernel for TableKernel {
             return Err(errno::EPERM);
         }
         Table::set_ctty(&mut s, p.pid, id.n);
+        drop(s);
+        table.advertise();
         Ok(0)
     }
 
@@ -1557,6 +1590,7 @@ impl Kernel for TableKernel {
             }
             signals
         };
+        table.advertise();
         for (pgid, sig) in signals {
             table.signal_group(pgid, sig);
         }
@@ -1609,7 +1643,12 @@ impl Kernel for TableKernel {
             if me.ctty != Some(id.n) {
                 return Ok(true);
             }
-            match s.ttys.get(&id.n).and_then(|t| t.pgrp) {
+            // (Another host's terminal: as that host last said.)
+            let fg = match s.ttys.get(&id.n) {
+                Some(t) => t.pgrp,
+                None => table.remote_tty(id.n).and_then(|t| t.1),
+            };
+            match fg {
                 Some(fg) if fg != me.pgid => me.pgid,
                 _ => return Ok(true),
             }
