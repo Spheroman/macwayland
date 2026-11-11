@@ -6,8 +6,8 @@ terminals and job control included, `macwl-run`s from outside joining a
 host as clients, and Mac programs as processes of their own standing in
 for the Linux processes that ran them; one VM the default); step 7 done
 (2026-11-03: shared windows and futexes across processes); step 8 done
-(2026-11-10: 1:1 mode gone, one VM the only mode). Step 9 is next.
-ROADMAP items 6 and 13;
+(2026-11-10: 1:1 mode gone, one VM the only mode); step 9 done
+(2026-11-10: federated hosts). ROADMAP items 6 and 13;
 extends the thread
 scheduler (`docs/mn-threads.md`) one level up, from the threads of a
 process to the processes of a session.
@@ -1716,8 +1716,38 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
      hosts stopped with Ctrl-Z, `jobs`, `fg`, Ctrl-C; a moved `cat &`
      stopped by SIGTTIN, then `fg` and read; a moved interactive bash's
      own job control on the other host's terminal.
-   - Next: 9e (a coordinator that restarts), 9f (`/proc` and `ps -ef`
-     listing other hosts' processes; the session test in foot).
+   - **9e, failures** (done, 2026-11-10). A moved process's host dying
+     (9b) and its parent's host dying (9b) were done with the links; with
+     those direct, the coordinator holds nothing a host needs to carry
+     on, and a new one is linked to by every host as it starts (9a's
+     link threads). `ps_all_lists_every_host` kills the coordinator and
+     lists again.
+   - **9f, `/proc` across hosts** (done, 2026-11-10). `Kernel::pids` is
+     every process of the linked hosts (`LIST_PIDS`, asked along the
+     links: each host answers with its own and its other links'), and
+     `proc_status` of another host's process is asked of the link that
+     reaches its pid (`ASK_STATUS`; the answer carries its command line
+     and resident size, read from its memory there, as for a Mac
+     program's stand-in), so `ps -ef` and `top` in either host list both,
+     each process with its real parent. A moved process's stand-in is
+     its host's to describe. Not another host's process's memory:
+     `environ`, `maps` and `fd/` of one are ESRCH. Test `session_federates`:
+     the session in foot, a pipeline across hosts stopped with Ctrl-Z,
+     `jobs`, `fg`, Ctrl-C; a moved background job that `ps -ef` in foot's
+     host lists; `kill %1` (143).
+
+   Step 9 done (2026-11-10). Not done, left for when something needs it:
+   orphaned groups counted across hosts (a group whose only link to its
+   session is in another host is taken as orphaned there, as
+   `remote_parent` keeps it from being for the moved process itself);
+   `getpgid`/`getsid` of another host's process; another host's process's
+   memory in `/proc`; pending signals across the move (dropped, as an
+   exec would keep them); epoll sets, eventfds, timerfds, signalfds,
+   inotify instances and pidfds across the move (not passed); a
+   `tcsetpgrp` that arrives at the terminal's host by two links (the
+   first answers). The hand-off blocks the exec'ing thread's CPU for the
+   ~4 ms the new host takes to start. Runtime 39 unit + 63 integration,
+   linux-abi 73.
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's

@@ -296,6 +296,19 @@ from a static Linux binary.
    process) and the Mac program that replaced its process (`exec_host`).
    A `macwl-run` without `MACWL_HOST` is the host of its program alone,
    the isolated mode. Every test runs in the one mode.
+   Step 9 done (2026-11-10): **federated hosts**. A program set to have a
+   host of its own (`MACWL_NEW_HOST=1`, or `~/.config/macwl/hosts`) moves
+   to one at its `execve` (~4 ms) and stays an ordinary process of its
+   session: `wait`, exit and killed-by-signal statuses, signals by pid,
+   group and `-1`, groups and sessions spanning hosts, job control on the
+   other host's terminal (Ctrl-C, Ctrl-Z, `bg`, `fg`, SIGTTIN), `ps -ef`
+   in either host listing both, and either host's death handled (the
+   moved process killed, or reparented to its host's init). Hosts talk
+   over direct links (the hand-off's socket, a tree), each telling the
+   others what groups, pids and terminals it reaches; a per-user
+   coordinator (`macwl-run --coordinator`, started on demand, linked to
+   by every host) lists every host's processes (`macwl-run --ps
+   --all`).
 7. **Signals.** Done: handlers run, in Linux arm64 signal frames on the guest
    stack (siginfo, ucontext with registers and FP/SIMD state, frame record),
    undone by `rt_sigreturn`; handlers without SA_RESTORER (glibc's) return
