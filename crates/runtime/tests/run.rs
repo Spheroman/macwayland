@@ -1647,6 +1647,39 @@ fn moved_to_a_host_of_its_own() {
     assert_eq!(ppids[1], "1", "{seen:?}");
 }
 
+/// Process groups across hosts (docs/processes.md, step 9c): a job with a
+/// local process and a moved one in it, `kill -TERM -$pgid` from the
+/// parent's host ending both; a moved process signalling its parent by
+/// pid (in the other host), a pid no host has (ESRCH), and its own group
+/// with `kill 0` (reaching members in the other host); and `kill -1` from
+/// a moved process reaching the parent's host.
+#[test]
+#[ignore = "needs nix"]
+fn signals_across_hosts() {
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::Path::new(&linux_package("coreutils")).join("bin");
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!(
+        "set -m; export PATH={cu}; d={d}
+         {{ sleep 30 & MACWL_NEW_HOST=1 sleep 30 & wait; }} & g=$!; sleep 0.5; kill -TERM -$g; echo kill $?; wait $g; echo group $?
+         trap 'echo usr1 > $d/usr1' USR1
+         MACWL_NEW_HOST=1 {bash} -c 'kill -USR1 $PPID; echo parent $?; kill -0 4000000 2>/dev/null; echo none $?'
+         sleep 0.3; cat $d/usr1
+         {{ trap 'echo sub got term; exit 3' TERM; sleep 30 & MACWL_NEW_HOST=1 {bash} -c 'sleep 0.3; kill -TERM 0'; wait; }} & g=$!; wait $g; echo own group $?
+         MACWL_NEW_HOST=1 {bash} -c 'trap \"\" TERM; kill -TERM -1; echo all $?'; sleep 5; echo not reached",
+        cu = cu.display(),
+        d = dir.path().display(),
+        bash = bash.display(),
+    );
+    let start = std::time::Instant::now();
+    let out = macwl_run().arg(&bash).arg("-c").arg(&script).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "kill 0\ngroup 143\nparent 0\nnone 1\nusr1\nsub got term\nown group 3\nall 0\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // kill -1 ended the shell too.
+    assert_eq!(out.status.code(), Some(128 + 15), "{out:?}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(15), "{:?}: a sleep wasn't ended", start.elapsed());
+}
+
 /// A moved process's host dying ends it in its parent's eyes as killed by
 /// SIGKILL (docs/processes.md, step 9, "A host's failure").
 #[test]
