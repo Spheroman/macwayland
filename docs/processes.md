@@ -1698,9 +1698,26 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
      host's process. Test `signals_across_hosts` (`kill -TERM -$pgid` of
      a job half moved; from a moved process: its parent by pid, a pid no
      host has, `kill 0`, `kill -1`).
-   - Next: 9d (terminals and job control with remote members), 9e (a
-     coordinator that restarts), 9f (`/proc` and `ps -ef` listing other
-     hosts' processes; the session test in foot).
+   - **9d, terminals and job control across hosts** (done, 2026-11-10).
+     Keyboard signals needed nothing new: they're a group's signal (9c),
+     which goes on to the hosts with members, the pty raising them passed
+     along so Mac programs whose agent has it aren't signalled twice.
+     A terminal's job control stays its host's: `Reach` carries each
+     pty's session and foreground group from the host that has it, so a
+     moved process's background check (SIGTTIN, SIGTTOU, EIO for an
+     orphaned group), `tcgetpgrp` and `tcgetsid` answer from that, and
+     `tcsetpgrp` from another host is asked of the terminal's
+     (`ASK_FOREGROUND`, `Table::set_foreground`), which accepts a group
+     of the session's in any host. The foreground changing is advertised
+     at once, on the same links the job's SIGCONT then takes, so the new
+     foreground is known there first. (This is the doc's cache with a
+     generation, pushed rather than pulled.) Test
+     `job_control_across_hosts`: bash on a terminal, a pipeline across
+     hosts stopped with Ctrl-Z, `jobs`, `fg`, Ctrl-C; a moved `cat &`
+     stopped by SIGTTIN, then `fg` and read; a moved interactive bash's
+     own job control on the other host's terminal.
+   - Next: 9e (a coordinator that restarts), 9f (`/proc` and `ps -ef`
+     listing other hosts' processes; the session test in foot).
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's
