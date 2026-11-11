@@ -35,7 +35,7 @@ use std::{
 
 use linux_abi::{
     errno,
-    syscall::{Exec, SigInfo, Thread},
+    syscall::{Exec, ProcStatus, SigInfo, Thread},
     wire::{Decoder, Encoder, Truncated},
     Process,
 };
@@ -76,6 +76,12 @@ const ANSWER: u8 = 36;
 /// Either way: make a process group a terminal's foreground (`tcsetpgrp`
 /// from another host than the terminal's), answered.
 const ASK_FOREGROUND: u8 = 37;
+/// Either way: the pids of the processes there and beyond (for `/proc`),
+/// answered.
+const LIST_PIDS: u8 = 38;
+/// Either way: what's known of a process there or beyond (for `/proc`),
+/// answered.
+const ASK_STATUS: u8 = 39;
 
 /// How long the old host waits for the new one's answer to a hand-off.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
@@ -144,8 +150,8 @@ pub(crate) struct Peer {
     reach: Mutex<Reach>,
     /// What this host last told it it reaches.
     told: Mutex<Option<Reach>>,
-    /// Signals asked of it, by id: their answers once they come.
-    asks: Mutex<(u64, HashMap<u64, Option<i64>>)>,
+    /// Requests made of it, by id: their answers once they come.
+    asks: Mutex<(u64, HashMap<u64, Option<Vec<u8>>>)>,
     answered: Condvar,
 }
 
@@ -179,7 +185,7 @@ impl Peer {
         let mut e = Encoder::default();
         encode_target(&mut e, to);
         encode_info(&mut e, &info);
-        self.request(ASK, &e.0)
+        result_of(self.request(ASK, &e.0))
     }
 
     /// Pty `n`'s foreground is group `pgrp` (asked by a process of session
@@ -187,11 +193,34 @@ impl Peer {
     pub fn ask_foreground(&self, n: u32, pgrp: i64, sid: i64) -> Result<i64, i64> {
         let mut e = Encoder::default();
         e.u64(n as u64).i64(pgrp).i64(sid);
-        self.request(ASK_FOREGROUND, &e.0)
+        result_of(self.request(ASK_FOREGROUND, &e.0))
     }
 
-    /// A request (`kind`, its id then `body`), and its answer.
-    fn request(&self, kind: u8, body: &[u8]) -> Result<i64, i64> {
+    /// The pids there and beyond.
+    fn list_pids(&self) -> Vec<i64> {
+        let Some(body) = self.request(LIST_PIDS, &[]) else { return Vec::new() };
+        let mut d = Decoder(&body);
+        (|| {
+            let mut pids = Vec::new();
+            for _ in 0..d.count(8)? {
+                pids.push(d.i64()?);
+            }
+            Ok::<_, Truncated>(pids)
+        })()
+        .unwrap_or_default()
+    }
+
+    /// What's known there of `pid`.
+    fn status(&self, pid: i64) -> Result<ProcStatus, i64> {
+        let mut e = Encoder::default();
+        e.i64(pid);
+        let body = self.request(ASK_STATUS, &e.0).ok_or(errno::ESRCH)?;
+        decode_status(&mut Decoder(&body)).map_err(|_| errno::ESRCH)?
+    }
+
+    /// A request (`kind`, its id then `body`), and its answer (None: none
+    /// came in time, or the link went).
+    fn request(&self, kind: u8, body: &[u8]) -> Option<Vec<u8>> {
         let id = {
             let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
             asks.0 += 1;
@@ -206,15 +235,13 @@ impl Peer {
         let deadline = std::time::Instant::now() + ASK_WITHIN;
         let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(Some(r)) = asks.1.get(&id) {
-                let r = *r;
-                asks.1.remove(&id);
-                return if r < 0 { Err(-r) } else { Ok(r) };
+            if let Some(Some(_)) = asks.1.get(&id) {
+                return asks.1.remove(&id).flatten().filter(|b| !b.is_empty());
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 asks.1.remove(&id);
-                return Err(errno::ESRCH);
+                return None;
             }
             asks = self.answered.wait_timeout(asks, left).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -224,10 +251,18 @@ impl Peer {
     fn gone(&self) {
         let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
         for r in asks.1.values_mut() {
-            r.get_or_insert(-errno::ESRCH);
+            r.get_or_insert(Vec::new());
         }
         self.answered.notify_all();
         *self.reach.lock().unwrap_or_else(|e| e.into_inner()) = Reach::default();
+    }
+
+    /// Answer request `id`.
+    fn answer(&self, id: u64, body: &[u8]) {
+        let mut e = Encoder::default();
+        e.u64(id);
+        e.0.extend_from_slice(body);
+        self.send(ANSWER, &e.0);
     }
 
     /// `pid`'s parent is `ppid` from now on.
@@ -272,6 +307,64 @@ impl Peer {
     fn tty(&self, n: u32) -> Option<(i64, i64)> {
         self.reach.lock().unwrap_or_else(|e| e.into_inner()).ttys.get(&n).copied()
     }
+}
+
+/// A signal's (or `tcsetpgrp`'s) answer: the result, or the errno negated;
+/// no answer is ESRCH.
+fn result_of(body: Option<Vec<u8>>) -> Result<i64, i64> {
+    match body.and_then(|b| Decoder(&b).i64().ok()) {
+        Some(r) if r < 0 => Err(-r),
+        Some(r) => Ok(r),
+        None => Err(errno::ESRCH),
+    }
+}
+
+fn answer_of(r: Result<i64, i64>) -> Vec<u8> {
+    let mut e = Encoder::default();
+    e.i64(match r {
+        Ok(v) => v,
+        Err(e) => -e,
+    });
+    e.0
+}
+
+fn encode_status(e: &mut Encoder, r: &Result<ProcStatus, i64>) {
+    match r {
+        Err(err) => drop(e.bool(false).i64(*err)),
+        Ok(s) => {
+            e.bool(true).bytes(&s.comm).i64(s.ppid).i64(s.pgid).i64(s.sid).u64(s.state as u64).u64(s.threads);
+            e.u64(s.user_ns).u64(s.sys_ns).u64(s.children_user_ns).u64(s.children_sys_ns).u64(s.start_ns);
+            e.bool(s.tty.is_some()).u64(s.tty.unwrap_or(0) as u64).i64(s.tpgid);
+            e.opt_bytes(s.cmdline.as_deref()).u64(s.rss_pages);
+        }
+    }
+}
+
+fn decode_status(d: &mut Decoder) -> Result<Result<ProcStatus, i64>, Truncated> {
+    if !d.bool()? {
+        return Ok(Err(d.i64()?));
+    }
+    let (comm, ppid, pgid, sid, state, threads) = (d.bytes()?, d.i64()?, d.i64()?, d.i64()?, d.u64()? as u8, d.u64()?);
+    let (user_ns, sys_ns, children_user_ns, children_sys_ns, start_ns) = (d.u64()?, d.u64()?, d.u64()?, d.u64()?, d.u64()?);
+    let (has_tty, tty, tpgid) = (d.bool()?, d.u64()? as u32, d.i64()?);
+    let (cmdline, rss_pages) = (d.opt_bytes()?, d.u64()?);
+    Ok(Ok(ProcStatus {
+        comm,
+        ppid,
+        pgid,
+        sid,
+        state,
+        threads,
+        user_ns,
+        sys_ns,
+        children_user_ns,
+        children_sys_ns,
+        start_ns,
+        tty: has_tty.then_some(tty),
+        tpgid,
+        cmdline,
+        rss_pages,
+    }))
 }
 
 fn encode_info(e: &mut Encoder, info: &SigInfo) {
@@ -354,6 +447,42 @@ impl Table {
     /// foreground group (-1: none), as its host last said.
     pub(super) fn remote_tty(&self, n: u32) -> Option<(i64, Option<i64>)> {
         self.peers().iter().find_map(|p| p.tty(n)).map(|(sid, pgrp)| (sid, (pgrp >= 0).then_some(pgrp)))
+    }
+
+    /// The pids of every process here and in the linked hosts (but
+    /// `except`) and beyond, for `/proc`. Moved processes' stand-ins are
+    /// their hosts' to list.
+    pub(super) fn federated_pids(&self, except: Option<&Arc<Peer>>) -> BTreeSet<i64> {
+        let mut pids: BTreeSet<i64> = {
+            let s = self.state();
+            s.procs.iter().filter(|(_, e)| !matches!(&e.stand, Some(StandIn { of: Elsewhere::Host(_), .. }))).map(|(&pid, _)| pid).collect()
+        };
+        for p in self.peers() {
+            if except.is_none_or(|x| !Arc::ptr_eq(&p, x)) {
+                pids.extend(p.list_pids());
+            }
+        }
+        pids
+    }
+
+    /// What's known of `pid`, here (with its command line from its
+    /// memory) or in the linked host (but `except`) that reaches it.
+    pub(super) fn federated_status(&self, pid: i64, except: Option<&Arc<Peer>>) -> Result<ProcStatus, i64> {
+        let here = {
+            let s = self.state();
+            s.procs.get(&pid).map(|e| matches!(&e.stand, Some(StandIn { of: Elsewhere::Host(_), .. })))
+        };
+        if here == Some(false) {
+            return self.status_of(pid, true);
+        }
+        let peer = self.peers().into_iter().find(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)) && p.reaches_pid(pid));
+        match peer.map(|p| p.status(pid)) {
+            Some(Ok(status)) => Ok(status),
+            // A moved process's stand-in, if its host doesn't answer.
+            _ if here == Some(true) => self.status_of(pid, true),
+            Some(Err(e)) => Err(e),
+            None => Err(errno::ESRCH),
+        }
     }
 
     /// `tcsetpgrp` on pty `n`, another host's: asked of it.
@@ -472,28 +601,35 @@ impl Table {
             ASK => {
                 let Ok((id, to, info)) = (|| Ok::<_, Truncated>((d.u64()?, decode_target(&mut d)?, decode_info(&mut d)?)))() else { return true };
                 let r = self.deliver_from(to, info, None, Some(peer));
-                let mut e = Encoder::default();
-                e.u64(id).i64(match r {
-                    Ok(v) => v,
-                    Err(e) => -e,
-                });
-                peer.send(ANSWER, &e.0);
+                peer.answer(id, &answer_of(r));
             }
             ASK_FOREGROUND => {
                 let Ok((id, n, pgrp, sid)) = (|| Ok::<_, Truncated>((d.u64()?, d.u64()? as u32, d.i64()?, d.i64()?)))() else { return true };
                 let r = self.set_foreground(n, pgrp, sid, Some(peer));
+                peer.answer(id, &answer_of(r));
+            }
+            LIST_PIDS => {
+                let Ok(id) = d.u64() else { return true };
+                let pids = self.federated_pids(Some(peer));
                 let mut e = Encoder::default();
-                e.u64(id).i64(match r {
-                    Ok(v) => v,
-                    Err(e) => -e,
-                });
-                peer.send(ANSWER, &e.0);
+                e.u64(pids.len() as u64);
+                for pid in pids {
+                    e.i64(pid);
+                }
+                peer.answer(id, &e.0);
+            }
+            ASK_STATUS => {
+                let (Ok(id), Ok(pid)) = (d.u64(), d.i64()) else { return true };
+                let r = self.federated_status(pid, Some(peer));
+                let mut e = Encoder::default();
+                encode_status(&mut e, &r);
+                peer.answer(id, &e.0);
             }
             ANSWER => {
-                if let (Ok(id), Ok(r)) = (d.u64(), d.i64()) {
+                if let Ok(id) = d.u64() {
                     let mut asks = peer.asks.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(slot) = asks.1.get_mut(&id) {
-                        *slot = Some(r);
+                        *slot = Some(d.0.to_vec());
                     }
                     peer.answered.notify_all();
                 }

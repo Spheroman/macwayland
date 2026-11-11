@@ -1286,6 +1286,68 @@ impl Table {
     }
 }
 
+impl Table {
+    /// What `/proc/<pid>` says of process `pid` of this host's;
+    /// `with_cmdline`: its command line too, from its memory (for another
+    /// host, which can't read it).
+    pub(super) fn status_of(&self, pid: i64, with_cmdline: bool) -> Result<ProcStatus, i64> {
+        let s = self.state();
+        let e = s.procs.get(&pid).ok_or(errno::ESRCH)?;
+        let (state, threads, cpu, comm) = match &e.kind {
+            Kind::Local(proc) => {
+                let state = if proc.stopped.load(Ordering::Acquire) {
+                    b'T'
+                } else if proc.cpu.in_guest() {
+                    b'R'
+                } else {
+                    b'S'
+                };
+                (state, proc.abi.thread_count().max(1) as u64, proc.cpu.times(), proc.abi.comm())
+            }
+            Kind::Zombie { cpu, comm, .. } => (b'Z', 0, *cpu, comm.clone()),
+            Kind::StandIn { cpu } => {
+                let m = e.stand.as_ref().expect("a stand-in's program");
+                let (user, sys, _) = m.mac_pid().and_then(mac::usage).unwrap_or_default();
+                (if m.stopped { b'T' } else { b'S' }, 1, *cpu + Times { user, sys }, m.comm.clone())
+            }
+        };
+        // A stand-in's command line and memory: its program's.
+        let (cmdline, rss_pages) = match (&e.stand, &e.kind) {
+            (Some(m), Kind::StandIn { .. }) => (Some(m.cmdline.clone()), m.mac_pid().and_then(mac::usage).map_or(0, |u| u.2 / 4096)),
+            (_, Kind::Local(proc)) if with_cmdline => {
+                let space = proc.space();
+                (Some(cmdline_of(proc, &space)), linux_abi::GuestMemory::resident_pages(&*space))
+            }
+            _ => (None, 0),
+        };
+        Ok(ProcStatus {
+            cmdline,
+            rss_pages,
+            comm,
+            ppid: e.ppid,
+            pgid: e.pgid,
+            sid: e.sid,
+            state,
+            threads,
+            user_ns: cpu.user,
+            sys_ns: cpu.sys,
+            children_user_ns: e.children_cpu.user,
+            children_sys_ns: e.children_cpu.sys,
+            start_ns: e.start_ns,
+            tty: e.ctty,
+            tpgid: e.ctty.and_then(|n| s.ttys.get(&n)).and_then(|t| t.pgrp).unwrap_or(-1),
+        })
+    }
+}
+
+/// A local process's command line, from its memory: `cmdline`'s
+/// NUL-separated strings.
+fn cmdline_of(proc: &Proc, space: &Space) -> Vec<u8> {
+    let [a0, a1, ..] = proc.abi.arg_area();
+    let mut args = vec![0u8; a1.saturating_sub(a0).min(4096) as usize];
+    if linux_abi::GuestMemory::read(space, a0, &mut args).is_ok() { args } else { Vec::new() }
+}
+
 impl mac::MacEvents for Table {
     fn mac_changed(&self, mac_pid: libc::pid_t, change: Change) {
         let _order = self.mac_order.lock().unwrap_or_else(|e| e.into_inner());
@@ -1749,53 +1811,18 @@ impl Kernel for TableKernel {
     }
 
     fn pids(&self, _p: &Process) -> Vec<i64> {
-        self.table().map(|t| t.state().procs.keys().copied().collect()).unwrap_or_default()
+        // Every host's linked to this one too (step 9).
+        self.table().map(|t| t.federated_pids(None).into_iter().collect()).unwrap_or_default()
     }
 
     fn proc_status(&self, _p: &Process, pid: i64) -> Result<ProcStatus, i64> {
         let table = self.table()?;
-        let s = table.state();
-        let e = s.procs.get(&pid).ok_or(errno::ESRCH)?;
-        let (state, threads, cpu, comm) = match &e.kind {
-            Kind::Local(proc) => {
-                let state = if proc.stopped.load(Ordering::Acquire) {
-                    b'T'
-                } else if proc.cpu.in_guest() {
-                    b'R'
-                } else {
-                    b'S'
-                };
-                (state, proc.abi.thread_count().max(1) as u64, proc.cpu.times(), proc.abi.comm())
-            }
-            Kind::Zombie { cpu, comm, .. } => (b'Z', 0, *cpu, comm.clone()),
-            Kind::StandIn { cpu } => {
-                let m = e.stand.as_ref().expect("a stand-in's program");
-                let (user, sys, _) = m.mac_pid().and_then(mac::usage).unwrap_or_default();
-                (if m.stopped { b'T' } else { b'S' }, 1, *cpu + Times { user, sys }, m.comm.clone())
-            }
-        };
-        // A stand-in's command line and memory: its program's.
-        let (cmdline, rss_pages) = match &e.stand {
-            Some(m) if matches!(e.kind, Kind::StandIn { .. }) => (Some(m.cmdline.clone()), m.mac_pid().and_then(mac::usage).map_or(0, |u| u.2 / 4096)),
-            _ => (None, 0),
-        };
-        Ok(ProcStatus {
-            cmdline,
-            rss_pages,
-            comm,
-            ppid: e.ppid,
-            pgid: e.pgid,
-            sid: e.sid,
-            state,
-            threads,
-            user_ns: cpu.user,
-            sys_ns: cpu.sys,
-            children_user_ns: e.children_cpu.user,
-            children_sys_ns: e.children_cpu.sys,
-            start_ns: e.start_ns,
-            tty: e.ctty,
-            tpgid: e.ctty.and_then(|n| s.ttys.get(&n)).and_then(|t| t.pgrp).unwrap_or(-1),
-        })
+        let local = table.state().procs.get(&pid).map(|e| !matches!(&e.stand, Some(StandIn { of: Elsewhere::Host(_), .. })));
+        match local {
+            Some(true) => table.status_of(pid, false),
+            // Another host's (a moved process's is its host's to say).
+            _ => table.federated_status(pid, None),
+        }
     }
 
     fn with_process(&self, _p: &Process, pid: i64, f: &mut dyn FnMut(&Process, &dyn GuestMemory)) -> Result<(), i64> {
