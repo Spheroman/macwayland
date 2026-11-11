@@ -18,7 +18,7 @@
 //! `--root` isn't the guest's. It is off unless `MACWL_MAC_PROGRAMS=1`
 //! (otherwise such an `execve` fails with ENOEXEC). See ROADMAP.md, item 13.
 
-use std::{os::unix::ffi::OsStrExt, sync::atomic::Ordering};
+use std::{os::{fd::OwnedFd, unix::ffi::OsStrExt}, sync::atomic::Ordering};
 
 use super::{
     kernel::MacPrograms,
@@ -129,6 +129,78 @@ impl Process {
         child.signals = thread_signals;
         child.comm = t.comm.clone();
         (p, child)
+    }
+
+    /// Everything process `p`'s thread `t` keeps as it execs `exec` in a
+    /// host of its own (docs/processes.md, step 9, "Moving at execve"): its
+    /// filesystem view and working directory, dispositions (handlers reset,
+    /// as by an exec; ignored signals kept) and `t`'s mask, rlimits, umask,
+    /// `prctl` flags, the program's path, name, argv and environment, and
+    /// the guest numbers of the fds it inherits. Those fds are returned, to
+    /// be passed alongside: only files the host can hand over as they are
+    /// (files, pipes, sockets, terminals); an epoll set, eventfd, timerfd,
+    /// signalfd, inotify instance or pidfd is a kqueue of this host's, and
+    /// isn't passed on. (Pending signals don't go with it.)
+    pub fn encode_for_move(&self, t: &Thread, exec: &Exec, e: &mut Encoder) -> Vec<(usize, std::sync::Arc<crate::fs::OpenFile>)> {
+        self.fs.encode(e);
+        let mut signals = self.signals().clone();
+        let mut ts = t.signals.spawned();
+        signals.reset_on_exec(&mut ts);
+        signals.encode(&ts, e);
+        for [soft, hard] in *self.rlimits.lock().unwrap_or_else(|e| e.into_inner()) {
+            e.u64(soft).u64(hard);
+        }
+        e.u64(self.umask() as u64).bool(self.dumpable.load(Ordering::Relaxed)).bool(self.no_new_privs.load(Ordering::Relaxed));
+        e.bytes(&exec.exe).bytes(&exec.comm);
+        for list in [&exec.argv, &exec.envp] {
+            e.u64(list.len() as u64);
+            for item in list {
+                e.bytes(item);
+            }
+        }
+        let fds: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| matches!(f.kind, crate::fs::FileKind::Plain)).collect();
+        e.u64(fds.len() as u64);
+        for (n, _) in &fds {
+            e.u64(*n as u64);
+        }
+        fds
+    }
+
+    /// The new host's side of [`Process::encode_for_move`]: the process
+    /// (with `fds`, the passed files, in order, at their guest numbers), its
+    /// thread, and the program's guest path, argv and environment.
+    #[allow(clippy::type_complexity)]
+    pub fn decode_moved(d: &mut Decoder, fds: Vec<OwnedFd>) -> Result<(Process, Thread, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>), Truncated> {
+        let mut p = Process::new("/");
+        p.fs = Filesystem::decode(d)?;
+        let (signals, thread_signals) = signal::Signals::decode(d)?;
+        *p.signals() = signals;
+        for limit in p.rlimits.get_mut().unwrap().iter_mut() {
+            *limit = [d.u64()?, d.u64()?];
+        }
+        p.umask.store(d.u64()? as u32 & 0o777, Ordering::Relaxed);
+        p.dumpable.store(d.bool()?, Ordering::Relaxed);
+        p.no_new_privs.store(d.bool()?, Ordering::Relaxed);
+        let (exe, comm) = (d.bytes()?, d.bytes()?);
+        let mut lists = [Vec::new(), Vec::new()];
+        for list in &mut lists {
+            for _ in 0..d.count(8)? {
+                list.push(d.bytes()?);
+            }
+        }
+        let [argv, envp] = lists;
+        let n = d.count(8)?;
+        if n != fds.len() {
+            return Err(Truncated);
+        }
+        for host in fds {
+            p.fds.insert_at(d.u64()? as usize, crate::fs::FdEntry::new(host));
+        }
+        p.set_exe(exe.clone());
+        p.set_comm(&comm);
+        let mut t = Thread::main(&p);
+        t.signals = thread_signals;
+        Ok((p, t, exe, argv, envp))
     }
 
     /// The core replaced the program (other threads gone, `t` the one left):

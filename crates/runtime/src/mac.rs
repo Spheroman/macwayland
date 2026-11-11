@@ -51,7 +51,7 @@ use linux_abi::{
 use crate::proto;
 
 /// `posix_spawn` flags macOS has that the libc crate doesn't name.
-const POSIX_SPAWN_SETSID: libc::c_short = 0x0400;
+pub(crate) const POSIX_SPAWN_SETSID: libc::c_short = 0x0400;
 const POSIX_SPAWN_START_SUSPENDED: libc::c_short = 0x0080;
 
 /// The spawn flags given, if they start a new process: never
@@ -180,7 +180,7 @@ fn spawn_errno(e: i32) -> i64 {
 
 /// The `macwl-run` binary, to start agents with: this one, or (a test
 /// binary running a host in-process) the one built beside it.
-fn macwl_run_exe() -> std::io::Result<std::path::PathBuf> {
+pub(crate) fn macwl_run_exe() -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     if exe.file_name().is_some_and(|n| n == "macwl-run") {
         return Ok(exe);

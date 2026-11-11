@@ -96,7 +96,7 @@ impl Launch {
 
 /// The program, as a guest path: its contents, and its guest path with
 /// symlinks resolved.
-fn read_program(process: &Process, path: &OsStr) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub(crate) fn read_program(process: &Process, path: &OsStr) -> Result<(Vec<u8>, Vec<u8>), String> {
     const AT_FDCWD: u64 = -100i64 as u64;
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let host = match process.fs.resolve(&process.fds, AT_FDCWD, path.as_bytes(), true) {

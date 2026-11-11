@@ -31,6 +31,12 @@ pub const SIGNAL: u8 = 4;
 pub const RESIZE: u8 = 5;
 /// Client to host: the client's terminal has hung up.
 pub const HANGUP: u8 = 6;
+/// Host to coordinator, first: a host links (its Mac pid is the socket's
+/// peer's).
+pub const HELLO: u8 = 7;
+/// Client to coordinator: every host's processes (answered with a
+/// [`LISTING`]); the coordinator asks each host with a [`PS`].
+pub const PS_ALL: u8 = 8;
 
 /// Host to client: the process runs, with this pid (and its terminal's
 /// master, if it has one).

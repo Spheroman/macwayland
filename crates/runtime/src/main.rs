@@ -1,7 +1,7 @@
 //! `macwl-run [--root DIR] [--bind HOST[:GUEST]]... [--mac-programs]
 //! [--host PATH | --new-host] PROGRAM [ARGS...]`
 //! `macwl-run --serve PATH`
-//! `macwl-run --ps [--host PATH]`
+//! `macwl-run --ps [--host PATH | --all]`
 //!
 //! Runs an arm64 Linux program. Without `--root` the program sees the Mac's
 //! own filesystem, which is enough for programs from Nix (their libraries are
@@ -17,7 +17,9 @@
 //! it runs PROGRAM in that host (starting one if none serves PATH) and
 //! stands in for it on the Mac: its exit status, signals sent to it, its
 //! terminal. Otherwise (or with `--new-host`) `macwl-run` is the host of
-//! PROGRAM and everything it starts. `--ps` lists a host's processes.
+//! PROGRAM and everything it starts. `--ps` lists a host's processes;
+//! `--ps --all`, every host's, through the user's coordinator of hosts
+//! (`--coordinator`, started if none runs: docs/processes.md, step 9).
 //!
 //! A Linux program may run Mac programs, as WSL's run Windows ones: an
 //! `execve` of a Mach-O file runs it natively, a Mac process of its own,
@@ -41,7 +43,7 @@ use macwl_runtime::{launch::Launch, Exit};
 
 const USAGE: &str = "usage: macwl-run [--root DIR] [--bind HOST[:GUEST]]... [--mac-programs] [--host PATH | --new-host] PROGRAM [ARGS...]
        macwl-run --serve PATH
-       macwl-run --ps [--host PATH]";
+       macwl-run --ps [--host PATH | --all]";
 
 struct Options {
     root: Option<PathBuf>,
@@ -51,11 +53,13 @@ struct Options {
     host: Option<PathBuf>,
     new_host: bool,
     ps: bool,
+    /// `--ps --all`: every host's.
+    all: bool,
     args: Vec<OsString>,
 }
 
 fn parse_args() -> Result<Options, String> {
-    let mut opts = Options { root: None, binds: Vec::new(), host: None, new_host: false, ps: false, args: Vec::new() };
+    let mut opts = Options { root: None, binds: Vec::new(), host: None, new_host: false, ps: false, all: false, args: Vec::new() };
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_bytes() {
@@ -78,6 +82,7 @@ fn parse_args() -> Result<Options, String> {
             b"--host" => opts.host = Some(args.next().ok_or("--host needs a path")?.into()),
             b"--new-host" => opts.new_host = true,
             b"--ps" => opts.ps = true,
+            b"--all" if opts.ps => opts.all = true,
             b"--" => {
                 opts.args.extend(args);
                 break;
@@ -268,6 +273,11 @@ fn main() -> ExitCode {
         Some(a) if a == "--serve" => return serve(args),
         // Started by a host to run Mac programs (never makes a VM).
         Some(a) if a == "--tty-agent" => return macwl_runtime::run_tty_agent(args.next()),
+        // A host for a process moving to one of its own as it execs: the
+        // host it was in is at the other end of fd 3.
+        Some(a) if a == "--adopted" => return finish(macwl_runtime::run_adopted()),
+        // The user's coordinator of hosts (never makes a VM).
+        Some(a) if a == "--coordinator" => return macwl_runtime::run_coordinator(),
         _ => {}
     }
     let opts = match parse_args() {
@@ -277,6 +287,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if opts.ps && opts.all {
+        return macwl_runtime::coord_ps_all();
+    }
     if opts.ps {
         return match &opts.host {
             Some(host) => macwl_runtime::client::ps(host),

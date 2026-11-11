@@ -24,9 +24,9 @@ use std::{
     io::ErrorKind,
     os::{
         fd::{AsRawFd, OwnedFd, RawFd},
-        unix::{fs::DirBuilderExt, net::{UnixListener, UnixStream}},
+        unix::net::UnixStream,
     },
-    path::{Path, PathBuf},
+    path::Path,
     sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -37,6 +37,7 @@ use linux_abi::{
     wire::{Decoder, Encoder, Truncated},
 };
 
+use crate::endpoint::Endpoint;
 use super::{route_host_signals, Kind, RangePids, Table, TableKernel, Target, SIGCHLD, SIGCONT, SIGHUP, SI_KERNEL, SI_USER};
 use crate::{
     hv,
@@ -96,66 +97,9 @@ impl Notify {
     }
 }
 
-/// The socket a host serves, and the lock that makes it this host's.
-struct Endpoint {
-    path: PathBuf,
-    listener: Option<UnixListener>,
-    lock: Option<OwnedFd>,
-}
-
 /// Another host already serves the path (`macwl-run --serve` exits with
 /// this status then).
 pub const ALREADY_SERVING: u8 = 3;
-
-impl Endpoint {
-    fn claim(path: &Path) -> std::io::Result<Endpoint> {
-        let me = unsafe { libc::getuid() };
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            // Directories the host makes are the user's alone.
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-            use std::os::unix::fs::MetadataExt;
-            if std::fs::metadata(dir)?.uid() != me {
-                return Err(std::io::Error::new(ErrorKind::PermissionDenied, format!("{} isn't yours", dir.display())));
-            }
-        }
-        let mut lock_path = path.as_os_str().to_owned();
-        lock_path.push(".lock");
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path)?;
-        // A host that's just going still holds it for a moment.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            if Instant::now() > deadline {
-                return Err(std::io::Error::new(ErrorKind::AddrInUse, format!("a host already serves {}", path.display())));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Holding the lock, whatever is at the path is a host's that has
-        // gone.
-        match std::fs::remove_file(path) {
-            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        let listener = UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        Ok(Endpoint { path: path.to_owned(), listener: Some(listener), lock: Some(lock.into()) })
-    }
-
-    /// No more clients: the path goes, then the lock, so that a new host
-    /// can serve the path at once.
-    fn close(&mut self) {
-        if self.listener.take().is_some() {
-            let _ = std::fs::remove_file(&self.path);
-        }
-        self.lock = None;
-    }
-}
-
-impl Drop for Endpoint {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
 
 /// A client's terminal: a pty of the host's whose slave its process has.
 /// The client reads the master's output itself (it has the master too);
@@ -228,6 +172,7 @@ pub(crate) fn serve(path: &Path, idle_exit: bool) -> Result<(), Error> {
     // would apply on top.
     let old_umask = unsafe { libc::umask(0) };
     route_host_signals(&table)?;
+    table.link();
     // The VM, with no process yet: the pool and windows mapped into it,
     // as a host's first process would have them.
     let machine = Machine::new()?;
@@ -383,7 +328,8 @@ impl Service {
                 } else {
                     None
                 };
-                match self.start(sh, scope, launch, stdio, terminal) {
+                let mac_pid = self.clients[i].mac_pid;
+                match self.start(sh, scope, launch, stdio, terminal, mac_pid) {
                     Ok((pid, pty)) => {
                         let c = &mut self.clients[i];
                         c.pid = Some(pid);
@@ -401,7 +347,7 @@ impl Service {
                 }
             }
             proto::PS => {
-                let text = self.listing();
+                let text = self.table.listing();
                 let c = &mut self.clients[i];
                 c.listing = true;
                 c.send(proto::LISTING, text.as_bytes(), &[]);
@@ -482,6 +428,7 @@ impl Service {
         launch: Launch,
         stdio: Vec<(usize, OwnedFd)>,
         terminal: Option<(libc::termios, Option<libc::winsize>, Vec<u64>)>,
+        client_pid: Option<libc::pid_t>,
     ) -> Result<(i64, Option<relay::Pty>), String> {
         let table = &self.table;
         let (mut process, elf) = launch.process(stdio)?;
@@ -522,6 +469,7 @@ impl Service {
             let mut s = table.state();
             if let Some(e) = s.procs.get_mut(&pid) {
                 e.client = true;
+                e.client_pid = client_pid;
                 // The client is the Mac shell's job: that shell continues
                 // it when it stops, so its group is never orphaned.
                 e.mac_parent = true;
@@ -590,74 +538,5 @@ impl Service {
                 (None, None) => {}
             }
         }
-    }
-
-    /// `macwl-run --ps`: the host's processes, as `ps -ef` would show them
-    /// inside, and the Mac pid of each one's client.
-    fn listing(&self) -> String {
-        let clients: std::collections::HashMap<i64, libc::pid_t> =
-            self.clients.iter().filter_map(|c| Some((c.pid?, c.mac_pid?))).collect();
-        let rows: Vec<_> = {
-            let s = self.table.state();
-            s.procs
-                .iter()
-                .map(|(&pid, e)| {
-                    let (state, cpu, proc, comm) = match &e.kind {
-                        Kind::Local(p) => {
-                            let state = if p.stopped.load(Ordering::Acquire) {
-                                'T'
-                            } else if p.cpu.in_guest() {
-                                'R'
-                            } else {
-                                'S'
-                            };
-                            (state, p.cpu.times(), Some(p.clone()), p.abi.comm())
-                        }
-                        Kind::Zombie { cpu, comm, .. } => ('Z', *cpu, None, comm.clone()),
-                        // A stand-in: what macOS says of its Mac program.
-                        Kind::Mac { cpu } => {
-                            let m = e.mac.as_ref().expect("a stand-in's Mac program");
-                            let (user, sys, _) = crate::mac::usage(m.pid).unwrap_or_default();
-                            (if m.stopped { 'T' } else { 'S' }, *cpu + crate::cputime::Times { user, sys }, None, m.comm.clone())
-                        }
-                    };
-                    let mac = e.mac.as_ref().filter(|_| matches!(e.kind, Kind::Mac { .. })).map(|m| (m.pid, m.cmdline.clone()));
-                    (pid, e.ppid, e.pgid, e.sid, e.ctty, state, cpu, proc, comm, mac)
-                })
-                .collect()
-        };
-        let mut out = format!("{:>7} {:>7} {:>7} {:>7} {:<7} {:<4} {:>8} {:>8} {:>6}  CMD\n", "PID", "PPID", "PGID", "SID", "TTY", "STAT", "TIME", "RSS", "CLIENT");
-        for (pid, ppid, pgid, sid, ctty, state, cpu, proc, comm, mac) in rows {
-            // The command line from the process's memory, as /proc's
-            // cmdline; a zombie's name in brackets.
-            let (cmd, rss_kb) = match proc.map(|p| (p.abi.arg_area(), p.space())) {
-                Some(([a0, a1, ..], space)) => {
-                    let mut args = vec![0u8; a1.saturating_sub(a0).min(4096) as usize];
-                    let args = if linux_abi::GuestMemory::read(&*space, a0, &mut args).is_ok() { args } else { Vec::new() };
-                    let cmd: Vec<u8> = args.strip_suffix(b"\0").unwrap_or(&args).iter().map(|&b| if b == 0 { b' ' } else { b }).collect();
-                    let cmd = if cmd.is_empty() { format!("[{}]", String::from_utf8_lossy(&comm)) } else { String::from_utf8_lossy(&cmd).into_owned() };
-                    (cmd, linux_abi::GuestMemory::resident_pages(&*space) * 4)
-                }
-                None => match &mac {
-                    Some((mac_pid, cmdline)) => {
-                        let cmd: Vec<u8> = cmdline.strip_suffix(b"\0").unwrap_or(cmdline).iter().map(|&b| if b == 0 { b' ' } else { b }).collect();
-                        (String::from_utf8_lossy(&cmd).into_owned(), crate::mac::usage(*mac_pid).map_or(0, |u| u.2 / 1024))
-                    }
-                    None => (format!("[{}]", String::from_utf8_lossy(&comm)), 0),
-                },
-            };
-            let secs = cpu.total() / 1_000_000_000;
-            let time = format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
-            let tty = ctty.map_or_else(|| "?".to_string(), |n| format!("pts/{n}"));
-            // The Mac process standing for it: its client's, or the Mac
-            // program it stands in for (marked so).
-            let client = match (clients.get(&pid), &mac) {
-                (Some(p), _) => p.to_string(),
-                (None, Some((mac_pid, _))) => format!("{mac_pid}*"),
-                (None, None) => "-".to_string(),
-            };
-            out.push_str(&format!("{pid:>7} {ppid:>7} {pgid:>7} {sid:>7} {tty:<7} {state:<4} {time:>8} {rss_kb:>8} {client:>6}  {cmd}\n"));
-        }
-        out
     }
 }

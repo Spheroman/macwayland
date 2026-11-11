@@ -11,6 +11,8 @@
 
 pub mod hv;
 mod cputime;
+mod coord;
+mod endpoint;
 mod host;
 mod mac;
 mod park;
@@ -153,6 +155,8 @@ impl From<loader::LoadError> for Error {
     }
 }
 pub use mac::agent_main as run_tty_agent;
+pub use coord::{ps_all as coord_ps_all, run as run_coordinator};
+pub use host::run_adopted;
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
@@ -989,7 +993,7 @@ fn run_at_el1(vcpu: &mut Vcpu, path: u64, x0: Option<u64>) -> Result<(), Error> 
 }
 
 /// The Linux errno for a program `execve` couldn't load.
-fn exec_errno(e: &Error) -> i64 {
+pub(crate) fn exec_errno(e: &Error) -> i64 {
     match e {
         Error::Load(loader::LoadError::Interpreter(_, io)) => linux_abi::errno::from_io(io),
         Error::Io(_) => linux_abi::errno::ENOMEM,
@@ -1317,6 +1321,13 @@ fn system_call<'scope, 'env>(
             // never execs), and this process stands in for it; if it can't
             // start, execve says why.
             Action::MacStandIn(exec) => match sh.table.start_mac(proc, thread.blocked_signals(), &exec) {
+                Ok(()) => return Ok(Some(Next::StandIn)),
+                Err(e) => -e,
+            },
+            // A program set to have a host of its own: this process moves
+            // there, and stands in for itself here (docs/processes.md,
+            // step 9); if it can't, execve says why.
+            Action::Exec(exec) if sh.table.moves(&exec) => match sh.table.move_to_host(proc, thread, &exec) {
                 Ok(()) => return Ok(Some(Next::StandIn)),
                 Err(e) => -e,
             },
