@@ -1,6 +1,6 @@
-# Mac programs from Linux bash, in one VM (docs/processes.md, section 7;
-# ROADMAP.md item 13's list). Run by the runtime's tests with nixpkgs'
-# arm64 bash, with Mac programs on and MACWL_ONE_VM=1, as
+# Mac programs from Linux bash (docs/processes.md, section 7; ROADMAP.md
+# item 13's list). Run by the runtime's tests with nixpkgs' arm64 bash,
+# with Mac programs on, as
 #   bash mac_programs.sh PATH DIR
 # PATH has Linux tools only (coreutils, grep, procps); Mac programs are
 # named by their paths.

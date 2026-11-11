@@ -412,22 +412,20 @@ fn signals() {
     assert!(out.status.success());
 }
 
-/// tgkill to a thread of another process, in both modes: never ESRCH while
-/// the thread lives, and the signal arrives (see guest/tgkill.c). In 1:1 it
-/// was ESRCH, which wineserver took to mean a client's thread had died; it
-/// ended the thread on its side while it still ran, and its heap was soon
-/// corrupt.
+/// tgkill to a thread of another process: never ESRCH while the thread
+/// lives, and the signal arrives (see guest/tgkill.c). When each process
+/// was a Mac process of its own it was ESRCH, which wineserver took to mean
+/// a client's thread had died; it ended the thread on its side while it
+/// still ran, and its heap was soon corrupt.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn tgkill_reaches_another_process_thread() {
     let path = format!("{}/../../target/guest/tgkill", env!("CARGO_MANIFEST_DIR"));
     let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
-    for one_vm in ["0", "1"] {
-        let out = macwl_run().env("MACWL_ONE_VM", one_vm).arg(&path).output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "tgkill ok\n", "MACWL_ONE_VM={one_vm}, stderr: {stderr}");
-        assert!(out.status.success(), "MACWL_ONE_VM={one_vm}");
-    }
+    let out = macwl_run().arg(&path).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "tgkill ok\n", "stderr: {stderr}");
+    assert!(out.status.success());
 }
 
 /// More threads than CPUs (150 at once, past the 64 vCPUs a process can
@@ -519,13 +517,13 @@ fn live_processes_of(path: &std::path::Path) -> Vec<i32> {
     pids
 }
 
-/// Every Mac process (and so its VM) goes as soon as its Linux process has
-/// ended: hundreds of children that exit, exit_group from a thread while
-/// others are blocked, are killed (with and without a spare and a child of
-/// their own), exec, daemonize (fork, setsid, fork) or outlive their parent,
-/// none of them waited for: see guest/procstress.c. Runs a copy of
-/// `macwl-run`, so that its processes, spares included, can be told from
-/// other tests'.
+/// The host is the one Mac process (and VM) however many Linux processes it
+/// runs, and it goes once they have: hundreds of children that exit,
+/// exit_group from a thread while others are blocked, are killed (with and
+/// without a child of their own), exec, daemonize (fork, setsid, fork) or
+/// outlive their parent, none of them waited for: see guest/procstress.c.
+/// Runs a copy of `macwl-run`, so that its processes can be told from other
+/// tests'.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn processes_go_when_they_end() {
@@ -557,7 +555,7 @@ fn processes_go_when_they_end() {
     }
     assert_eq!(announced.len(), 300 + 300 / 10 * 4, "every child and grandchild announced itself");
     // Daemons may still be finishing; give them a moment. What's left is
-    // the parent, with its zombies, and its spare.
+    // the host.
     let wait_until = |what: &str, ok: &dyn Fn(&[i32]) -> bool| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -569,22 +567,18 @@ fn processes_go_when_they_end() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     };
-    // (In one VM the processes are the host's: it's the one Mac
-    // process, with no spare.)
-    let mac_processes = if macwl_runtime::one_vm() { 1 } else { 2 };
-    wait_until("ended children", &|live| live.len() == mac_processes && live.contains(&main) && !announced.iter().any(|p| live.contains(p)));
+    wait_until("ended children", &|live| live == [main] && !announced.iter().any(|p| live.contains(p)));
     drop(child.stdin.take());
     assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procstress ok"));
     assert!(child.wait().unwrap().success());
     wait_until("after the parent", &|live| live.is_empty());
 }
 
-/// `guest/procs` TEST under one VM (`MACWL_ONE_VM=1`, whatever the tests run
-/// with): its stdout, after checking it ended well.
+/// `guest/procs` TEST: its stdout, after checking it ended well.
 fn procs_in_one_vm(test: &str) -> String {
     let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
     let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
-    let out = macwl_run().env("MACWL_ONE_VM", "1").arg(&path).arg(test).output().unwrap();
+    let out = macwl_run().arg(&path).arg(test).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success() && stdout.ends_with(&format!("procs {test} ok\n")), "{test}: {stdout}, stderr: {}", String::from_utf8_lossy(&out.stderr));
     stdout
@@ -676,7 +670,6 @@ fn one_vm_more_processes_than_vms() {
     std::fs::copy(macwl_run().get_program(), &copy).unwrap();
     let copy = std::fs::canonicalize(copy).unwrap();
     let mut child = std::process::Command::new(&copy)
-        .env("MACWL_ONE_VM", "1")
         .args([path.as_os_str(), "many".as_ref(), "300".as_ref(), "hold".as_ref()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -690,13 +683,13 @@ fn one_vm_more_processes_than_vms() {
     assert!(child.wait().unwrap().success());
 }
 
-/// With Mac programs off, an execve of one fails with ENOEXEC in one VM.
+/// With Mac programs off, an execve of one fails with ENOEXEC.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn one_vm_refuses_mac_programs_when_off() {
     let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
     let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
-    let out = macwl_run().env("MACWL_ONE_VM", "1").env_remove("MACWL_MAC_PROGRAMS").arg(&path).arg("execmac").output().unwrap();
+    let out = macwl_run().env_remove("MACWL_MAC_PROGRAMS").arg(&path).arg("execmac").output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "execve: ENOEXEC\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success());
 }
@@ -708,8 +701,7 @@ fn one_vm_refuses_mac_programs_when_off() {
 /// Linux numbers); fds by guest number, redirects, cwd; a Mac binary that
 /// can't run failing execve (bash: 126); SIGSTOP, SIGCONT, SIGTSTP and
 /// `bg`, SIGINT to a Mac job; the stand-in in `/proc` and procps' `ps`; Mac
-/// `git`; `pbcopy`/`pbpaste`. Mac programs run only with one VM: this sets
-/// MACWL_ONE_VM=1 whatever the tests run with.
+/// `git`; `pbcopy`/`pbpaste`.
 #[test]
 #[ignore = "needs nix"]
 fn one_vm_mac_programs() {
@@ -718,7 +710,6 @@ fn one_vm_mac_programs() {
     let dir = tempfile::tempdir().unwrap();
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/mac_programs.sh");
     let out = macwl_run()
-        .env("MACWL_ONE_VM", "1")
         .env("MACWL_MAC_PROGRAMS", "1")
         .arg(&bash)
         .arg(script)
@@ -746,7 +737,7 @@ fn one_vm_spawns_mac_programs() {
     let true_bin = std::fs::read("/usr/bin/true").unwrap();
     std::fs::write(&bad, &true_bin[..20000.min(true_bin.len())]).unwrap();
     std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let run = |args: &[&std::ffi::OsStr]| macwl_run().env("MACWL_ONE_VM", "1").env("MACWL_MAC_PROGRAMS", "1").arg(&path).args(args).output().unwrap();
+    let run = |args: &[&std::ffi::OsStr]| macwl_run().env("MACWL_MAC_PROGRAMS", "1").arg(&path).args(args).output().unwrap();
     let out = run(&["spawnmac".as_ref(), bad.as_os_str()]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "bad mac binary: ENOEXEC\nprocs spawnmac ok\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let out = run(&["execmac".as_ref()]);
@@ -903,15 +894,11 @@ fn locks_and_timers_stay_within_the_host_thread_budget() {
     assert!(out.status.success());
 }
 
-/// `guest/tty ARGS` with `one_vm` (None: as the tests run), checked to end
-/// well.
-fn tty_guest(one_vm: Option<bool>, args: &[&std::ffi::OsStr]) {
+/// `guest/tty ARGS`, checked to end well.
+fn tty_guest(args: &[&std::ffi::OsStr]) {
     let path = format!("{}/../../target/guest/tty", env!("CARGO_MANIFEST_DIR"));
     let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
     let mut cmd = macwl_run();
-    if let Some(on) = one_vm {
-        cmd.env("MACWL_ONE_VM", if on { "1" } else { "0" });
-    }
     // Its waits traced to stderr, which a failure (or two minutes without
     // an end) shows.
     let mut child = cmd
@@ -966,19 +953,12 @@ fn linux_package(name: &str) -> std::ffi::OsString {
 /// tcsetattr and tcsetpgrp from the background (SIGTTOU blocked: allowed),
 /// Ctrl-C, Ctrl-\ and Ctrl-Z for the foreground job alone, Ctrl-V quoting,
 /// SIGWINCH on a resize, TIOCNOTTY, and hangups (the master closing; the
-/// session leader ending).
-#[test]
-#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
-fn terminals_and_job_control() {
-    tty_guest(None, &["rules".as_ref()]);
-}
-
-/// The same in one VM, where the host keeps terminals' sessions and
+/// session leader ending). The host keeps terminals' sessions and
 /// foreground groups itself (docs/processes.md, section 6).
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
-fn one_vm_terminals_and_job_control() {
-    tty_guest(Some(true), &["rules".as_ref()]);
+fn terminals_and_job_control() {
+    tty_guest(&["rules".as_ref()]);
 }
 
 /// Bash's job control on a pty, typed at through the master: `cat &`
@@ -990,19 +970,10 @@ fn one_vm_terminals_and_job_control() {
 fn bash_job_control() {
     let (bash, coreutils) = (linux_package("bash"), linux_package("coreutils"));
     let bash = std::path::Path::new(&bash).join("bin/bash");
-    tty_guest(None, &["bash".as_ref(), bash.as_os_str(), &coreutils]);
+    tty_guest(&["bash".as_ref(), bash.as_os_str(), &coreutils]);
 }
 
-/// The same in one VM.
-#[test]
-#[ignore = "needs scripts/build-guest.sh and nix"]
-fn one_vm_bash_job_control() {
-    let (bash, coreutils) = (linux_package("bash"), linux_package("coreutils"));
-    let bash = std::path::Path::new(&bash).join("bin/bash");
-    tty_guest(Some(true), &["bash".as_ref(), bash.as_os_str(), &coreutils]);
-}
-
-/// `macwl-run ARGS` in one VM, in a terminal of its own (a pty, `rows` by
+/// `macwl-run ARGS` in a terminal of its own (a pty, `rows` by
 /// `cols`, as a Mac terminal's): the child and the terminal's master.
 fn in_a_terminal(args: &[&std::ffi::OsStr], env: &[(&str, &std::ffi::OsStr)], rows: u16, cols: u16) -> (std::process::Child, OwnedFd) {
     use std::os::{fd::FromRawFd, unix::process::CommandExt};
@@ -1013,7 +984,7 @@ fn in_a_terminal(args: &[&std::ffi::OsStr], env: &[(&str, &std::ffi::OsStr)], ro
     unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let mut cmd = macwl_run();
-    cmd.env("MACWL_ONE_VM", "1").args(args);
+    cmd.args(args);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1142,7 +1113,6 @@ impl Served {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("host");
         let mut cmd = macwl_run();
-        cmd.env("MACWL_ONE_VM", "1");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1454,7 +1424,6 @@ fn session_shares_one_host() {
     let ps_txt = dir.join("ps.txt");
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/session.sh");
     let mut session = std::process::Command::new(script)
-        .env("MACWL_ONE_VM", "1")
         .env("MACWL_SESSION_COMPOSITOR", "headless")
         .env("MACWL_SESSION_DIR", &dir)
         .env("MACWL_TYPE", format!("ps -eo pid=,ppid=,comm= > {}; sleep 3; exit\\n", ps_txt.display()))
@@ -1517,7 +1486,6 @@ fn session_runs_mac_programs() {
          echo done > {d}/done\\n\\pexit\\n"
     );
     let mut session = std::process::Command::new(script)
-        .env("MACWL_ONE_VM", "1")
         .env("MACWL_SESSION_COMPOSITOR", "headless")
         .env("MACWL_SESSION_DIR", &dir)
         .env("MACWL_TYPE", typed)
@@ -1571,17 +1539,12 @@ fn stand_ins_in_the_hosts_listing() {
     assert_eq!(st.code(), Some(5), "{st:?}");
 }
 
-/// Whether the suite runs one VM (the default) or 1:1 (`MACWL_ONE_VM=0`).
-fn suite_one_vm() -> bool {
-    std::env::var_os("MACWL_ONE_VM").is_none_or(|v| v != "0")
-}
-
 fn shmfutex_guest() -> std::path::PathBuf {
     let path = format!("{}/../../target/guest/shmfutex", env!("CARGO_MANIFEST_DIR"));
     std::fs::canonicalize(path).expect("run scripts/build-guest.sh first")
 }
 
-/// `guest/shmfutex` with `args`, in the suite's mode: its stdout, after
+/// `guest/shmfutex` with `args`: its stdout, after
 /// checking it ended well and the runtime said nothing of futexes.
 fn shmfutex(args: &[&str]) -> String {
     let out = macwl_run().arg(shmfutex_guest()).args(args).output().unwrap();
@@ -1595,9 +1558,7 @@ fn shmfutex(args: &[&str]) -> String {
 /// Process-shared mutexes, condition variables, semaphores and barriers
 /// across processes: forked ones sharing anonymous memory, and a program
 /// exec'd afresh mapping a POSIX shm object by name, or a memfd it was
-/// passed over a Unix socket. (In 1:1 a waiter in another Mac process
-/// isn't reached by a wake: it looks at the word now and then instead,
-/// slower, but it works.)
+/// passed over a Unix socket.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn process_shared_sync() {
@@ -1606,8 +1567,7 @@ fn process_shared_sync() {
     }
 }
 
-/// The same between processes of two clients of one host (one VM, as
-/// clients are): one makes a POSIX shm object, the other maps it by name.
+/// The same between processes of two clients of one host: one makes a POSIX shm object, the other maps it by name.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn process_shared_sync_between_clients() {
@@ -1622,16 +1582,12 @@ fn process_shared_sync_between_clients() {
 
 /// Robust mutexes, plain and priority-inheriting, whose holder exits
 /// holding them: the next locker gets EOWNERDEAD, whether it was waiting
-/// already or came later; and (one VM) whose holder is killed with SIGKILL.
+/// already or came later; and whose holder is killed with SIGKILL.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn robust_mutexes() {
     shmfutex(&["robust"]);
-    // Not in 1:1: SIGKILL ends the holder's Mac process outright, with
-    // nothing of the runtime left to walk its robust list.
-    if suite_one_vm() {
-        shmfutex(&["robust", "kill"]);
-    }
+    shmfutex(&["robust", "kill"]);
 }
 
 /// A priority-inheriting process-shared mutex (FUTEX_LOCK_PI and
@@ -1643,14 +1599,10 @@ fn pi_mutexes() {
 }
 
 /// FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP and futex_waitv between processes,
-/// with the counts of waiters woken and moved. One VM only: in 1:1 the
-/// waiters are other Mac processes, which a wake can't reach or count.
+/// with the counts of waiters woken and moved.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn futex_ops_across_processes() {
-    if !suite_one_vm() {
-        return;
-    }
     for test in ["requeue", "wakeop", "waitv"] {
         shmfutex(&[test]);
     }
@@ -1667,15 +1619,11 @@ fn shared_windows() {
 }
 
 /// A file mapped by many processes of a host (as a library is) is one
-/// host mapping however many map it, as `vmmap` lists the host's. One VM
-/// only: in 1:1 each process is a Mac process with a mapping of its own.
+/// host mapping however many map it, as `vmmap` lists the host's.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn one_window_for_a_library_in_many_processes() {
     use std::io::{BufRead, BufReader, Write};
-    if !suite_one_vm() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let lib = dir.path().join("libbig.so");
     std::fs::File::create(&lib).unwrap().write_all(&vec![b'x'; 8 << 20]).unwrap();

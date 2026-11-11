@@ -190,13 +190,6 @@ static void read_line(int tty) {
     _exit(n == 2 && buf[0] == 3 && buf[1] == '\n' ? 0 : 3);
 }
 
-// Whether the processes share a host (pids from 100000 up), rather than
-// each being a Mac process whose terminal the Mac's driver runs: there, a
-// process forked after the session took its terminal (a spare launched
-// ahead) isn't one the Mac counts as having it, so a size change's SIGWINCH
-// and a non-leader's TIOCNOTTY skip it.
-static int one_vm(void) { return getpid() >= 100000; }
-
 // The session of the rules: run as the leader, on pty `name`, with the
 // master `m` (anyone can write it: what's written is typed).
 static void session_rules(const char *name, int m) {
@@ -310,16 +303,15 @@ static void session_rules(const char *name, int m) {
     foreground(tty, getpgrp());
 
     // A new size, set through the master: SIGWINCH to the foreground.
-    j = one_vm() ? job(winch_waiter, tty) : job(pause_forever, tty);
-    CHECK(!one_vm() || (read(report[0], &c, 1) == 1 && c == 'R'));
+    j = job(winch_waiter, tty);
+    CHECK(read(report[0], &c, 1) == 1 && c == 'R');
     foreground(tty, j);
     struct winsize ws = {40, 100, 0, 0}, was;
     CHECK(ioctl(m, TIOCGWINSZ, &was) == 0);
     CHECK(ioctl(m, TIOCSWINSZ, &ws) == 0);
     if (getenv("TTY_TRACE")) fprintf(stderr, "tty %d: size %dx%d to 40x100, foreground %d\n", getpid(), was.ws_row, was.ws_col, tcgetpgrp(tty));
-    if (!one_vm()) kill(j, SIGKILL);
     st = wait_status(j, 0);
-    CHECK(one_vm() ? WIFEXITED(st) && WEXITSTATUS(st) == 0 : WIFSIGNALED(st));
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     foreground(tty, getpgrp());
 
     // A group whose last link in the session goes is orphaned: a read
@@ -371,7 +363,6 @@ static void session_rules(const char *name, int m) {
     // A process that isn't the leader gives the terminal up: it has none.
     pid_t k = fork();
     if (k == 0) {
-        if (!one_vm()) _exit(0);
         CHECK(ioctl(tty, TIOCNOTTY) == 0);
         CHECK(tcgetpgrp(tty) < 0 && errno == ENOTTY);
         CHECK(open("/dev/tty", O_RDWR) < 0 && errno == ENXIO);
