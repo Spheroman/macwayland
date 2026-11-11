@@ -3,10 +3,10 @@
 //! from [`crate::hostinfo`] and the host), and `/proc/<pid>` for every
 //! process the kernel has (`self` and `thread-self` too): `stat`, `status`,
 //! `statm`, `cmdline`, `environ`, `comm`, `maps`, `fd/`, `exe`, `cwd`,
-//! `task/<tid>/` and `mounts`/`mountinfo`. With many processes in a host,
-//! that's every process of the host, from its process table and from each
-//! process's own state and memory ([`Kernel::with_process`]); in 1:1 mode,
-//! the process itself. Directories list what's in them.
+//! `task/<tid>/` and `mounts`/`mountinfo`. That's every process of the host,
+//! from its process table and from each process's own state and memory
+//! ([`Kernel::with_process`]) (for a process on its own, `HostKernel`, the
+//! process itself). Directories list what's in them.
 //!
 //! [`Kernel::with_process`]: crate::syscall::Kernel::with_process
 

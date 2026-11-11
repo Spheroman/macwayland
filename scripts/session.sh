@@ -5,14 +5,12 @@
 # Cmd+Q quits. Needs: cargo build --release, nix (for foot), signed binaries.
 #
 # The session's Linux processes share one host (one Mac process, one VM:
-# docs/processes.md; MACWL_ONE_VM=0 for a VM per process instead): the
-# script starts it (`macwl-run --serve`) and exports MACWL_HOST, so the
+# docs/processes.md): the script starts it (`macwl-run --serve`) and exports MACWL_HOST, so the
 # D-Bus daemon, foot and everything started from the session (a Mac
 # terminal that sources its environment too) join it as its clients.
 # `macwl-run --ps` lists its processes.
 # Linux programs there can run Mac ones (open, pbcopy, git, ...), each a Mac
-# process of its own that the Linux process stands in for. Without one VM
-# they're off: Mac programs need the host that runs them never to exec.
+# process of its own that the Linux process stands in for.
 #
 # For tests: MACWL_SESSION_COMPOSITOR=headless runs the headless compositor
 # (macwl-compositor, typed at with MACWL_TYPE, its frames dumped in the
@@ -53,18 +51,15 @@ done
 export WAYLAND_DISPLAY=wayland-mac XDG_RUNTIME_DIR=$runtime
 
 # One host for the session: everything below joins it.
-host=
-if [ "$MACWL_ONE_VM" != 0 ]; then
-    export MACWL_HOST="$runtime/macwl-host"
-    # Mac programs are the host's to start (docs/processes.md, section 7).
-    MACWL_MAC_PROGRAMS=1 target/release/macwl-run --serve "$MACWL_HOST" </dev/null &
-    host=$!
-    trap 'kill $shell $host 2>/dev/null' EXIT
-    while [ ! -S "$MACWL_HOST" ]; do
-        kill -0 $host 2>/dev/null || exit 1
-        sleep 0.05
-    done
-fi
+export MACWL_HOST="$runtime/macwl-host"
+# Mac programs are the host's to start (docs/processes.md, section 7).
+MACWL_MAC_PROGRAMS=1 target/release/macwl-run --serve "$MACWL_HOST" </dev/null &
+host=$!
+trap 'kill $shell $host 2>/dev/null' EXIT
+while [ ! -S "$MACWL_HOST" ]; do
+    kill -0 $host 2>/dev/null || exit 1
+    sleep 0.05
+done
 
 # A D-Bus session bus (nixpkgs' dbus-daemon, under macwl-run too).
 target/release/macwl-run "$dbus/bin/dbus-daemon" --config-file="$dbus/share/dbus-1/session.conf" \

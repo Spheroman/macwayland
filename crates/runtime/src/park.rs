@@ -33,25 +33,21 @@ use std::{
     collections::HashMap,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
-        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard,
     },
     time::Instant,
 };
 
 use linux_abi::syscall::kevent_now;
 
-use crate::{
-    sched::{Job, Placed, Sched, Start, Task},
-    Proc,
-};
+use crate::sched::{Job, Placed, Sched, Start, Task};
 
 /// User events in the host's kqueue: tasks to place (with a CPU to start,
-/// say), the host ending, a host signal (1:1). Tasks' timers are idents
+/// say), the host ending. Tasks' timers are idents
 /// from their ids, which start well above these.
 const PLACE: usize = 1;
 const STOP: usize = 2;
-const HOST_SIGNAL: usize = 3;
 const FIRST_ID: u64 = 1 << 16;
 
 const SHARDS: usize = 32;
@@ -87,15 +83,7 @@ pub(crate) struct Parking {
     sched: Arc<Sched>,
     ready: Mutex<Vec<Ready>>,
     any_ready: AtomicBool,
-    /// 1:1: the process host signals are for, whose threads a host signal
-    /// (or SIGCHLD, for a parked `wait4`) wakes: a parked one has no host
-    /// thread for it to land on.
-    host_signals_for: Mutex<Option<Weak<Proc>>>,
 }
-
-/// The kqueue of the host whose waiters a host signal's handler tells (the
-/// host running now; a test binary runs several, one after another).
-static HOST_KQ: AtomicI32 = AtomicI32::new(-1);
 
 fn kev(ident: usize, filter: i16, flags: u16, fflags: u32, data: isize, udata: u64) -> libc::kevent {
     libc::kevent { ident, filter, flags, fflags, data, udata: udata as usize as *mut libc::c_void }
@@ -116,15 +104,6 @@ fn change(kq: i32, ev: libc::kevent) -> Result<(), i32> {
 
 fn trigger(kq: i32, ident: usize) {
     kevent_now(kq, &[kev(ident, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, 0)], &mut []);
-}
-
-/// From a host signal's handler: the waiters wake the threads it's for
-/// (async-signal-safe: one `kevent64`, no allocation).
-pub(crate) fn host_signal_arrived() {
-    let kq = HOST_KQ.load(Ordering::Acquire);
-    if kq >= 0 {
-        trigger(kq, HOST_SIGNAL);
-    }
 }
 
 /// A new id for a task's location (never reused, so a stale event names no
@@ -148,10 +127,9 @@ impl Parking {
         unsafe { libc::fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC) };
         let kq = unsafe { OwnedFd::from_raw_fd(kq) };
         // STOP stays triggered once it is (no EV_CLEAR): every waiter sees it.
-        for (ident, flags) in [(PLACE, libc::EV_ADD | libc::EV_CLEAR), (STOP, libc::EV_ADD), (HOST_SIGNAL, libc::EV_ADD | libc::EV_CLEAR)] {
+        for (ident, flags) in [(PLACE, libc::EV_ADD | libc::EV_CLEAR), (STOP, libc::EV_ADD)] {
             change(kq.as_raw_fd(), kev(ident, libc::EVFILT_USER, flags, 0, 0, 0)).map_err(std::io::Error::from_raw_os_error)?;
         }
-        HOST_KQ.store(kq.as_raw_fd(), Ordering::Release);
         sched.set_stop_kq(kq.as_raw_fd());
         Ok(Arc::new(Parking {
             kq,
@@ -159,19 +137,11 @@ impl Parking {
             sched,
             ready: Mutex::default(),
             any_ready: AtomicBool::new(false),
-            host_signals_for: Mutex::new(None),
         }))
     }
 
     fn shard(&self, id: u64) -> MutexGuard<'_, HashMap<u64, Parked>> {
         self.shards[id as usize % SHARDS].lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// 1:1: host signals are for `proc`'s threads; and a SIGCHLD to the
-    /// host wakes them too (a `wait4` for a host child parks on it).
-    pub fn host_signals_for(&self, proc: &Arc<Proc>) {
-        *self.host_signals_for.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(proc));
-        let _ = change(self.kq.as_raw_fd(), kev(libc::SIGCHLD as usize, libc::EVFILT_SIGNAL, libc::EV_ADD, 0, 0, 0));
     }
 
     /// Make `task`'s thread one this host can unpark: its waker's hook.
@@ -319,31 +289,23 @@ impl Parking {
     }
 
     /// Wait for events in the host's kqueue: the ids of tasks to make
-    /// runnable, whether the host is ending, whether a host signal (or
-    /// SIGCHLD) came.
-    fn wait(&self, out: &mut [libc::kevent]) -> (Vec<u64>, bool, bool) {
+    /// runnable, and whether the host is ending.
+    fn wait(&self, out: &mut [libc::kevent]) -> (Vec<u64>, bool) {
         // Asleep in `poll` on the kqueue, then its events taken: a thread
         // asleep in `kevent` itself takes ~8 µs longer to wake (measured,
         // wakebench), every time.
         let mut pf = libc::pollfd { fd: self.kq.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         unsafe { libc::poll(&mut pf, 1, -1) };
         let n = kevent_now(self.kq.as_raw_fd(), &[], out);
-        let (mut ids, mut stop, mut signal) = (Vec::new(), false, false);
+        let (mut ids, mut stop) = (Vec::new(), false);
         for ev in &out[..n.max(0) as usize] {
             match (ev.filter, ev.ident) {
                 (libc::EVFILT_USER, STOP) => stop = true,
-                (libc::EVFILT_USER, HOST_SIGNAL) | (libc::EVFILT_SIGNAL, _) => signal = true,
                 (libc::EVFILT_USER, _) => {}
                 _ => ids.push(ev.udata as usize as u64),
             }
         }
-        (ids, stop, signal)
-    }
-}
-
-impl Drop for Parking {
-    fn drop(&mut self) {
-        let _ = HOST_KQ.compare_exchange(self.kq.as_raw_fd(), -1, Ordering::AcqRel, Ordering::Acquire);
+        (ids, stop)
     }
 }
 
@@ -358,22 +320,16 @@ pub(crate) fn waiters() -> usize {
 }
 
 /// Start the host's waiter threads: each waits in the host's kqueue, makes
-/// tasks runnable as their waits end, places what's ready, and wakes a 1:1
-/// process's threads for a host signal, until the host ends.
+/// tasks runnable as their waits end, and places what's ready, until the
+/// host ends.
 pub(crate) fn run_waiters<'scope, 'env>(sh: &'scope crate::Host<'env>, scope: &'scope crate::Scope<'scope, 'env>) {
     for _ in 0..waiters() {
         linux_abi::host_threads::spawn_scoped(scope, "waiter", move || {
             let mut out: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
             loop {
-                let (ids, stop, signal) = sh.parking.wait(&mut out);
+                let (ids, stop) = sh.parking.wait(&mut out);
                 for id in ids {
                     sh.parking.unpark(id);
-                }
-                if signal {
-                    let proc = sh.parking.host_signals_for.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Weak::upgrade);
-                    if let Some(proc) = proc {
-                        proc.abi.wake_all_threads();
-                    }
                 }
                 crate::place_ready(sh, scope);
                 if stop {

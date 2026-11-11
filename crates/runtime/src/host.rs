@@ -1,5 +1,5 @@
-//! Many Linux processes in one VM (docs/processes.md, step 3): the default
-//! since step 6 (`MACWL_ONE_VM=0` for 1:1).
+//! Many Linux processes in one VM (docs/processes.md, step 3): the only
+//! mode since step 8.
 //!
 //! A host is one Mac process with one VM that runs every Linux process of a
 //! `macwl-run` tree: the processes' tasks share its CPUs, their address
@@ -1530,7 +1530,7 @@ impl Kernel for TableKernel {
 
     fn with_process(&self, _p: &Process, pid: i64, f: &mut dyn FnMut(&Process, &dyn GuestMemory)) -> Result<(), i64> {
         let proc = self.table()?.local(pid).ok_or(errno::ESRCH)?;
-        let space = proc.space.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or(errno::ESRCH)?;
+        let space = proc.space();
         f(&proc.abi, &*space);
         Ok(())
     }
@@ -1624,7 +1624,7 @@ pub(crate) fn run(elf: &[u8], argv: &[&[u8]], envp: &[&[u8]], mut process: Proce
         let _ = table.relay.set(relay.clone());
         relay.start(&table);
     }
-    let host = Host { vm: &vm, machine: &machine, sched, parking, table: Some(table.clone()), exec_host: Mutex::new(None) };
+    let host = Host { vm: &vm, machine: &machine, sched, parking, table: table.clone() };
     std::thread::scope(|scope| {
         linux_abi::host_threads::spawn_scoped(scope, "ticker", || host.sched.ticker()).expect("the host's own threads fit its budget");
         crate::park::run_waiters(&host, scope);
@@ -1786,7 +1786,7 @@ pub(crate) fn park<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'s
 /// A vfork child has exec'd or ended: its parent's task runs on.
 pub(crate) fn vfork_done(sh: &Host, proc: &Proc) {
     let Some(parent) = proc.vfork_parent.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
-    let Some(table) = &sh.table else { return };
+    let table = &sh.table;
     let child = proc.abi.pid;
     let mut parked = parent.parked();
     match parked.vfork.iter().position(|(c, ..)| *c == child) {

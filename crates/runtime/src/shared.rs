@@ -28,7 +28,6 @@ use std::{
 
 use linux_abi::{
     errno,
-    wire::{Decoder, Encoder, Truncated},
     SharedKey,
 };
 
@@ -88,9 +87,8 @@ struct Window {
     len: u64,
     writable: bool,
     object: Object,
-    /// What's mapped, from `offset`: the guest's file, or a POSIX shm object
-    /// for shared anonymous memory. Kept so a forked child can map it too.
-    fd: OwnedFd,
+    /// Where in what's mapped (the guest's file, or a POSIX shm object for
+    /// shared anonymous memory) it starts.
     offset: u64,
     /// Address spaces using it.
     users: u32,
@@ -166,17 +164,11 @@ impl SharedWindows {
             w.users += 1;
             return Ok((start, start + (offset - w.offset)));
         }
-        let (fd, host_off) = match fd {
-            Some(fd) => {
-                let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if dup < 0 {
-                    return Err(errno::from_io(&std::io::Error::last_os_error()));
-                }
-                (unsafe { OwnedFd::from_raw_fd(dup) }, host_off)
-            }
-            None => (anonymous_shm(host_len)?, 0),
+        // The mapping holds what it maps: the fd isn't needed after.
+        let window = match fd {
+            Some(fd) => map_host(fd, host_off, host_len, writable, object.unwrap_or_else(Object::own))?,
+            None => map_host(anonymous_shm(host_len)?.as_raw_fd(), 0, host_len, writable, Object::own())?,
         };
-        let window = map_host(fd, host_off, host_len, writable, object.unwrap_or_else(Object::own))?;
         let Some(ipa) = self.alloc(host_len) else {
             unsafe { libc::munmap(window.host.as_ptr().cast(), host_len as usize) };
             return Err(errno::ENOMEM);
@@ -235,15 +227,6 @@ impl SharedWindows {
             map_window(ipa, w)?;
         }
         self.vm_live = true;
-        Ok(())
-    }
-
-    /// Unmap every window from the VM, before it goes.
-    pub fn detach_vm(&mut self) -> Result<(), HvError> {
-        for (&ipa, w) in &self.windows {
-            hv::unmap(ipa, w.len as usize)?;
-        }
-        self.vm_live = false;
         Ok(())
     }
 
@@ -325,74 +308,29 @@ impl SharedWindows {
 /// on the host side instead: nothing writes it (the guest's page tables and
 /// the VM mapping are read-only), and a private mapping still sees the file's
 /// changes in pages no one has written.
-fn map_host(fd: OwnedFd, offset: u64, len: u64, writable: bool, object: Object) -> Result<Window, i64> {
+fn map_host(fd: RawFd, offset: u64, len: u64, writable: bool, object: Object) -> Result<Window, i64> {
     let rw = libc::PROT_READ | libc::PROT_WRITE;
     let (prot, flags) = if writable {
         (rw, libc::MAP_SHARED)
     } else {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
-        let read_only_fd = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY;
+        unsafe { libc::fstat(fd, &mut st) };
+        let read_only_fd = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY;
         if read_only_fd && st.st_mode & libc::S_IFMT == libc::S_IFREG {
             (rw, libc::MAP_PRIVATE)
         } else {
             (libc::PROT_READ, libc::MAP_SHARED)
         }
     };
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, prot, flags, fd.as_raw_fd(), offset as libc::off_t) };
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, prot, flags, fd, offset as libc::off_t) };
     if p == libc::MAP_FAILED {
         return Err(errno::from_io(&std::io::Error::last_os_error()));
     }
-    Ok(Window { host: NonNull::new(p.cast()).unwrap(), len, writable, object, fd, offset, users: 1 })
+    Ok(Window { host: NonNull::new(p.cast()).unwrap(), len, writable, object, offset, users: 1 })
 }
 
 impl SharedWindows {
-    /// Encode the windows starting at `starts` for a child in another
-    /// process (1:1 fork), which maps the same objects (so they stay
-    /// shared). Returns their fds, in order, to pass along.
-    pub fn encode<'a>(&self, e: &mut Encoder, starts: impl ExactSizeIterator<Item = &'a u64>) -> Vec<RawFd> {
-        e.u64(starts.len() as u64);
-        let mut fds = Vec::new();
-        for ipa in starts {
-            let w = &self.windows[ipa];
-            e.u64(*ipa).u64(w.len).bool(w.writable).u64(w.offset).u64(w.object.0[0]).u64(w.object.0[1]);
-            fds.push(w.fd.as_raw_fd());
-        }
-        fds
-    }
 
-    /// The child's side of [`SharedWindows::encode`], into a VM's windows
-    /// (none yet): each is used by the one address space. Returns their
-    /// starts.
-    pub fn decode(&mut self, d: &mut Decoder, fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Vec<u64>, Truncated> {
-        let mut starts = Vec::new();
-        for _ in 0..d.count(32)? {
-            let (ipa, len, writable, offset) = (d.u64()?, d.u64()?, d.bool()?, d.u64()?);
-            let object = Object([d.u64()?, d.u64()?]);
-            let fd = fds.next().ok_or(Truncated)?;
-            let w = map_host(fd, offset, len, writable, object).map_err(|_| Truncated)?;
-            self.reserve(ipa, len).ok_or(Truncated)?;
-            self.insert(ipa, w);
-            starts.push(ipa);
-        }
-        Ok(starts)
-    }
-
-    /// Take `[start, start + len)` out of the free IPA ranges.
-    fn reserve(&mut self, start: u64, len: u64) -> Option<()> {
-        let (&fs, &fe) = self.free.range(..=start).next_back()?;
-        if fe < start + len {
-            return None;
-        }
-        self.free.remove(&fs);
-        if fs < start {
-            self.free.insert(fs, start);
-        }
-        if start + len < fe {
-            self.free.insert(start + len, fe);
-        }
-        Some(())
-    }
 }
 
 fn map_window(ipa: u64, w: &Window) -> Result<(), HvError> {
@@ -435,22 +373,6 @@ mod tests {
         assert_eq!(start, IPA_BASE);
         assert_eq!(pa, IPA_BASE + 3 * 4096);
         assert_eq!(s.find(pa), Some((IPA_BASE, IPA_BASE + HOST_PAGE)));
-    }
-
-    #[test]
-    fn a_decoded_copy_shares_the_same_memory() {
-        let mut s = SharedWindows::default();
-        let (first, _) = s.create(None, 0, 4096, true).unwrap();
-        let (second, pa) = s.create(None, 0, 8192, true).unwrap();
-        let mut e = Encoder::default();
-        let fds: Vec<OwnedFd> =
-            s.encode(&mut e, [first, second].iter()).into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(libc::dup(fd)) }).collect();
-        let mut copy = SharedWindows::default();
-        assert_eq!(copy.decode(&mut Decoder(&e.0), &mut fds.into_iter()).unwrap(), vec![first, second]);
-        assert_eq!(copy.ranges(), s.ranges());
-        assert_eq!(copy.free, s.free);
-        unsafe { *s.ptr(pa).unwrap() = 42 };
-        assert_eq!(unsafe { *copy.ptr(pa).unwrap() }, 42, "shared, not copied");
     }
 
     #[test]

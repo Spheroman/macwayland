@@ -167,12 +167,6 @@ impl Drop for Inotify {
     }
 }
 
-impl Inotify {
-    /// For a forked child: each watch's (wd, host path, mask).
-    pub fn state(&self) -> Vec<(i32, Vec<u8>, u32)> {
-        self.0.lock().watches.iter().map(|(&wd, w)| (wd, w.path.clone(), w.mask)).collect()
-    }
-}
 
 fn new_instance(nonblock: bool) -> Result<(FdEntry, Arc<Shared>), i64> {
     let kq = kfd::new_kqueue(nonblock)?;
@@ -194,20 +188,6 @@ pub(super) fn inotify_init1(p: &Process, flags: u64) -> Result<i64, i64> {
     }
     let (entry, _) = new_instance(flags & O_NONBLOCK != 0)?;
     Ok(p.fds.insert(entry.cloexec(flags & O_CLOEXEC != 0)))
-}
-
-/// A forked child's copy of an instance, watching the same paths.
-pub(crate) fn inotify_copy(watches: Vec<(i32, Vec<u8>, u32)>, nonblock: bool) -> Result<FdEntry, i64> {
-    let (entry, shared) = new_instance(nonblock)?;
-    for (wd, path, mask) in watches {
-        let Ok(path) = CString::new(path) else { continue };
-        if let Ok(watch) = new_watch(&shared, wd, &path, mask) {
-            let mut state = shared.lock();
-            state.next_wd = state.next_wd.max(wd + 1);
-            state.watches.insert(wd, watch);
-        }
-    }
-    Ok(entry)
 }
 
 fn instance(file: &OpenFile) -> Result<&Arc<Shared>, i64> {

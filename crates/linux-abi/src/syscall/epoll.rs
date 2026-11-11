@@ -45,16 +45,6 @@ pub(crate) fn new_instance() -> Result<FdEntry, i64> {
     Ok(entry)
 }
 
-/// In a forked child: make epoll instance `epfd` watch `fd` again.
-pub(crate) fn rewatch(table: &crate::fs::FdTable, epfd: u64, fd: i32, interest: Interest) {
-    let (Ok(ep), Ok(target)) = (table.get(epfd), table.get(fd as u64)) else { return };
-    if let Ok(set) = interests(&ep)
-        && register(ep.host.as_raw_fd(), target.host.as_raw_fd(), fd, Some(interest.events)).is_ok()
-    {
-        set.lock().unwrap_or_else(|e| e.into_inner()).insert(fd, interest);
-    }
-}
-
 pub(super) fn epoll_create1(p: &Process, flags: u64) -> Result<i64, i64> {
     if flags & !EPOLL_CLOEXEC != 0 {
         return Err(errno::EINVAL);

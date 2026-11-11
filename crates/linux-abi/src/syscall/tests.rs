@@ -98,7 +98,7 @@ impl T {
             Action::Return(v) => v,
             Action::Exit(c) | Action::ExitThread(c) => panic!("exited with {c}"),
             Action::SigReturn => panic!("rt_sigreturn wants the core"),
-            a @ (Action::Fork(_) | Action::Exec(_) | Action::ExecHost(_) | Action::MacStandIn(_) | Action::Spawn(_)) => panic!("{} wants the core: {a:?}", nr::name(nr)),
+            a @ (Action::Fork(_) | Action::Exec(_) | Action::MacStandIn(_) | Action::Spawn(_)) => panic!("{} wants the core: {a:?}", nr::name(nr)),
         }
     }
 
@@ -1380,18 +1380,13 @@ fn signal_numbers_translate() {
 }
 
 #[test]
-fn fork_state_round_trips() {
-    use crate::wire::{Decoder, Encoder};
-    use std::os::fd::{FromRawFd, OwnedFd};
+fn a_fork_child_inherits_its_parents_state() {
     let mut t = T::new();
     let fd = t.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     t.p.set_exe(b"/bin/prog".to_vec());
     let ign = t.put(&[1u64.to_le_bytes(), [0; 8], [0; 8], [0; 8]].concat());
     t.ok(nr::RT_SIGACTION, &[13, ign, 0, 8]);
-    let mut e = Encoder::default();
-    let host: Vec<OwnedFd> = t.p.encode_for_fork(&t.th, &mut e).into_iter().map(|h| unsafe { OwnedFd::from_raw_fd(libc::dup(h)) }).collect();
-    let (ctl, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let (q, mut qt) = Process::decode_forked(&mut Decoder(&e.0), host, ctl.into()).unwrap();
+    let (q, mut qt) = t.p.fork_in_host(&t.th, t.p.pid + 1);
     assert_eq!(q.exe(), t.p.exe());
     assert_eq!(q.fs.root(), t.p.fs.root());
     assert!(q.fds.cloexec(fd).unwrap());
@@ -1609,18 +1604,13 @@ fn inotify_reports_changes() {
 
 #[test]
 fn inotify_goes_to_a_forked_child() {
-    use std::os::fd::{FromRawFd, OwnedFd};
     let mut t = T::new();
     let d = t.s("/d");
     t.ok(nr::MKDIRAT, &[FDCWD, d, 0o755]);
     let fd = t.ok(nr::INOTIFY_INIT1, &[0o4000]);
     let wd = t.ok(nr::INOTIFY_ADD_WATCH, &[fd, d, 0x100 /* IN_CREATE */]);
-    // As a fork does: the table encoded, and decoded with its host fds.
-    let mut e = crate::wire::Encoder::default();
-    let host = t.p.fds.encode(&mut e);
-    let mut fds = host.iter().map(|&h| unsafe { OwnedFd::from_raw_fd(libc::dup(h)) });
-    let child = crate::fs::FdTable::decode(&mut crate::wire::Decoder(&e.0), &mut fds, &t.p.inbox).unwrap();
-    let file = child.get(fd).unwrap();
+    let (child, _) = t.p.fork_in_host(&t.th, t.p.pid + 1);
+    let file = child.fds.get(fd).unwrap();
     std::fs::write(t.root().join("d/new"), "x").unwrap();
     let mut buf = [0u8; 64];
     let start = std::time::Instant::now();

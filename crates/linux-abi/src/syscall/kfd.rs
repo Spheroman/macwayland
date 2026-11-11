@@ -132,42 +132,6 @@ pub(super) fn nonblocking(file: &OpenFile) -> bool {
     flags & libc::O_NONBLOCK != 0
 }
 
-impl EventFd {
-    /// For a forked child: (count, semaphore).
-    pub fn state(&self) -> (u64, bool) {
-        (self.count, self.semaphore)
-    }
-}
-
-impl TimerFd {
-    /// For a forked child: (clock, interval, time to the next expiry).
-    pub fn state(&self) -> (u64, Duration, Option<Duration>) {
-        (self.clock, self.interval, self.deadline.map(|d| d.saturating_duration_since(Instant::now())))
-    }
-}
-
-/// A forked child's copy of an eventfd.
-pub(crate) fn eventfd_copy(count: u64, semaphore: bool, nonblock: bool) -> Result<FdEntry, i64> {
-    let kq = new_kqueue(nonblock)?;
-    change(kq.as_raw_fd(), user_event(libc::EV_ADD | libc::EV_CLEAR, 0))?;
-    if count != 0 {
-        change(kq.as_raw_fd(), user_event(0, libc::NOTE_TRIGGER))?;
-    }
-    let mut entry = FdEntry::new(kq);
-    entry.kind = FileKind::EventFd(Mutex::new(EventFd { count, semaphore }));
-    Ok(entry)
-}
-
-/// A forked child's copy of a timerfd.
-pub(crate) fn timerfd_copy(clock: u64, interval: Duration, left: Option<Duration>, nonblock: bool) -> Result<FdEntry, i64> {
-    let kq = new_kqueue(nonblock)?;
-    let deadline = left.map(|l| Instant::now() + l);
-    arm(kq.as_raw_fd(), deadline)?;
-    let mut entry = FdEntry::new(kq);
-    entry.kind = FileKind::TimerFd(Mutex::new(TimerFd { clock, deadline, interval }));
-    Ok(entry)
-}
-
 pub(super) fn eventfd2(p: &Process, initval: u64, flags: u64) -> Result<i64, i64> {
     if flags & !(O_NONBLOCK | O_CLOEXEC | EFD_SEMAPHORE) != 0 {
         return Err(errno::EINVAL);

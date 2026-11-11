@@ -2,8 +2,7 @@
 //!
 //! A [`Cpu`] is a vCPU and the host thread that owns it (Hypervisor.framework
 //! ties a vCPU to the thread that made it); a [`Task`] is a guest thread.
-//! A host (a VM: one Linux process in 1:1 mode, many by default,
-//! docs/processes.md) has a CPU per physical core at most, shared by the
+//! A host (a VM and the Linux processes in it, docs/processes.md) has a CPU per physical core at most, shared by the
 //! tasks of all its processes, made as tasks need them and kept until it
 //! ends: each takes the next task from the run queue
 //! ([`Sched`]) when its own exits, is preempted, or blocks. Tasks beyond the

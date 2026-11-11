@@ -233,7 +233,7 @@ pub(crate) fn serve(path: &Path, idle_exit: bool) -> Result<(), Error> {
     let machine = Machine::new()?;
     let vm = hv::Vm::new()?;
     machine.map_into(&vm)?;
-    let host = Host { vm: &vm, machine: &machine, sched, parking, table: Some(table.clone()), exec_host: Mutex::new(None) };
+    let host = Host { vm: &vm, machine: &machine, sched, parking, table: table.clone() };
     let mut service = Service { table, notify, endpoint, clients: Vec::new(), started: idle_exit, idle_since: None };
     std::thread::scope(|scope| {
         linux_abi::host_threads::spawn_scoped(scope, "ticker", || host.sched.ticker()).expect("the host's own threads fit its budget");
@@ -630,7 +630,7 @@ impl Service {
         for (pid, ppid, pgid, sid, ctty, state, cpu, proc, comm, mac) in rows {
             // The command line from the process's memory, as /proc's
             // cmdline; a zombie's name in brackets.
-            let (cmd, rss_kb) = match proc.and_then(|p| Some((p.abi.arg_area(), p.space.lock().unwrap_or_else(|e| e.into_inner()).clone()?))) {
+            let (cmd, rss_kb) = match proc.map(|p| (p.abi.arg_area(), p.space())) {
                 Some(([a0, a1, ..], space)) => {
                     let mut args = vec![0u8; a1.saturating_sub(a0).min(4096) as usize];
                     let args = if linux_abi::GuestMemory::read(&*space, a0, &mut args).is_ok() { args } else { Vec::new() };

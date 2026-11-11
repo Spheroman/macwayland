@@ -2,16 +2,16 @@
 //! processes (`kill`, `wait`), process groups and sessions, terminals'
 //! foreground groups, CPU accounting.
 //!
-//! Today every Linux process is a Mac process, so these are the host's own
-//! calls ([`HostKernel`]). With many processes in one VM (docs/processes.md)
-//! the runtime keeps the process table instead, and answers them from it
-//! with a `Kernel` of its own; the dispatcher doesn't change.
+//! The runtime keeps the process table of its host (docs/processes.md) and
+//! answers these from it with a `Kernel` of its own. [`HostKernel`] is for
+//! a process on its own (this crate's tests): no children, and the host's
+//! own calls for the rest.
 
 use std::{os::fd::AsRawFd, time::Duration};
 
 use crate::fs::OpenFile;
 
-use super::{ok, process, signal, Process, Thread};
+use super::{ok, signal, Process, Thread};
 use crate::errno;
 
 /// A child that changed state, as `wait4` reports it.
@@ -74,12 +74,9 @@ pub struct ProcStatus {
 pub enum MacPrograms {
     /// It fails with ENOEXEC (Mac programs are off).
     Refused,
-    /// The host process becomes the Mac program (`Action::ExecHost`): only
-    /// when the host process is this Linux process alone (1:1).
-    ExecHost,
     /// The Mac program is spawned as a process of its own, and this one
-    /// stands in for it in the process table (`Action::MacStandIn`): with
-    /// many processes in one VM, whose host never execs.
+    /// stands in for it in the process table (`Action::MacStandIn`): the
+    /// host never execs.
     StandIn,
 }
 
@@ -210,13 +207,14 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
         if on { Err(errno::EINVAL) } else { Ok(()) }
     }
     /// Process `pid`'s CPU time (user and system), for its CPU clock; None:
-    /// the host's own clock for this process says (1:1, where the host
-    /// process is the Linux one), and other processes' are out of reach.
+    /// the host's own clock for this process says (a process on its own,
+    /// where the host process is the Linux one), and other processes' are
+    /// out of reach.
     fn process_cpu_time(&self, p: &Process, pid: i64) -> Result<Option<Duration>, i64> {
         if pid == p.pid { Ok(None) } else { Err(errno::EINVAL) }
     }
-    /// The processes `/proc` lists: every one the kernel has (in 1:1 mode,
-    /// the caller alone: others are Mac processes).
+    /// The processes `/proc` lists: every one the kernel has (for a process
+    /// on its own, the caller alone: others are Mac processes).
     fn pids(&self, p: &Process) -> Vec<i64> {
         vec![p.pid]
     }
@@ -251,8 +249,8 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
         })
     }
     /// Run `f` with another process's state and memory, for its `/proc`
-    /// files: ESRCH if it isn't one the kernel runs (a zombie, or in 1:1
-    /// mode any other).
+    /// files: ESRCH if it isn't one the kernel runs (a zombie, or for a
+    /// process on its own any other).
     fn with_process(&self, _p: &Process, _pid: i64, _f: &mut dyn FnMut(&Process, &dyn crate::memory::GuestMemory)) -> Result<(), i64> {
         Err(errno::ESRCH)
     }
@@ -267,9 +265,9 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Each Linux process is a host process: pids, groups, sessions, `wait` and
-/// signals are the host's own, adjusted where Linux differs (a fork child's
-/// control socket: see `process.rs`).
+/// A Linux process on its own, as this crate's tests run one: it has no
+/// children (it can't fork: that's the runtime's), and pids, groups,
+/// sessions and signals are the host's own.
 #[derive(Debug, Default)]
 pub struct HostKernel;
 
@@ -282,8 +280,8 @@ impl Kernel for HostKernel {
         ok(unsafe { libc::getpgid(pid as i32) } as i64)
     }
 
-    fn setpgid(&self, p: &Process, pid: i64, pgid: i64) -> Result<i64, i64> {
-        process::host_setpgid(p, pid, pgid)
+    fn setpgid(&self, _p: &Process, pid: i64, pgid: i64) -> Result<i64, i64> {
+        ok(unsafe { libc::setpgid(pid as i32, pgid as i32) } as i64)
     }
 
     fn getsid(&self, _p: &Process, pid: i64) -> Result<i64, i64> {
@@ -297,8 +295,7 @@ impl Kernel for HostKernel {
     fn kill(&self, p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
         match target {
             // The caller's group: the Mac process group holds processes that
-            // aren't Linux ones (the runtime itself, a spare), so the caller
-            // only.
+            // aren't Linux ones (the test runner), so the caller only.
             0 => signal::kill_self(p, sig),
             -1 => {
                 // Every process the user owns: on a Mac that's the whole login
@@ -331,12 +328,12 @@ impl Kernel for HostKernel {
         self.kill(p, pid, sig)
     }
 
-    fn wait4(&self, p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
-        process::host_wait4(p, t, pid, options)
+    fn wait4(&self, _p: &Process, _t: &Thread, _pid: i64, _options: u64) -> Result<Option<Waited>, i64> {
+        Err(errno::ECHILD)
     }
 
-    fn waitid(&self, p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
-        process::host_waitid(p, t, idtype, id, options)
+    fn waitid(&self, _p: &Process, _t: &Thread, _idtype: u64, _id: u64, _options: u64) -> Result<Option<ChildInfo>, i64> {
+        Err(errno::ECHILD)
     }
 
     fn tcgetpgrp(&self, _p: &Process, file: &OpenFile) -> Result<i64, i64> {
@@ -373,13 +370,13 @@ impl Kernel for HostKernel {
     }
 
     fn umask_changed(&self, _p: &Process, mask: u32) {
-        // The host process is the Linux process: what it creates (and a Mac
-        // program it becomes) gets the mask from the host too.
+        // The host process is the Linux process: what it creates gets the
+        // mask from the host too.
         unsafe { libc::umask(mask as libc::mode_t) };
     }
 
     fn mac_programs(&self) -> MacPrograms {
-        if process::mac_programs_allowed() { MacPrograms::ExecHost } else { MacPrograms::Refused }
+        MacPrograms::Refused
     }
 }
 

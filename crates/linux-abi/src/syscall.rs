@@ -29,9 +29,7 @@ pub use tty::{identify as tty_of, TtyId, TtyOp};
 #[cfg(test)]
 mod tests;
 
-pub(crate) use epoll::{new_instance as new_epoll, rewatch};
-pub(crate) use inotify::{inotify_copy, inotify_pending, inotify_read};
-pub(crate) use kfd::{eventfd_copy, timerfd_copy};
+pub(crate) use inotify::{inotify_pending, inotify_read};
 pub use kfd::now as kevent_now;
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
 pub use signalfd::{HostSignalWait, SignalFd};
@@ -39,7 +37,7 @@ pub use futex::{finish_wait as futex_finish_wait, restarts_after_handler as fute
 pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, MacPrograms, ProcStatus, Waited, RUSAGE_SIZE};
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
-pub use process::{answer_setpgid, ctl, exec_host, mac_environment, mac_programs_allowed, mac_spawn, Exec, Fork, HostExec, MacSpawn, Spawn};
+pub use process::{mac_environment, mac_programs_allowed, mac_spawn, Exec, Fork, HostExec, MacSpawn, Spawn};
 pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
 /// Signal numbers between Linux's and Darwin's (a client forwards the Mac
 /// side's to its Linux process, and ends as that process did).
@@ -89,10 +87,6 @@ pub struct Process {
     /// `prctl` flags.
     dumpable: AtomicBool,
     no_new_privs: AtomicBool,
-    /// Forked children not yet waited for.
-    children: Mutex<process::Children>,
-    /// If this process was forked: the control socket to its parent.
-    parent_ctl: Option<OwnedFd>,
     /// Its private futexes' number, in the futex table's keys.
     futexes: futex::Futexes,
     /// Each thread's robust futex list (`set_robust_list`), by tid: what
@@ -110,7 +104,8 @@ pub struct Process {
     /// Which files are mapped where.
     file_maps: Mutex<mem::FileMaps>,
     /// What the process asks of the world outside it: other processes,
-    /// groups, sessions, accounting (the host's own, in 1:1 mode).
+    /// groups, sessions, accounting (the host's process table; the host's
+    /// own calls for a process on its own, [`HostKernel`]).
     pub kernel: Arc<dyn Kernel>,
     /// Signals and timer expiries from outside its system calls, and who
     /// to wake for them.
@@ -242,8 +237,6 @@ impl Process {
             rlimits: Mutex::new(misc::default_rlimits()),
             dumpable: AtomicBool::new(true),
             no_new_privs: AtomicBool::new(false),
-            children: Mutex::default(),
-            parent_ctl: None,
             futexes: futex::Futexes::default(),
             robust: Mutex::default(),
             exiting: AtomicBool::new(false),
@@ -491,12 +484,8 @@ pub enum Action {
     /// Replace the program (`execve`). If the core can't load it, the call
     /// fails with the errno it reports.
     Exec(Exec),
-    /// Replace the program with a Mac one (`execve` of a Mach-O file): the
-    /// core tears down the VM and hands it to [`exec_host`], which returns
-    /// only on failure.
-    ExecHost(HostExec),
-    /// Run a Mac program for this process (`execve` of a Mach-O file, with
-    /// many processes in one VM): the core spawns it as a process of its
+    /// Run a Mac program for this process (`execve` of a Mach-O file): the
+    /// core spawns it as a process of its
     /// own, and this process stands in for it in the process table (see
     /// [`MacPrograms::StandIn`]). If it can't be started, the call fails
     /// with the errno the spawn gave.

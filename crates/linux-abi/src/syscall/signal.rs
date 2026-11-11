@@ -140,8 +140,8 @@ pub fn catch_host_signals(signals: &[u64]) {
     }
 }
 
-/// The inbox of the process host signals are for: in 1:1 mode, the one
-/// process this host process runs.
+/// The inbox host signals are for: the host's own (whose thread hands them
+/// to the process table), or a process on its own's.
 static HOST_TARGET: AtomicPtr<Inbox> = AtomicPtr::new(std::ptr::null_mut());
 
 /// How the core gets a running vCPU to stop and look at pending signals.
@@ -701,10 +701,10 @@ impl Process {
 
     /// Signals that would be ignored now, which (on Linux, where they're
     /// dropped as they're sent unless blocked) wake and interrupt nothing.
-    /// With many processes in a host, where signals from others arrive in
-    /// memory: a child's SIGCHLD at its default action mustn't end its
-    /// parent's `wait4` with EINTR. (In 1:1 mode the host's own dispositions
-    /// do that already.)
+    /// Signals from other processes arrive in memory: a child's SIGCHLD at
+    /// its default action mustn't end its parent's `wait4` with EINTR. (For
+    /// a process on its own that mirrors the host, the host's own
+    /// dispositions do that already.)
     fn ignoring(&self, s: &Signals) -> u64 {
         if self.inbox.mirror_host.load(Ordering::Relaxed) {
             return 0;

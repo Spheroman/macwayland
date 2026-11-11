@@ -239,12 +239,6 @@ impl Waker {
         }
     }
 
-    /// Watch host signal `sig` (as sent to the host process) in the kqueue
-    /// from now on: a wait for a host child (1:1) wakes on SIGCHLD.
-    pub(super) fn watch_signal(&self, sig: i32) {
-        let ev = kev(sig as usize, libc::EVFILT_SIGNAL, libc::EV_ADD, 0, 0);
-        super::kfd::now(self.kq.as_raw_fd(), &[ev], &mut []);
-    }
 }
 
 /// What [`Waker::arm`] found had come already.
@@ -607,9 +601,10 @@ impl FutexWait {
     }
 }
 
-/// A wait on shared memory in a host of one process (1:1 mode): the
-/// processes it shares the memory with are other Mac processes, whose
-/// wakes can't reach it, so it looks at the word itself, from every 1 ms
+/// A wait on shared memory where the kernel doesn't share memory between
+/// processes (a process on its own, `HostKernel`): any others it shares the
+/// memory with are other Mac processes, whose wakes can't reach it, so it
+/// looks at the word itself, from every 1 ms
 /// to every 32 ms, and a word changed ends the wait as a wake would (a
 /// spurious wake, as the futex protocol allows). A PI lock's wait tries to
 /// take the lock instead.

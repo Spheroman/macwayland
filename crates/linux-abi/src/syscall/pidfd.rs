@@ -2,12 +2,11 @@
 //! `pidfd_getfd`, and `waitid(P_PIDFD)`.
 //!
 //! The host fd behind one reads as ready once the process has ended, so
-//! `poll` and `epoll` on it wait for that, as on Linux. Where the process
-//! table is the runtime's (many processes in one VM) it hands out the fd and
-//! makes it ready as the process becomes a zombie, and `pidfd_getfd` takes a
-//! file from another process's table. In 1:1 mode the fd is a kqueue
-//! watching the Mac process's exit; another process's files are out of
-//! reach (ENOSYS).
+//! `poll` and `epoll` on it wait for that, as on Linux. The runtime's process
+//! table hands out the fd and makes it ready as the process becomes a
+//! zombie, and `pidfd_getfd` takes a file from another process's table. For
+//! a process on its own (`HostKernel`) the fd is a kqueue watching the Mac
+//! process's exit; another process's files are out of reach (ENOSYS).
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -19,7 +18,8 @@ use crate::{
 
 const PIDFD_NONBLOCK: u64 = 0o4000;
 
-/// A host fd that becomes readable when Mac process `pid` exits (1:1 mode).
+/// A host fd that becomes readable when Mac process `pid` exits (a process
+/// on its own).
 pub(crate) fn host_exit_watch(pid: i64) -> Result<OwnedFd, i64> {
     let kq = ok(unsafe { libc::kqueue() } as i64)? as i32;
     let kq = unsafe { OwnedFd::from_raw_fd(kq) };

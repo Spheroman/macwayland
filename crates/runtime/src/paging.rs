@@ -18,11 +18,9 @@ use std::{
     },
 };
 
-use linux_abi::wire::{Decoder, Encoder, Truncated};
 
 use crate::{
     hv::{self, HvError, Vm},
-    mach::MemoryEntry,
 };
 
 /// Linux's page size on arm64, which the guest sees.
@@ -299,90 +297,6 @@ impl Pool {
         Ok(())
     }
 
-    /// Take the pool out of the VM (before the VM goes).
-    pub fn unmap_from_vm(&self) -> Result<(), HvError> {
-        let mut s = self.state();
-        s.vm_live = false;
-        while s.mapped > 0 {
-            let (start, len) = segment(s.mapped - 1);
-            hv::unmap(start, len as usize)?;
-            s.mapped -= 1;
-        }
-        Ok(())
-    }
-
-    /// Copy-on-write snapshots of the frames handed out so far, one per
-    /// segment, for a forked child. The VM can keep running (other threads
-    /// may be): macOS write-protects the pages for the VM too, so its later
-    /// writes take copies (checked: a guest writing through HVF after the
-    /// snapshot doesn't change it).
-    pub fn snapshot(&self) -> io::Result<Vec<MemoryEntry>> {
-        let next_fresh = self.state().next_fresh.max(HOST_PAGE);
-        let mut entries = Vec::new();
-        for k in 0..SEGMENTS {
-            let (start, len) = segment(k);
-            if start >= next_fresh {
-                break;
-            }
-            entries.push(MemoryEntry::snapshot(self.ptr(start), len.min(next_fresh - start))?);
-        }
-        Ok(entries)
-    }
-
-    /// The allocator's state, which goes with a snapshot. `also_free` are
-    /// frames held but not mapped anywhere a child would see (unused,
-    /// quarantined, or of an address space being retired): a child's fresh
-    /// vCPUs have no stale TLB entries, so they're simply free there.
-    pub fn encode(&self, e: &mut Encoder, also_free: &[u64]) {
-        let s = self.state();
-        e.u64(s.next_fresh).u64((s.free.len() + also_free.len()) as u64);
-        for &f in s.free.iter().chain(also_free) {
-            e.u64(f);
-        }
-    }
-
-    /// Guest physical memory from a parent's snapshots and allocator state.
-    /// Every frame handed out and not free is held once (by the child's one
-    /// address space, or its kernel half).
-    pub fn restore(entries: &[MemoryEntry], d: &mut Decoder) -> Result<Arc<Pool>, Truncated> {
-        let pool = Pool::new().map_err(|_| Truncated)?;
-        let next_fresh = d.u64()?;
-        if next_fresh > POOL_SIZE || !next_fresh.is_multiple_of(CHUNK_FRAMES as u64 * PAGE_SIZE) {
-            return Err(Truncated);
-        }
-        {
-            let mut s = pool.state();
-            let covered = next_fresh.max(HOST_PAGE);
-            for (k, entry) in entries.iter().enumerate() {
-                let (start, len) = segment(k);
-                if start >= covered {
-                    return Err(Truncated);
-                }
-                while s.reserved <= k {
-                    pool.reserve(&mut s).map_err(|_| Truncated)?;
-                }
-                entry.map_at(pool.ptr(start), len.min(covered - start)).map_err(|_| Truncated)?;
-            }
-            if entries.len() <= segment_of(covered - 1) {
-                return Err(Truncated);
-            }
-            let n = d.count(8)?;
-            s.next_fresh = next_fresh;
-            s.refs = vec![1; (next_fresh / PAGE_SIZE) as usize];
-            s.host_pages = vec![0; (next_fresh / HOST_PAGE) as usize];
-            for _ in 0..n {
-                let pa = d.u64()?;
-                if pa >= next_fresh || !pa.is_multiple_of(PAGE_SIZE) {
-                    return Err(Truncated);
-                }
-                s.refs[(pa / PAGE_SIZE) as usize] = 0;
-                s.free.push(pa);
-                s.host_pages[(pa / HOST_PAGE) as usize] += 1;
-            }
-        }
-        Ok(pool)
-    }
-
     /// Another hold on each of `frames` (a fork shares them).
     pub fn hold(&self, frames: &[u64]) {
         let mut s = self.state();
@@ -484,11 +398,6 @@ impl PhysMem {
     pub fn take_quarantine(&mut self) -> Vec<u64> {
         self.in_use -= self.quarantine.len() as u64;
         std::mem::take(&mut self.quarantine)
-    }
-
-    /// Frames held but mapped nowhere: the cache and the quarantine.
-    pub fn unmapped(&self) -> impl Iterator<Item = u64> + '_ {
-        self.cache.iter().chain(&self.quarantine).copied()
     }
 
     pub fn read_u64(&self, pa: u64) -> u64 {

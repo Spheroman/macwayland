@@ -1,64 +1,35 @@
 //! Processes: `clone` (fork and vfork), `execve`, `wait4`/`waitid`.
 //!
-//! A guest process is a host process. The dispatcher checks and decodes these
-//! calls; the core does the parts that touch the CPU and memory — making the
-//! child ([`Action::Fork`]) or replacing the program ([`Action::Exec`]) — and
-//! calls back into [`Process`] around them.
+//! The dispatcher checks and decodes these calls; the core does the parts
+//! that touch the CPU and memory — making the child ([`Action::Fork`]) or
+//! replacing the program ([`Action::Exec`]) — and calls back into
+//! [`Process`] around them. The process table, and so `wait`, is the
+//! kernel's ([`Kernel`](super::Kernel)).
 //!
 //! `execve` of a Mac program (a Mach-O file, or a script whose interpreter is
-//! one) replaces the process with it for real, as WSL runs Windows programs:
-//! [`exec_host`]. It keeps the pid, so the parent's `wait`, the terminal and
-//! job control carry on as for any child. It gets the guest's fds (by their
-//! guest numbers), working directory, signal mask and ignored signals, and
-//! environment — except `PATH` and `SHELL`, which are the Mac's (those
-//! macwl-run started with), so the programs it runs in turn are Mac ones too.
-//! It sees the Mac's file system, which under `--root` isn't the guest's.
-//! It is off unless `MACWL_MAC_PROGRAMS=1` (otherwise such an `execve` fails
-//! with ENOEXEC). See ROADMAP.md, item 13.
-//!
-//! Each forked child keeps a control socket to its parent. Over it the child
-//! says when it is ready (its memory snapshot is taken), when it has exec'd
-//! (which ends a vfork), and — just before exiting — whether it was killed by
-//! a Linux signal. The host process then exits with 128 + the signal rather
-//! than raising it (which would make macOS write a crash report), and the
-//! parent's `wait` reports the signal.
+//! one) runs it, as WSL runs Windows programs: the core spawns it as a Mac
+//! process of its own and this process stands in for it
+//! ([`Action::MacStandIn`]), keeping the pid, so the parent's `wait`, the
+//! terminal and job control carry on as for any child. It gets the guest's
+//! fds (by their guest numbers), working directory, signal mask and ignored
+//! signals, and environment — except `PATH` and `SHELL`, which are the Mac's
+//! (those macwl-run started with), so the programs it runs in turn are Mac
+//! ones too ([`mac_spawn`]). It sees the Mac's file system, which under
+//! `--root` isn't the guest's. It is off unless `MACWL_MAC_PROGRAMS=1`
+//! (otherwise such an `execve` fails with ENOEXEC). See ROADMAP.md, item 13.
 
-use std::{
-    collections::BTreeMap,
-    sync::atomic::Ordering,
-    os::{
-        fd::{AsRawFd, OwnedFd, RawFd},
-        unix::ffi::OsStrExt,
-    },
-};
+use std::{os::unix::ffi::OsStrExt, sync::atomic::Ordering};
 
 use super::{
-    kernel::{ChildInfo, MacPrograms, Waited},
+    kernel::MacPrograms,
     ok, path_arg, signal, Action, Process, Thread,
 };
 use crate::{
     errno,
-    fs::{FdTable, Filesystem, Target},
+    fs::{Filesystem, Target},
     memory::{GuestMemory, GuestMemoryExt},
     wire::{Decoder, Encoder, Truncated},
 };
-
-/// Control-socket messages from a child to its parent.
-pub mod ctl {
-    /// The child has its memory snapshot; the parent may run on.
-    pub const READY: u8 = b'R';
-    /// The child exec'd a new program.
-    pub const EXEC: u8 = b'E';
-    /// Followed by one byte: the child is about to exit, killed by that
-    /// (Linux) signal.
-    pub const KILLED: u8 = b'S';
-    /// Parent to child, followed by an i32: put yourself in this process
-    /// group (`setpgid` on a child: see [`super::setpgid`]).
-    pub const SETPGID: u8 = b'P';
-    /// Child to parent, followed by an i32: how that went (0 or a Linux
-    /// errno).
-    pub const SETPGID_DONE: u8 = b'G';
-}
 
 /// A fork the core should carry out, from `clone`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,24 +50,6 @@ pub struct Fork {
     /// The signal the parent gets when the child ends (`flags & CSIGNAL`,
     /// SIGCHLD as a rule; 0 for none).
     pub exit_signal: u64,
-}
-
-impl Fork {
-    pub fn encode(&self, e: &mut Encoder) {
-        e.u64(self.stack).bool(self.vfork).u64(self.exit_signal);
-        for v in [self.tls, self.parent_tid, self.child_tid] {
-            e.bool(v.is_some()).u64(v.unwrap_or(0));
-        }
-    }
-
-    pub fn decode(d: &mut Decoder) -> Result<Self, Truncated> {
-        let (stack, vfork, exit_signal) = (d.u64()?, d.bool()?, d.u64()?);
-        let mut opt = || -> Result<Option<u64>, Truncated> {
-            let (some, v) = (d.bool()?, d.u64()?);
-            Ok(some.then_some(v))
-        };
-        Ok(Fork { stack, vfork, vm: vfork, exit_signal, tls: opt()?, parent_tid: opt()?, child_tid: opt()? })
-    }
 }
 
 /// A thread the core should start, from `clone` with CLONE_THREAD. It
@@ -128,7 +81,7 @@ pub struct Exec {
     pub comm: Vec<u8>,
 }
 
-/// A Mac program to run in place of this one: see [`exec_host`].
+/// A Mac program to run for this process: see [`mac_spawn`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostExec {
     /// Its host path.
@@ -144,154 +97,17 @@ enum Program {
     Mac(std::ffi::CString, Vec<Vec<u8>>),
 }
 
-/// Per-process bookkeeping for forked children.
-#[derive(Debug, Default)]
-pub(super) struct Children {
-    /// Control sockets to children not yet waited for, by pid.
-    ctl: BTreeMap<i64, OwnedFd>,
-    /// Children whose control socket said they were killed by a signal.
-    killed: BTreeMap<i64, u8>,
-    /// Bytes of a message not yet whole, per child.
-    partial: BTreeMap<i64, Vec<u8>>,
-}
-
-impl Children {
-    /// Read whatever `pid`'s control socket has to say, without blocking.
-    fn poll(&mut self, pid: i64) {
-        self.read_messages(pid, false);
-    }
-
-    /// Take in what `pid`'s control socket has said (waiting for a
-    /// SETPGID_DONE if `wait_reply`), and return that reply.
-    fn read_messages(&mut self, pid: i64, wait_reply: bool) -> Option<i32> {
-        let sock = self.ctl.get(&pid)?.as_raw_fd();
-        let mut reply = None;
-        loop {
-            let mut buf = [0u8; 64];
-            let flags = if wait_reply && reply.is_none() { 0 } else { libc::MSG_DONTWAIT };
-            let n = unsafe { libc::recv(sock, buf.as_mut_ptr().cast(), buf.len(), flags) };
-            if n <= 0 {
-                if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return reply;
-            }
-            let partial = self.partial.entry(pid).or_default();
-            partial.extend_from_slice(&buf[..n as usize]);
-            // Whole messages: 1 byte, or a kind byte and its payload.
-            loop {
-                let need = match partial.first() {
-                    None => break,
-                    Some(&ctl::KILLED) => 2,
-                    Some(&ctl::SETPGID_DONE) => 5,
-                    Some(_) => 1,
-                };
-                if partial.len() < need {
-                    break;
-                }
-                let msg: Vec<u8> = partial.drain(..need).collect();
-                match msg[0] {
-                    ctl::KILLED => {
-                        self.killed.insert(pid, msg[1]);
-                    }
-                    ctl::SETPGID_DONE => reply = Some(i32::from_le_bytes(msg[1..5].try_into().unwrap())),
-                    _ => {}
-                }
-            }
-            if reply.is_some() && !wait_reply {
-                continue;
-            }
-            if wait_reply && reply.is_some() {
-                return reply;
-            }
-        }
-    }
-
-    /// The Linux wait status for a host one, for child `pid`.
-    fn status(&mut self, pid: i64, host: i32) -> i32 {
-        if libc::WIFEXITED(host) {
-            let code = libc::WEXITSTATUS(host);
-            if code >= 128 {
-                self.poll(pid);
-                if let Some(&sig) = self.killed.get(&pid) {
-                    return sig as i32;
-                }
-            }
-            code << 8
-        } else if libc::WIFSIGNALED(host) {
-            let core = if libc::WCOREDUMP(host) { 0x80 } else { 0 };
-            signal::from_darwin(libc::WTERMSIG(host)) as i32 | core
-        } else if libc::WIFSTOPPED(host) {
-            ((signal::from_darwin(libc::WSTOPSIG(host)) as i32) << 8) | 0x7f
-        } else {
-            0xffff // continued
-        }
-    }
-
-    /// `pid` has been reaped: forget it.
-    fn reaped(&mut self, pid: i64) {
-        self.ctl.remove(&pid);
-        self.killed.remove(&pid);
-        self.partial.remove(&pid);
-    }
-}
-
 impl Process {
-    /// Encode everything a forked child inherits from thread `t`'s process.
-    /// The host fds of the fd table aren't in the message: they're returned,
-    /// in order, to be passed with it.
-    pub fn encode_for_fork(&self, t: &Thread, e: &mut Encoder) -> Vec<RawFd> {
-        let fds = self.fds.encode(e);
-        self.fs.encode(e);
-        e.bytes(&self.exe());
-        self.signals().encode(&t.signals, e);
-        for [soft, hard] in *self.rlimits.lock().unwrap_or_else(|e| e.into_inner()) {
-            e.u64(soft).u64(hard);
-        }
-        e.bytes(&t.comm).bool(self.dumpable.load(Ordering::Relaxed)).bool(self.no_new_privs.load(Ordering::Relaxed));
-        self.file_maps().encode(e);
-        e.u64(self.umask() as u64);
-        fds
-    }
-
-    /// The child's side of [`Process::encode_for_fork`]: the process and its
-    /// one thread. `ctl` is its control socket to the parent.
-    pub fn decode_forked(d: &mut Decoder, fds: Vec<OwnedFd>, ctl: OwnedFd) -> Result<(Process, Thread), Truncated> {
-        let mut fds = fds.into_iter();
-        let mut p = Process::new("/");
-        let table = FdTable::decode(d, &mut fds, &p.inbox)?;
-        let fs = Filesystem::decode(d)?;
-        p.fds = table;
-        p.fs = fs;
-        p.set_exe(d.bytes()?);
-        let (signals, thread_signals) = signal::Signals::decode(d)?;
-        *p.signals() = signals;
-        for limit in p.rlimits.get_mut().unwrap().iter_mut() {
-            *limit = [d.u64()?, d.u64()?];
-        }
-        let mut t = Thread::main(&p);
-        t.signals = thread_signals;
-        t.comm = d.bytes()?;
-        p.dumpable.store(d.bool()?, Ordering::Relaxed);
-        p.no_new_privs.store(d.bool()?, Ordering::Relaxed);
-        *p.file_maps() = super::mem::FileMaps::decode(d)?;
-        // The host process is new: its umask may not be the parent's now.
-        p.set_umask(d.u64()? as u32);
-        p.parent_ctl = Some(ctl);
-        Ok((p, t))
-    }
-
-    /// A child forked by thread `t` in the same host process (many processes
-    /// in one VM), as pid `pid`, and its one thread: what
-    /// [`Process::encode_for_fork`] would pass on, but open files shared
-    /// rather than sent (one open file description each, as on Linux:
-    /// see [`FdTable::fork`]), and the same kernel.
+    /// A child forked by thread `t` (in the same host process), as pid
+    /// `pid`, and its one thread: everything it inherits, open files shared
+    /// (one open file description each, as on Linux: see [`crate::fs::FdTable::fork`]),
+    /// and the same kernel.
     pub fn fork_in_host(&self, t: &Thread, pid: i64) -> (Process, Thread) {
         let mut p = Process::new("/");
         p.pid = pid;
         p.set_kernel(self.kernel.clone());
         p.fds = self.fds.fork(&p.inbox);
-        // The rest as a 1:1 fork carries it, through the same encoding.
+        // The rest through its encoding: a copy.
         let mut e = Encoder::default();
         self.fs.encode(&mut e);
         self.signals().encode(&t.signals, &mut e);
@@ -315,42 +131,8 @@ impl Process {
         (p, child)
     }
 
-    /// In the parent, once the child `pid` exists: CLONE_PARENT_SETTID, and
-    /// keep its control socket for `wait`.
-    /// `seen` is anything already read from the socket (while waiting for a
-    /// vfork child).
-    pub fn forked_parent<M: GuestMemory + ?Sized>(&self, mem: &M, fork: &Fork, pid: i64, ctl: OwnedFd, seen: &[u8]) {
-        if let Some(addr) = fork.parent_tid {
-            let _ = mem.write_pod(addr, &(pid as i32));
-        }
-        let mut children = self.children();
-        if let Some(i) = seen.iter().position(|&b| b == ctl::KILLED)
-            && let Some(&sig) = seen.get(i + 1)
-        {
-            children.killed.insert(pid, sig);
-        }
-        children.ctl.insert(pid, ctl);
-    }
-
-    /// In the child, with its memory in place: CLONE_CHILD_SETTID.
-    pub fn forked_child<M: GuestMemory + ?Sized>(&mut self, t: &mut Thread, mem: &M, fork: &Fork) {
-        self.pid = std::process::id() as i64;
-        t.tid = self.pid;
-        if let Some(addr) = fork.child_tid {
-            let _ = mem.write_pod(addr, &(self.pid as i32));
-        }
-    }
-
-    /// Tell the parent something over the control socket (if forked).
-    pub fn tell_parent(&self, msg: &[u8]) {
-        if let Some(sock) = &self.parent_ctl {
-            unsafe { libc::send(sock.as_raw_fd(), msg.as_ptr().cast(), msg.len(), 0) };
-        }
-    }
-
     /// The core replaced the program (other threads gone, `t` the one left):
-    /// close-on-exec fds close, handlers reset, and a vforking parent may run
-    /// on.
+    /// close-on-exec fds close, and handlers reset.
     pub fn exec_done(&self, t: &mut Thread, exe: Vec<u8>, comm: &[u8]) {
         self.set_comm(comm);
         self.fds.close_on_exec();
@@ -359,52 +141,7 @@ impl Process {
         t.comm.clear();
         t.clear_child_tid = 0;
         self.set_exe(exe);
-        self.tell_parent(&[ctl::EXEC]);
     }
-
-    fn children(&self) -> std::sync::MutexGuard<'_, Children> {
-        self.children.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// `setpgid(pid, pgid)`. A fork child is a fresh `macwl-run` the host sees
-/// as having exec'd, and POSIX doesn't let a parent change an exec'd child's
-/// group (EACCES), though Linux lets a parent do it to its forked children
-/// (shells do, for each pipeline). So such a child is asked to do it itself,
-/// over its control socket, and the parent waits for the answer.
-pub(super) fn host_setpgid(p: &Process, pid: i64, pgid: i64) -> Result<i64, i64> {
-    if unsafe { libc::setpgid(pid as i32, pgid as i32) } == 0 {
-        return Ok(0);
-    }
-    let e = super::last_errno();
-    if e != errno::EACCES || pid <= 0 || pid == p.pid {
-        return Err(e);
-    }
-    let mut children = p.children();
-    let Some(sock) = children.ctl.get(&pid).map(|s| s.as_raw_fd()) else { return Err(e) };
-    let mut msg = vec![ctl::SETPGID];
-    // pgid 0 means the child's own pid, from either side.
-    msg.extend_from_slice(&(if pgid == 0 { pid } else { pgid } as i32).to_le_bytes());
-    if unsafe { libc::send(sock, msg.as_ptr().cast(), msg.len(), 0) } != msg.len() as isize {
-        return Err(errno::ESRCH);
-    }
-    match children.read_messages(pid, true) {
-        Some(0) => Ok(0),
-        Some(err) => Err(err as i64),
-        // No answer: the child exec'd a Mac program (which doesn't keep the
-        // socket), and Linux says EACCES once a child has exec'd.
-        None => Err(errno::EACCES),
-    }
-}
-
-/// The child's side of [`setpgid`]: answer one request (`msg` is its i32).
-pub fn answer_setpgid(msg: [u8; 4]) -> [u8; 5] {
-    let pgid = i32::from_le_bytes(msg);
-    let r = unsafe { libc::setpgid(0, pgid) };
-    let err = if r == 0 { 0 } else { super::last_errno() as i32 };
-    let mut out = [ctl::SETPGID_DONE, 0, 0, 0, 0];
-    out[1..].copy_from_slice(&err.to_le_bytes());
-    out
 }
 
 const CLONE_VM: u64 = 0x100;
@@ -531,7 +268,6 @@ pub(super) fn execve<M: GuestMemory + ?Sized>(p: &Process, mem: &M, path: u64, a
     Ok(match load_program(p, path, argv, &search, 0)? {
         Program::Linux(exec) => Action::Exec(Exec { envp, comm, ..exec }),
         Program::Mac(path, argv) => match p.kernel.mac_programs() {
-            MacPrograms::ExecHost => Action::ExecHost(HostExec { path, argv, envp }),
             MacPrograms::StandIn => Action::MacStandIn(HostExec { path, argv, envp }),
             MacPrograms::Refused => return Err(errno::ENOEXEC),
         },
@@ -690,8 +426,8 @@ pub fn mac_environment(envp: &[Vec<u8>]) -> Vec<Vec<u8>> {
     env
 }
 
-/// What a Mac program started for a process (with many processes in one
-/// VM, [`Action::MacStandIn`]) gets from it, as `execve` would pass it on:
+/// What a Mac program started for a process ([`Action::MacStandIn`]) gets
+/// from it, as `execve` would pass it on:
 /// see the module docs. The core spawns it as a process of its own.
 #[derive(Debug)]
 pub struct MacSpawn {
@@ -724,98 +460,6 @@ pub fn mac_spawn(p: &Process, blocked: u64, exec: &HostExec) -> Result<MacSpawn,
     })
 }
 
-// Darwin's `posix_spawn_file_actions_addchdir_np` (macOS 10.15), which the
-// libc crate doesn't declare.
-unsafe extern "C" {
-    fn posix_spawn_file_actions_addchdir_np(actions: *mut libc::posix_spawn_file_actions_t, path: *const libc::c_char) -> libc::c_int;
-}
-
-/// Run the Mac program `exec` in place of this process, as `execve` does
-/// (see the module docs for what it inherits), with `blocked` (a guest
-/// thread's mask) as its signal mask. Returns only if it couldn't, with the
-/// Linux errno.
-///
-/// The core calls this only once the guest's threads have ended and the VM
-/// is destroyed and its memory unmapped, so the Mac program starts clean
-/// (ROADMAP.md, item 13).
-pub fn exec_host(p: &Process, blocked: u64, exec: &HostExec) -> i64 {
-    use std::ffi::CString;
-    let cstrings = |v: &[Vec<u8>]| v.iter().filter_map(|s| CString::new(s.clone()).ok()).collect::<Vec<_>>();
-    let argv = cstrings(&exec.argv);
-    let env = cstrings(&mac_environment(&exec.envp));
-    let ptrs = |v: &[CString]| v.iter().map(|s| s.as_ptr()).chain([std::ptr::null()]).collect::<Vec<_>>();
-    let (argv_p, env_p) = (ptrs(&argv), ptrs(&env));
-    let Ok(cwd) = p.fs.host_path(&p.fs.cwd()) else { return errno::ENOENT };
-
-    // Guest fd n becomes fd n: by way of fds above all of them (so no move
-    // overwrites a source still to come), which are closed again. Everything
-    // else closes (CLOEXEC_DEFAULT).
-    let inherited = p.fds.inherited();
-    let above = inherited.iter().map(|&(n, host)| (n as RawFd).max(host)).max().unwrap_or(0) + 1;
-    let ignored = p.signals().ignored();
-    unsafe {
-        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
-        let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
-        libc::posix_spawn_file_actions_init(&mut actions);
-        libc::posix_spawnattr_init(&mut attr);
-        // With POSIX_SPAWN_SETEXEC, close-on-exec fds are gone before the
-        // file actions run (dup2 from one fails with EBADF), and the host
-        // fds all are: clear the flag on those that are passed on.
-        // CLOEXEC_DEFAULT still closes them once they've been moved.
-        for &(_, host) in &inherited {
-            libc::fcntl(host, libc::F_SETFD, 0);
-        }
-        for (i, &(_, host)) in inherited.iter().enumerate() {
-            libc::posix_spawn_file_actions_adddup2(&mut actions, host, above + i as RawFd);
-        }
-        for (i, &(n, _)) in inherited.iter().enumerate() {
-            libc::posix_spawn_file_actions_adddup2(&mut actions, above + i as RawFd, n as RawFd);
-            libc::posix_spawn_file_actions_addclose(&mut actions, above + i as RawFd);
-        }
-        posix_spawn_file_actions_addchdir_np(&mut actions, cwd.as_ptr());
-        // Signals: the guest's ignored ones stay ignored, the rest are as a
-        // new program finds them; the guest's mask carries over.
-        let (mut default, mut mask): (libc::sigset_t, libc::sigset_t) = (0, 0);
-        libc::sigemptyset(&mut default);
-        libc::sigemptyset(&mut mask);
-        let mut ignore = Vec::new();
-        for sig in 1..=31u64 {
-            let Some(host) = signal::to_darwin(sig) else { continue };
-            if ignored & (1 << (sig - 1)) != 0 {
-                ignore.push(host);
-            } else {
-                libc::sigaddset(&mut default, host);
-            }
-            if blocked & (1 << (sig - 1)) != 0 {
-                libc::sigaddset(&mut mask, host);
-            }
-        }
-        let mut saved = Vec::new();
-        for &sig in &ignore {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = libc::SIG_IGN;
-            libc::sigaction(sig, &sa, &mut old);
-            saved.push((sig, old));
-        }
-        libc::posix_spawnattr_setsigdefault(&mut attr, &default);
-        libc::posix_spawnattr_setsigmask(&mut attr, &mask);
-        let flags = libc::POSIX_SPAWN_SETEXEC | libc::POSIX_SPAWN_CLOEXEC_DEFAULT | libc::POSIX_SPAWN_SETSIGDEF | libc::POSIX_SPAWN_SETSIGMASK;
-        libc::posix_spawnattr_setflags(&mut attr, flags as libc::c_short);
-        let r = libc::posix_spawn(std::ptr::null_mut(), exec.path.as_ptr(), &actions, &attr, argv_p.as_ptr().cast(), env_p.as_ptr().cast());
-        // Still here: it didn't start.
-        for &(_, host) in &inherited {
-            libc::fcntl(host, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        for (sig, old) in saved {
-            libc::sigaction(sig, &old, std::ptr::null_mut());
-        }
-        libc::posix_spawn_file_actions_destroy(&mut actions);
-        libc::posix_spawnattr_destroy(&mut attr);
-        errno::from_io(&std::io::Error::from_raw_os_error(r))
-    }
-}
-
 /// Linux `wait4` options, and the `__W*` flags that don't matter to us.
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
@@ -834,63 +478,6 @@ pub(super) fn wait4<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, p
         mem.write(rusage, &got.rusage)?;
     }
     Ok(got.pid)
-}
-
-/// [`wait4`] when each Linux process is a host process: the host's `wait4`,
-/// its status in Linux's terms. It doesn't block in the host's: it looks
-/// (WNOHANG) and waits for SIGCHLD to the host (watched in the thread's
-/// waker kqueue, registered before the first look), so that the wait parks
-/// like any other, and a wake can't be missed.
-pub(super) fn host_wait4(p: &Process, t: &Thread, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
-    if options & WNOHANG != 0 {
-        return host_wait4_now(p, pid, options);
-    }
-    t.waker.watch_signal(libc::SIGCHLD);
-    loop {
-        if let Some(got) = host_wait4_now(p, pid, options | WNOHANG)? {
-            return Ok(Some(got));
-        }
-        if p.exiting() || p.signal_ready(t) {
-            return Err(errno::EINTR);
-        }
-        super::block::wait_woken(t, None)?;
-    }
-}
-
-fn host_wait4_now(p: &Process, pid: i64, options: u64) -> Result<Option<Waited>, i64> {
-    let mut host_opts = 0;
-    if options & WNOHANG != 0 {
-        host_opts |= libc::WNOHANG;
-    }
-    if options & WUNTRACED != 0 {
-        host_opts |= libc::WUNTRACED;
-    }
-    if options & WCONTINUED != 0 {
-        host_opts |= libc::WCONTINUED;
-    }
-    // The host process may have children the guest didn't fork (the runtime's
-    // spare, see the core's fork): they don't count, and are skipped if they
-    // turn up.
-    let any = pid <= 0;
-    if any && p.children().ctl.is_empty() {
-        return Err(errno::ECHILD);
-    }
-    let mut st = 0;
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    let got = loop {
-        let got = ok(unsafe { libc::wait4(pid as i32, &mut st, host_opts, &mut ru) } as i64)?;
-        if got == 0 {
-            return Ok(None);
-        }
-        if !any || p.children().ctl.contains_key(&got) {
-            break got;
-        }
-    };
-    let linux = p.children().status(got, st);
-    if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
-        p.children().reaped(got);
-    }
-    Ok(Some(Waited { pid: got, status: linux, rusage: super::kernel::rusage_bytes(&ru) }))
 }
 
 /// `waitid(idtype, id, infop, options, rusage)`.
@@ -924,79 +511,4 @@ pub(super) fn waitid<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, 
         mem.write(rusage, &[0u8; 144])?;
     }
     Ok(0)
-}
-
-/// [`waitid`] when each Linux process is a host process: the host's
-/// `waitid`, in Linux's terms; waiting as [`host_wait4`] does.
-pub(super) fn host_waitid(p: &Process, t: &Thread, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
-    if options & WNOHANG != 0 {
-        return host_waitid_now(p, idtype, id, options);
-    }
-    t.waker.watch_signal(libc::SIGCHLD);
-    loop {
-        if let Some(got) = host_waitid_now(p, idtype, id, options | WNOHANG)? {
-            return Ok(Some(got));
-        }
-        if p.exiting() || p.signal_ready(t) {
-            return Err(errno::EINTR);
-        }
-        super::block::wait_woken(t, None)?;
-    }
-}
-
-fn host_waitid_now(p: &Process, idtype: u64, id: u64, options: u64) -> Result<Option<ChildInfo>, i64> {
-    const WSTOPPED: u64 = 2;
-    const WEXITED: u64 = 4;
-    const WNOWAIT: u64 = 0x0100_0000;
-    const CLD_EXITED: i32 = 1;
-    const CLD_KILLED: i32 = 2;
-    const CLD_DUMPED: i32 = 3;
-    let idtype = match idtype {
-        0 => libc::P_ALL,
-        1 => libc::P_PID,
-        _ => libc::P_PGID,
-    };
-    let mut host_opts = 0;
-    for (l, d) in [(WNOHANG, libc::WNOHANG), (WSTOPPED, libc::WSTOPPED), (WEXITED, libc::WEXITED), (WCONTINUED, libc::WCONTINUED), (WNOWAIT, libc::WNOWAIT)] {
-        if options & l != 0 {
-            host_opts |= d;
-        }
-    }
-    // As in wait4: only children the guest forked count.
-    let any = idtype != libc::P_PID;
-    if any && p.children().ctl.is_empty() {
-        return Err(errno::ECHILD);
-    }
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    loop {
-        ok(unsafe { libc::waitid(idtype, id as libc::id_t, &mut info, host_opts) } as i64)?;
-        if !any || info.si_pid == 0 || p.children().ctl.contains_key(&(info.si_pid as i64)) {
-            break;
-        }
-        if options & WNOWAIT != 0 {
-            // Reap the stranger, or it would come back every time.
-            unsafe { libc::waitpid(info.si_pid, std::ptr::null_mut(), libc::WNOHANG) };
-        }
-    }
-    if info.si_pid == 0 {
-        return Ok(None);
-    }
-    let pid = info.si_pid as i64;
-    let (mut code, mut status) = (info.si_code, info.si_status);
-    match code {
-        CLD_EXITED if status >= 128 => {
-            let mut children = p.children();
-            children.poll(pid);
-            if let Some(&sig) = children.killed.get(&pid) {
-                (code, status) = (CLD_KILLED, sig as i32);
-            }
-        }
-        CLD_KILLED | CLD_DUMPED => status = signal::from_darwin(status) as i32,
-        CLD_EXITED => {}
-        _ => status = signal::from_darwin(status) as i32, // stopped, continued, trapped
-    }
-    if options & WNOWAIT == 0 && matches!(code, CLD_EXITED | CLD_KILLED | CLD_DUMPED) {
-        p.children().reaped(pid);
-    }
-    Ok(Some(ChildInfo { pid, uid: info.si_uid, code, status }))
 }

@@ -1,4 +1,4 @@
-//! A process's CPU time, user and system apart (many processes in one VM).
+//! A process's CPU time, user and system apart.
 //!
 //! User time is the time its threads spend in the guest: each run of a vCPU
 //! for it is timed (two reads of the uptime clock, ~20 ns each), and a run

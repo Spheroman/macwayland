@@ -22,7 +22,7 @@
 
 use std::{
     collections::BTreeSet,
-    os::fd::{OwnedFd, RawFd},
+    os::fd::RawFd,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Mutex, MutexGuard,
@@ -32,13 +32,11 @@ use std::{
 use linux_abi::{
     abi::mm,
     errno,
-    wire::{Decoder, Encoder, Truncated},
     Fault, GuestMemory, SharedKey,
 };
 
 use crate::{
     hv::{self, HvError, Vcpu, Vm},
-    mach::MemoryEntry,
     paging::{self, prot, OutOfMemory, PageTable, PhysMem, Pool, PAGE_SIZE, POOL_SIZE},
     shared::SharedWindows,
     vma::{Backing, Vma, Vmas},
@@ -198,23 +196,6 @@ impl Machine {
         }))
     }
 
-    /// A forked child's, from the parent's snapshot (see
-    /// [`AddressSpace::encode_for_fork`]): the same pool contents and kernel
-    /// half, and no ASIDs in use.
-    fn restore(entries: &[MemoryEntry], d: &mut Decoder) -> Result<Arc<Machine>, Truncated> {
-        let pool = Pool::restore(entries, d)?;
-        let kernel = PageTable { root: d.u64()? };
-        let phys = PhysMem::new(&pool);
-        Ok(Arc::new(Machine {
-            pool,
-            kernel,
-            _kernel_frames: Mutex::new(phys),
-            asids: Mutex::default(),
-            reclaim: Arc::default(),
-            windows: Mutex::default(),
-        }))
-    }
-
     pub fn pool(&self) -> &Arc<Pool> {
         &self.pool
     }
@@ -307,19 +288,6 @@ impl Machine {
         self.reclaim.changed.notify_all();
     }
 
-    /// Wait until the reclaiming thread has given back everything queued,
-    /// so the pool's free list is whole (a fork's snapshot of it).
-    fn reclaimed(&self) {
-        let mut s = self.reclaim.state();
-        while !s.queue.is_empty() || s.busy {
-            s = self.reclaim.changed.wait(s).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    /// Frames of address spaces gone whose ASIDs haven't been flushed.
-    fn retired_frames(&self) -> Vec<u64> {
-        self.asids().retired.iter().flat_map(|r| r.frames(&self.pool)).collect()
-    }
 }
 
 /// Whether a vCPU about to execute `pc` is inside the flush path's stretch
@@ -493,67 +461,10 @@ impl AddressSpace {
         Ok(pa)
     }
 
-    /// Everything a forked child needs to rebuild this address space:
-    /// copy-on-write snapshots of the pool (one per segment in use), the
-    /// layout (encoded into `e`), and the shared windows' fds, to map the
-    /// same memory. Other threads may keep running.
-    pub fn encode_for_fork(&self, e: &mut Encoder) -> std::io::Result<(Vec<MemoryEntry>, Vec<RawFd>)> {
-        let pool = self.machine.pool();
-        // Frames an exec left behind are free in the child only once they're
-        // on the free list.
-        self.machine.reclaimed();
-        let entries = pool.snapshot()?;
-        let also_free: Vec<u64> = self.phys.unmapped().chain(self.machine.retired_frames()).collect();
-        pool.encode(e, &also_free);
-        e.u64(self.machine.kernel.root);
-        e.u64(self.user.root).u64(self.brk_start).u64(self.brk);
-        let vmas: Vec<_> = self.vmas.iter().collect();
-        e.u64(vmas.len() as u64);
-        for (start, v) in vmas {
-            e.u64(start).u64(v.end).u64(v.prot);
-            match v.backing {
-                Backing::Private => e.u64(0),
-                Backing::Shared { ipa } => e.u64(1).u64(ipa),
-                Backing::File { ipa } => e.u64(2).u64(ipa),
-            };
-        }
-        let fds = self.machine.windows().encode(e, self.windows.iter());
-        Ok((entries, fds))
-    }
-
-    /// The child's side of [`AddressSpace::encode_for_fork`].
-    pub fn decode_forked(d: &mut Decoder, entries: &[MemoryEntry], fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Self, Truncated> {
-        let machine = Machine::restore(entries, d)?;
-        let user = PageTable { root: d.u64()? };
-        let (brk_start, brk) = (d.u64()?, d.u64()?);
-        let mut vmas = Vmas::default();
-        for _ in 0..d.count(32)? {
-            let (start, end, prot) = (d.u64()?, d.u64()?, d.u64()?);
-            let backing = match d.u64()? {
-                0 => Backing::Private,
-                1 => Backing::Shared { ipa: d.u64()? },
-                2 => Backing::File { ipa: d.u64()? },
-                _ => return Err(Truncated),
-            };
-            vmas.insert(start, end, prot, backing);
-        }
-        let windows = machine.windows().decode(d, fds)?.into_iter().collect();
-        let asid = machine.alloc_asid().map_err(|_| Truncated)?;
-        let phys = PhysMem::new(machine.pool());
-        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
-        Ok(AddressSpace { machine, phys, windows, user, asid, serial, ran: false, vmas, brk_start, brk, tlb_stale: false, cow_breaks: 0 })
-    }
-
     /// Map guest physical memory into `vm`: the pool, and shared windows (now
     /// and as they're created).
     pub fn map_into(&mut self, vm: &Vm) -> Result<(), HvError> {
         self.machine.map_into(vm)
-    }
-
-    /// Take guest physical memory out of `vm`, before it goes.
-    pub fn unmap_from(&mut self, _vm: &Vm) -> Result<(), HvError> {
-        self.machine.pool().unmap_from_vm()?;
-        self.machine.windows().detach_vm()
     }
 
     /// Point a vCPU set up for another address space of the same VM (by

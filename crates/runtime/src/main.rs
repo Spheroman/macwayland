@@ -20,11 +20,10 @@
 //! PROGRAM and everything it starts. `--ps` lists a host's processes.
 //!
 //! A Linux program may run Mac programs, as WSL's run Windows ones: an
-//! `execve` of a Mach-O file runs it natively. In a host of many processes
-//! it's a Mac process of its own, spawned by an agent (`--tty-agent`,
-//! started by the host), which the Linux process stands in for
-//! (docs/processes.md, section 7); in 1:1 mode it takes the process's
-//! place (`linux_abi::syscall::exec_host`). Off by default for now
+//! `execve` of a Mach-O file runs it natively, a Mac process of its own,
+//! spawned by an agent (`--tty-agent`, started by the host), which the
+//! Linux process stands in for (docs/processes.md, section 7). Off by
+//! default for now
 //! (ROADMAP.md, item 13). `--mac-programs` (or `MACWL_MAC_PROGRAMS=1`)
 //! turns it on.
 //!
@@ -266,8 +265,6 @@ fn main() -> ExitCode {
     raise_fd_limit();
     let mut args = std::env::args_os().skip(1);
     match args.next() {
-        // A guest process forked by another (see the runtime's fork module).
-        Some(a) if a == "--fork-child" => return finish(macwl_runtime::run_fork_child()),
         Some(a) if a == "--serve" => return serve(args),
         // Started by a host to run Mac programs (never makes a VM).
         Some(a) if a == "--tty-agent" => return macwl_runtime::run_tty_agent(args.next()),
@@ -324,9 +321,8 @@ fn main() -> ExitCode {
         }
     };
     let (process, elf) = process;
-    // With many processes in the VM, the terminal it was started in is
-    // relayed to a pty of the host's (in 1:1 the Mac's own driver does
-    // job control).
+    // The terminal it was started in is relayed to a pty of the host's,
+    // whose job control is the host's.
     macwl_runtime::relay_terminal();
     let argv: Vec<&[u8]> = launch.argv.iter().map(Vec::as_slice).collect();
     let envp: Vec<&[u8]> = launch.env.iter().map(Vec::as_slice).collect();
