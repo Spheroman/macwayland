@@ -258,6 +258,9 @@ pieces that make that work:
   it, exiting when no host is connected. It knows which host owns which
   pid range, and which hosts have members of a process group or session
   that spans hosts. It forwards; it holds no process state of its own.
+  (As built, step 9b: a host and the one a process moved to from it talk
+  over a direct link instead, the socket the hand-off came on; the
+  coordinator lists hosts.)
 - **pids.** Hosts allocate pids from ranges (4096 pids) handed out by the
   coordinator (section 5, "pids"), so a pid names one process across every
   host, and the owner of any pid is a lookup of its range.
@@ -1627,6 +1630,58 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
    `ps -ef` in either host listing both (`/proc` asks the coordinator for
    remote pids); a federated host killed with SIGKILL: its processes reaped
    as killed in the session; `macwl-run --ps --all`.
+   Built in parts, each with its tests:
+   - **9a, the coordinator** (done, 2026-11-10). `macwl-run --coordinator`
+     (`coord.rs`) serves `$TMPDIR/macwl-$UID/coordinator`; every host has
+     a link to it (a thread, `coord::Link`): linked while one runs, and
+     waiting on a kqueue on the socket's directory while none does, so a
+     coordinator started later finds every host linked within
+     milliseconds, with no polling. A host starts one only when it needs
+     one: a session that never federates has no coordinator process.
+     `macwl-run --ps --all` (starting one) lists every host's processes,
+     each host answering from its table (`Table::listing`, moved out of
+     `--serve`'s service so that any host can); just started, the
+     coordinator waits up to 0.5 s for the hosts the pid file says run.
+     It goes 2 s after its last host. Pid ranges stay in the pid file,
+     which the coordinator reads for the hosts it expects. Test
+     `ps_all_lists_every_host`: two hosts, 23 ms for a listing that
+     starts the coordinator.
+   - **9b, moving at `execve`** (done, 2026-11-10; `host/fed.rs`). An
+     `execve` of a program set to have its own host (`MACWL_NEW_HOST=1`
+     in the environment it passes, or its path or name in
+     `~/.config/macwl/hosts`), from a process not alone in its host,
+     starts `macwl-run --adopted` with a socket to it as fd 3 and hands it
+     the process: pid, parent, group, session and terminal, and what an
+     exec keeps (`Process::encode_for_move`: filesystem view and cwd,
+     dispositions reset as by an exec, the mask, rlimits, umask, `prctl`
+     flags, argv and environment, minus `MACWL_NEW_HOST` so it doesn't
+     move again), with its fds (`SCM_RIGHTS`; files, pipes, sockets and
+     terminals; kqueue-backed kinds aren't passed). The new host loads
+     the program and answers; a program it can't load fails the `execve`
+     with the errno (bash: 126). The process then stands in for itself
+     in the old host, as for a Mac program (`StandIn`, now either kind:
+     `Elsewhere::Mac` or `Elsewhere::Host`; `Kind::Mac` became
+     `Kind::StandIn`): its parent `wait`s for it there, `--ps` marks it
+     with its host's Mac pid and `@`. **The socket stays as a direct link
+     between the two hosts**, not the coordinator's to forward (a change
+     from section 1: one hop, and the other host's death is the link's
+     end): the new host reports stops, continues and the end
+     (`Peer::changed`, from `child_changed` and `ended` when the parent
+     is remote, `Entry::remote_parent`), the old one sends signals by pid
+     or thread and the new parent of an orphan. The new host dying ends
+     the process as killed by SIGKILL; the old one dying makes it its
+     host's init's. A terminal master it took along stays held in the old
+     host too. Moving costs ~3.8 ms an `execve` (`true` in a loop: 5.8 ms
+     a run, against 2.0 ms). Tests `moved_to_a_host_of_its_own` (exit
+     codes, 143 for SIGTERM by pid, 137 for SIGKILL from inside, `$PPID`,
+     STOP and CONT seen by `jobs`, a refused load, the hosts file, its
+     parent's host killed) and `a_moved_hosts_death_is_a_sigkill`.
+   - Next: 9c (groups and sessions spanning hosts: `kill(-pgid)` and
+     `kill(-1)` across links, each host telling its links which groups it
+     has members of; `setpgid`/`setsid` there), 9d (terminals and job
+     control with remote members), 9e (a coordinator that restarts),
+     9f (`/proc` and `ps -ef` listing other hosts' processes; the session
+     test in foot).
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's
