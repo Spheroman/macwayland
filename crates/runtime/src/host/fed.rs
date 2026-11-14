@@ -85,6 +85,9 @@ const ASK_STATUS: u8 = 39;
 /// Either way: what `/proc` shows of a process's state and memory there
 /// or beyond ([`linux_abi::RemoteView`]), answered.
 const ASK_VIEW: u8 = 40;
+/// Either way: a pidfd's far end (passed with it) for a process there or
+/// beyond, to hold until the process ends, answered.
+const ASK_PIDFD: u8 = 41;
 
 /// How long the old host waits for the new one's answer to a hand-off.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
@@ -189,8 +192,12 @@ impl Peer {
     }
 
     fn send(&self, kind: u8, body: &[u8]) {
+        self.send_fds(kind, body, &[]);
+    }
+
+    fn send_fds(&self, kind: u8, body: &[u8], fds: &[RawFd]) {
         let sock = self.sock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = proto::send(sock.as_raw_fd(), kind, body, &[]);
+        let _ = proto::send(sock.as_raw_fd(), kind, body, fds);
     }
 
     /// Signal `pid` there (or its thread `tid`), not waiting to hear.
@@ -251,9 +258,22 @@ impl Peer {
         linux_abi::RemoteView::decode(&mut d).map_err(|_| errno::ESRCH)
     }
 
+    /// `far`, a pidfd's far end for `pid` there, is held there until the
+    /// process ends: how that went.
+    fn hold_pidfd(&self, pid: i64, far: &OwnedFd) -> Result<i64, i64> {
+        let mut e = Encoder::default();
+        e.i64(pid);
+        result_of(self.request_fds(ASK_PIDFD, &e.0, &[far.as_raw_fd()]))
+    }
+
     /// A request (`kind`, its id then `body`), and its answer (None: none
     /// came in time, or the link went).
     fn request(&self, kind: u8, body: &[u8]) -> Option<Vec<u8>> {
+        self.request_fds(kind, body, &[])
+    }
+
+    /// [`Peer::request`], with `fds` passed alongside.
+    fn request_fds(&self, kind: u8, body: &[u8], fds: &[RawFd]) -> Option<Vec<u8>> {
         let id = {
             let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
             asks.0 += 1;
@@ -264,7 +284,7 @@ impl Peer {
         let mut e = Encoder::default();
         e.u64(id);
         e.0.extend_from_slice(body);
-        self.send(kind, &e.0);
+        self.send_fds(kind, &e.0, fds);
         let deadline = std::time::Instant::now() + ASK_WITHIN;
         let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -541,9 +561,30 @@ impl Table {
         peer.ok_or(errno::ESRCH)?.view(pid)
     }
 
-    /// `tcsetpgrp` on pty `n`, another host's: asked of it.
-    pub(super) fn remote_foreground(&self, n: u32, pgrp: i64, sid: i64) -> Result<i64, i64> {
-        match self.peers().into_iter().find(|p| p.tty(n).is_some()) {
+    /// A pidfd for `pid`: its far end `far` held by the process's entry
+    /// here (closed as it ends; at once if it has ended), or by the linked
+    /// host (but `except`) that reaches it. ESRCH if none has it.
+    pub(super) fn hold_pidfd(&self, pid: i64, far: OwnedFd, except: Option<&Arc<Peer>>) -> Result<i64, i64> {
+        {
+            let mut s = self.state();
+            if let Some(e) = s.procs.get_mut(&pid) {
+                // A moved process's stand-in ends as the process does.
+                if matches!(e.kind, super::Kind::Local(_) | super::Kind::StandIn { .. }) {
+                    e.pidfds.push(far);
+                }
+                return Ok(0);
+            }
+        }
+        let peer = self.peers().into_iter().find(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)) && p.reaches_pid(pid));
+        peer.ok_or(errno::ESRCH)?.hold_pidfd(pid, &far)
+    }
+
+    /// `tcsetpgrp` on pty `n`, another host's: asked of the linked host
+    /// (but `except`, the one that asked this one) that reaches it, which
+    /// asks on if it isn't the terminal's. In a tree of links only one leads
+    /// there, and never back, so a request can't go round.
+    pub(super) fn remote_foreground(&self, n: u32, pgrp: i64, sid: i64, except: Option<&Arc<Peer>>) -> Result<i64, i64> {
+        match self.peers().into_iter().find(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)) && p.tty(n).is_some()) {
             Some(peer) => peer.ask_foreground(n, pgrp, sid),
             None => Err(errno::ENOTTY),
         }
@@ -705,6 +746,14 @@ impl Table {
                     Err(err) => drop(e.bool(false).i64(err)),
                 }
                 peer.answer(id, &e.0);
+            }
+            ASK_PIDFD => {
+                let (Ok(id), Ok(pid)) = (d.u64(), d.i64()) else { return true };
+                let r = match msg.fds.first().map(|f| f.try_clone()) {
+                    Some(Ok(far)) => self.hold_pidfd(pid, far, Some(peer)),
+                    _ => Err(errno::EBADF),
+                };
+                peer.answer(id, &answer_of(r));
             }
             ANSWER => {
                 if let Ok(id) = d.u64() {

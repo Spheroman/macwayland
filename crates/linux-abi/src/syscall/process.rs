@@ -144,7 +144,9 @@ impl Process {
     /// goes instead (an epoll set's interests, an eventfd's count, a
     /// timer's interval and time left, a signalfd's mask, an inotify
     /// instance's watches, but not events it hasn't read), and the new
-    /// host makes one like it. A pidfd isn't passed on.
+    /// host makes one like it. A pidfd is passed as it is, with the pid it
+    /// names: its far end is held where that process is, so it still reads
+    /// as ready when the process ends.
     pub fn encode_for_move(&self, t: &Thread, exec: &Exec, e: &mut Encoder) -> Vec<(usize, std::sync::Arc<crate::fs::OpenFile>)> {
         self.fs.encode(e);
         let mut signals = self.signals().clone();
@@ -162,10 +164,11 @@ impl Process {
                 e.bytes(item);
             }
         }
-        let fds: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| matches!(f.kind, crate::fs::FileKind::Plain)).collect();
+        let fds: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| matches!(f.kind, crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_))).collect();
         e.u64(fds.len() as u64);
-        for (n, _) in &fds {
-            e.u64(*n as u64);
+        for (n, f) in &fds {
+            // The pid a pidfd names (0: a plain fd).
+            e.u64(*n as u64).i64(if let crate::fs::FileKind::PidFd(pid) = f.kind { pid } else { 0 });
         }
         // The kqueue-backed fds it inherits, by their state.
         let made: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| !matches!(f.kind, crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_))).collect();
@@ -237,12 +240,17 @@ impl Process {
             }
         }
         let [argv, envp] = lists;
-        let n = d.count(8)?;
+        let n = d.count(16)?;
         if n != fds.len() {
             return Err(Truncated);
         }
         for host in fds {
-            p.fds.insert_at(d.u64()? as usize, crate::fs::FdEntry::new(host));
+            let (n, pid) = (d.u64()? as usize, d.i64()?);
+            let mut entry = crate::fs::FdEntry::new(host);
+            if pid != 0 {
+                entry.kind = crate::fs::FileKind::PidFd(pid);
+            }
+            p.fds.insert_at(n, entry);
         }
         // Its kqueue-backed fds, made again here; then what its epoll sets
         // watched, once every fd is in place. (One that can't be made is
