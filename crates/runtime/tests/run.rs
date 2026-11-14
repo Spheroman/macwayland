@@ -1752,7 +1752,8 @@ fn signals_across_hosts() {
 /// Ctrl-C; a moved `cat &` stopped by SIGTTIN reading from the background,
 /// then reading in the foreground; and a moved interactive bash doing job
 /// control on the terminal of the host it came from (its `tcsetpgrp`
-/// asked of that host): Ctrl-Z, `fg`, Ctrl-C.
+/// asked of that host): Ctrl-Z, `fg`, Ctrl-C; and the same from a bash it
+/// moves on to a third host, two links from the terminal's.
 #[test]
 #[ignore = "needs nix"]
 fn job_control_across_hosts() {
@@ -1795,6 +1796,14 @@ fn job_control_across_hosts() {
     step("fg\n", "sleep 30", &mut at, &mut seen);
     std::thread::sleep(std::time::Duration::from_millis(300));
     step("\x03", "M> ", &mut at, &mut seen);
+    step(&format!("MACWL_NEW_HOST=1 {} --norc -i\n", bash.display()), "$ ", &mut at, &mut seen);
+    step("PS1='C> '; sleep 30\n", "sleep 30", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    step("\x1a", "Stopped", &mut at, &mut seen);
+    step("fg\n", "sleep 30", &mut at, &mut seen);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    step("\x03", "C> ", &mut at, &mut seen);
+    step("exit\n", "M> ", &mut at, &mut seen);
     step("exit\n", "P> ", &mut at, &mut seen);
     step("echo back $?\n", "back 130", &mut at, &mut seen);
     type_in(&master, "exit\n");
@@ -1807,13 +1816,16 @@ fn job_control_across_hosts() {
 /// and its eventfd, timerfd, epoll set, signalfd and inotify instance,
 /// made again in the new host in their state (and the same without moving,
 /// where a signalfd reads a signal `raise` sent its thread); and
-/// `getpgid`/`getsid` of its parent, in the host it came from.
+/// `getpgid`/`getsid` of its parent, in the host it came from; and its
+/// pidfds, which still name their processes (one for a sibling left in the
+/// old host: a signal through it, ready once it ends), and `pidfd_open` of
+/// its parent there.
 #[test]
 #[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
 fn a_move_keeps_pending_signals_and_kqueue_fds() {
     let path = format!("{}/../../target/guest/moved", env!("CARGO_MANIFEST_DIR"));
     let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
-    for (test, stay) in [("pending", false), ("fds", false), ("fds", true), ("ids", false)] {
+    for (test, stay) in [("pending", false), ("fds", false), ("fds", true), ("ids", false), ("pidfd", false), ("pidfd", true)] {
         let mut cmd = macwl_run();
         if stay {
             cmd.env("MACWL_ENV_MOVED_STAY", "1");

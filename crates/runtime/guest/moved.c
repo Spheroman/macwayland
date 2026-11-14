@@ -8,6 +8,9 @@
 //             (watching the eventfd, with its data), a signalfd (its
 //             signals) and an inotify instance (its watch) keep working
 //   ids       getpgid and getsid of its parent, in the host it came from
+//   pidfd     a pidfd for a sibling left in the old host still names it
+//             (a signal through it, ready once it ends), and pidfd_open
+//             of its parent there works
 //
 // Prints "moved TEST ok".
 #define _GNU_SOURCE
@@ -21,6 +24,8 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <poll.h>
+#include <sys/syscall.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
@@ -163,6 +168,58 @@ static void ids_child(char **argv) {
     CHECK(getpgid(4000000) < 0 && errno == ESRCH);
 }
 
+static int pidfd_open(pid_t pid) { return syscall(434, pid, 0); }
+static int pidfd_send_signal(int fd, int sig) { return syscall(424, fd, sig, NULL, 0); }
+
+// Whether pidfd `fd` reads as ready (its process ended) within `ms`.
+static int ended(int fd, int ms) {
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    return poll(&p, 1, ms) == 1 && (p.revents & POLLIN);
+}
+
+static void pidfd(void) {
+    pid_t sib = fork();
+    CHECK(sib >= 0);
+    if (sib == 0) {
+        // (Not for ever, should the child fail before it signals.)
+        alarm(20);
+        pause();
+        _exit(0);
+    }
+    int fd = pidfd_open(sib);
+    CHECK(fd >= 0);
+    CHECK(fcntl(fd, F_SETFD, 0) == 0);
+    char a[2][32];
+    snprintf(a[0], 32, "%d", fd);
+    snprintf(a[1], 32, "%d", sib);
+    char *args[] = {self, "pidfd-child", a[0], a[1], NULL};
+    int r = run_moved(args, NULL);
+    if (r != 0) kill(sib, SIGKILL);
+    CHECK(r == 0);
+    // The child's SIGTERM through the pidfd it took along ended it.
+    int st;
+    CHECK(waitpid(sib, &st, 0) == sib && WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM);
+    CHECK(ended(fd, 0));
+}
+
+static void pidfd_child(char **argv) {
+    int fd = atoi(argv[2]);
+    (void)argv[3];
+    // The sibling's pidfd came along, not ready: the sibling is alive.
+    CHECK(fcntl(fd, F_GETFD) >= 0);
+    CHECK(!ended(fd, 0));
+    // One for its parent, in the host it came from; none for a pid no
+    // host has.
+    int parent = pidfd_open(getppid());
+    CHECK(parent >= 0);
+    CHECK(!ended(parent, 0));
+    CHECK(pidfd_open(4000000) < 0 && errno == ESRCH);
+    // A signal through it ends the sibling, and it reads as ready.
+    CHECK(pidfd_send_signal(fd, SIGTERM) == 0);
+    CHECK(ended(fd, 5000));
+    CHECK(!ended(parent, 0));
+}
+
 int main(int argc, char **argv) {
     self = argv[0];
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -178,6 +235,11 @@ int main(int argc, char **argv) {
         ids();
     } else if (!strcmp(argv[1], "ids-child")) {
         ids_child(argv);
+        return 0;
+    } else if (!strcmp(argv[1], "pidfd")) {
+        pidfd();
+    } else if (!strcmp(argv[1], "pidfd-child")) {
+        pidfd_child(argv);
         return 0;
     } else if (!strcmp(argv[1], "fds-child")) {
         fds_child(argv);

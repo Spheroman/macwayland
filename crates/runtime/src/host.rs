@@ -1040,7 +1040,7 @@ impl Table {
             let Some(tty_sid) = s.ttys.get(&n).map(|t| t.sid) else {
                 drop(s);
                 return match self.remote_tty(n) {
-                    Some((owner_sid, _)) if owner_sid == sid && from.is_none() => self.remote_foreground(n, pgrp, sid),
+                    Some((owner_sid, _)) if owner_sid == sid => self.remote_foreground(n, pgrp, sid, from),
                     _ => Err(errno::ENOTTY),
                 };
             };
@@ -1812,14 +1812,11 @@ impl Kernel for TableKernel {
 
     fn pidfd(&self, _p: &Process, pid: i64) -> Result<std::os::fd::OwnedFd, i64> {
         let table = self.table()?;
-        let mut s = table.state();
-        let e = s.procs.get_mut(&pid).ok_or(errno::ESRCH)?;
-        // A socket pair: its far end closes as the process ends, and the
-        // near one (the pidfd's) reads as ready from then on.
+        // A socket pair: its far end closes as the process ends (held by
+        // its entry, here or in the host that has it), and the near one
+        // (the pidfd's) reads as ready from then on.
         let (near, far) = std::os::unix::net::UnixStream::pair().map_err(|e| errno::from_io(&e))?;
-        if matches!(e.kind, Kind::Local(_) | Kind::StandIn { .. }) {
-            e.pidfds.push(far.into());
-        }
+        table.hold_pidfd(pid, far.into(), None)?;
         Ok(near.into())
     }
 
