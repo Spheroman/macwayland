@@ -1,8 +1,8 @@
 # GPU: Vulkan through Venus, GL through Zink
 
-Status: step 1 done (2026-11-14, below): Linux Vulkan and GLES programs
-under macwl-run draw on the Mac's GPU through Venus over vtest. ROADMAP
-item 11. Costs below are still estimates from measured ones (`docs/processes.md`,
+Status: steps 1 and 2 done (2026-11-14, below): Linux Vulkan and GLES
+programs under macwl-run draw on the Mac's GPU through the runtime's own
+render node. ROADMAP item 11. Costs below are still estimates from measured ones (`docs/processes.md`,
 `docs/mn-threads.md`, `docs/d3dmetal-proton.md`). Worked out with a
 second model as design partner, against Mesa main (`c9ce420e`,
 2026-11-14) and upstream virglrenderer (`01637fc`, 2026-11-11).
@@ -335,7 +335,7 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
    short: prototype the split driver on KosmicKrisp's bridge stubs.
 2. **The virtio-gpu node** in the runtime: contexts, blobs, execbuffer,
    timeline syncobjs, sync_files, PRIME, the dma-buf sync ioctls; the
-   broker and `macwl-gpu`.
+   render server as broker. Done (below), but for a worker's death.
    Pass: Mesa logs no failed sync-file export; a deliberately slow frame
    never shows half drawn in headless dumps; `vkWaitForFences` wakes in
    under 30 µs p50 with no `nanosleep` under `MACWL_STRACE`; killing the
@@ -420,6 +420,67 @@ going; a real fix is `VK_EXT_transform_feedback` in KosmicKrisp, which
 already runs geometry shaders as compute (Honeykrisp, Asahi's Vulkan
 driver whose geometry code KosmicKrisp shares, does transform feedback
 the same way). Upstream work, and the next thing worth doing for GL.
+
+## Step 2, 2026-11-14
+
+The render node, in `linux-abi` (`crates/linux-abi/src/drm/`). `gpu/run.sh
+PROGRAM` runs a Linux program with it (`gpu/build.sh` builds the Mac
+side and prints the environment macwl-run needs: `MACWL_GPU`, the
+directory with `libvirglrenderer.1.dylib` and `virgl_render_server`;
+`VK_ICD_FILENAMES` for KosmicKrisp; `MACWL_GPU_DYLD_LIBRARY_PATH`, the
+Vulkan loader, since dyld drops `DYLD_*` from an entitled process).
+Fable (a second model) checked the uapi against Mesa and libdrm first;
+the checklist held.
+
+- **Finding it** (`drm/vfs.rs`): `/dev/dri/renderD128` (a character
+  device, 226:128) and the sysfs libdrm's `drmGetDevices2` reads, as a
+  virtio-gpu on PCI (1af4:1050): `/sys/dev/char/226:128/device/{drm,
+  subsystem -> .../bus/pci, uevent (PCI_SLOT_NAME), vendor, device, ...}`,
+  links followed inside the tree. While the GPU is on, `/sys` is this tree
+  (a new resolver target, `Target::Dev`, beside `/proc`'s).
+- **The node** (`drm/node.rs`, `drm/virgl.rs`): `VERSION` (virtio_gpu),
+  `GET_CAP`, `GETPARAM` (blobs, host-visible, context init, alignment
+  16 KiB), `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE_BLOB` (its inline
+  command first), `RESOURCE_INFO`, `MAP`, `EXECBUFFER`, `GEM_CLOSE`, PRIME
+  both ways. virglrenderer is `dlopen`ed once per host, in proxy mode: its
+  render server is `posix_spawn`ed by `get_server_fd` (never a fork), and
+  spawns a worker per context. Every call into it holds one lock; fences
+  come back on its sync threads. A blob is the shm fd virglrenderer
+  exports; `mmap` of the node at `MAP`'s offset maps that fd as a shared
+  window.
+- **Sync** (`drm/sync.rs`): fences, timeline syncobjs (create, destroy,
+  wait, timeline wait with WAIT_FOR_SUBMIT, query, signal, transfer,
+  reset, fds both ways), sync files (a socket pair's near end, readable
+  once the fence signals; MERGE, FILE_INFO), and the dma-buf sync ioctls
+  on blob fds. Waits block as the runtime's other waits do (parked, made
+  again). Found by the CTS: a syncobj's absolute timeout is the guest's
+  CLOCK_MONOTONIC, the host's UPTIME_RAW (the host's MONOTONIC runs ahead,
+  and every wait timed out at once); and a reset drops a timeline's every
+  point (Venus resubmits point 1).
+- **Results**: `vulkaninfo` (Venus: "using DRM device
+  /dev/dri/renderD128"); `vkcube` draws right in the headless compositor;
+  the dEQP-VK subset of step 1 as there (1899 pass, the one failure
+  virglrenderer's memory heaps), all 21 basic synchronization cases that
+  run pass. Test `venus_through_the_render_node`.
+- **Fence round trips** (`gpu/fencebench.c`: submit a command buffer with
+  a fence and wait for it; the same source natively on KosmicKrisp):
+
+  | p50 (p90) | KosmicKrisp natively | through the node |
+  |---|---|---|
+  | empty command buffer | 27–30 µs (36–50) | 68–97 µs (93–161) |
+  | 64 MiB fill | 455–465 µs (585–663) | 496–522 µs (659–872) |
+
+  So ~40–70 µs a synchronous round trip on top of native: more than this
+  doc's estimate for the wake alone (15–25 µs), under a tenth of a
+  millisecond a frame. The hops: the guest's ioctl, the proxy's socket to
+  the worker, the worker's ring and queue threads, its retire through the
+  FIFO "eventfd" to the proxy's sync thread, the callback, the guest
+  task's wake. Not yet broken down: step 3.
+- **Not done**: a worker's death (Metal aborting) failing its context's
+  fences at once. The proxy retires them only after its socket goes and
+  100 stalled polls; signalling them on the socket's end, and testing it
+  (killing a worker mid-run), is still to do. Also not checked: Zink and
+  EGL through the node (step 1 ran them over vtest), GBM.
 
 ## Sources
 

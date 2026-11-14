@@ -376,6 +376,11 @@ from a static Linux binary.
     `vulkaninfo`, `vkcube` and dEQP-VK (1899 of 1900 that run pass) under
     macwl-run, and GLES through Zink; Zink says only GL 2.1 and GLES 2.0
     until KosmicKrisp has transform feedback (4.6 and 3.2 by override).
+    Step 2 done (2026-11-14, `gpu/run.sh`): the runtime is a virtio-gpu
+    driver, `/dev/dri/renderD128` with its sysfs, timeline syncobjs and
+    sync files, virglrenderer `dlopen`ed in proxy mode; Venus runs through
+    it as on Linux (`vkcube`, the dEQP-VK subset, fences ~40–70 µs over
+    native a round trip).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with
