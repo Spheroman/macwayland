@@ -214,9 +214,18 @@ pub(crate) fn can_block(host: i32) -> bool {
 /// At once for files that never block, one that's ready (or hung up, or in
 /// error: the call says so), or one opened nonblocking (the call says
 /// EAGAIN).
+///
+/// A read of a named FIFO doesn't wait here: nothing says when its last
+/// writer goes (see [`OpenFile::named_fifo`]), so the read blocks in the
+/// host instead, which returns 0 then. (A blocking host call as a lock's:
+/// a signal or the process ending interrupts it, and a CPU wanted for
+/// another task hands it to a worker.)
 pub(super) fn ready(p: &Process, t: &Thread, file: &std::sync::Arc<OpenFile>, events: i16) -> Result<(), i64> {
     // Held for the call (and while it waits parked).
     crate::fs::hold(file);
+    if events == libc::POLLIN && file.named_fifo() {
+        return Ok(());
+    }
     ready_fd(p, t, file.host.as_raw_fd(), file.can_block(), events)
 }
 

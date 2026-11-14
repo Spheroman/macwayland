@@ -40,6 +40,9 @@ pub struct OpenFile {
     /// Whether a call on it can block (a pipe, socket, device), found out
     /// the first time it's asked.
     can_block: std::sync::OnceLock<bool>,
+    /// Whether it's a named FIFO (not a pipe), found out the first time
+    /// it's asked.
+    named_fifo: std::sync::OnceLock<bool>,
     /// Which pty it's an end of, if any, found out the first time it's
     /// asked.
     tty: std::sync::OnceLock<Option<crate::syscall::TtyId>>,
@@ -53,6 +56,22 @@ impl OpenFile {
     /// directory).
     pub fn can_block(&self) -> bool {
         *self.can_block.get_or_init(|| crate::syscall::can_block(self.host.as_raw_fd()))
+    }
+
+    /// Whether it's a named FIFO (`mkfifo`), as opposed to a pipe: on macOS
+    /// neither kqueue nor `poll` says when a FIFO's last writer has gone
+    /// (a read then returns 0 at once), though they do for a pipe.
+    pub fn named_fifo(&self) -> bool {
+        *self.named_fifo.get_or_init(|| {
+            let host = self.host.as_raw_fd();
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(host, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+                return false;
+            }
+            // A pipe has no path.
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            unsafe { libc::fcntl(host, libc::F_GETPATH, buf.as_mut_ptr()) == 0 }
+        })
     }
 
     /// The pty it's an end of, if it is one.
@@ -155,7 +174,7 @@ impl FdEntry {
     }
 
     fn open(self) -> Slot {
-        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(self.dir), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default(), tty: Default::default(), on_close: Default::default() };
+        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(self.dir), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default(), named_fifo: Default::default(), tty: Default::default(), on_close: Default::default() };
         Slot { file: Arc::new(file), cloexec: self.cloexec }
     }
 }
