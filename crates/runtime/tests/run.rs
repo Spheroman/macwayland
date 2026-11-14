@@ -1659,21 +1659,24 @@ fn moved_to_a_host_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("bad"), b"\x7fELF\x02\x01\x01 not a program, not for any machine at all, and long enough").unwrap();
     std::fs::set_permissions(dir.path().join("bad"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    // A program named in the hosts file: `cat` (moved, its parent isn't in
-    // its host: its /proc entry is there, from the parent's host, but not
-    // its memory, so not its environ).
+    // A program named in the hosts file: bash under another name. A moved
+    // process is told by its children's pids: they come from its new
+    // host's range, while it keeps the one it had (ranges of 4096 pids,
+    // from 100000).
     std::fs::create_dir_all(dir.path().join(".config/macwl")).unwrap();
-    std::fs::write(dir.path().join(".config/macwl/hosts"), "# programs with a host of their own\ncat\n").unwrap();
+    std::fs::write(dir.path().join(".config/macwl/hosts"), "# programs with a host of their own\nmovebash\n").unwrap();
+    std::fs::copy(&bash, dir.path().join("movebash")).unwrap();
     let script = format!(
         "set -m; export PATH={cu}; d={d}
          MACWL_NEW_HOST=1 sleep 10 & p=$!; sleep 0.3; kill -TERM $p; wait $p; echo term $?
          MACWL_NEW_HOST=1 {bash} -c 'exit 5'; echo code $?
          MACWL_NEW_HOST=1 {bash} -c 'kill -KILL $$' 2>/dev/null; echo killed $?
-         MACWL_NEW_HOST=1 {bash} -c 'echo ppid $PPID; test -e /proc/$PPID; echo parent listed $?; cat /proc/$PPID/environ >/dev/null 2>&1; echo parent environ $?'; echo parent $$
+         MACWL_NEW_HOST=1 {bash} -c 'echo ppid $PPID; test -e /proc/$PPID; echo parent listed $?; sleep 0 & echo moved $(( ($! - 100000) / 4096 != ($$ - 100000) / 4096 ))'; echo parent $$
          MACWL_NEW_HOST=1 $d/bad 2>/dev/null; echo bad $?
          MACWL_NEW_HOST=1 sleep 3 & p=$!; sleep 0.3; kill -STOP $p; sleep 0.2; jobs -l > $d/j; [[ $(<$d/j) == *Stopped* ]] && echo Stopped; kill -CONT $p; sleep 0.2; jobs -l > $d/j; [[ $(<$d/j) == *Running* ]] && echo Running; kill -INT $p; wait $p; echo int $?
          test -e /proc/$$; echo self seen $?
-         cat /proc/$$/environ >/dev/null 2>&1; echo cat moved $?",
+         $d/movebash -c 'sleep 0 & echo named moved $(( ($! - 100000) / 4096 != ($$ - 100000) / 4096 ))'
+         {bash} -c 'sleep 0 & echo unnamed moved $(( ($! - 100000) / 4096 != ($$ - 100000) / 4096 ))'",
         cu = cu.display(),
         d = dir.path().display(),
         bash = bash.display(),
@@ -1682,7 +1685,7 @@ fn moved_to_a_host_of_its_own() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         stdout,
-        "term 143\ncode 5\nkilled 137\nppid 100000\nparent listed 0\nparent environ 1\nparent 100000\nbad 126\nStopped\nRunning\nint 130\nself seen 0\ncat moved 1\n"
+        "term 143\ncode 5\nkilled 137\nppid 100000\nparent listed 0\nmoved 1\nparent 100000\nbad 126\nStopped\nRunning\nint 130\nself seen 0\nnamed moved 1\nunnamed moved 0\n"
             .replace("100000", stdout.lines().find_map(|l| l.strip_prefix("parent ").filter(|p| p.bytes().all(|b| b.is_ascii_digit()))).unwrap_or("?")),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
@@ -1762,7 +1765,7 @@ fn job_control_across_hosts() {
     let mut seen = Vec::new();
     // Each step, once the prompt says the last one is done.
     let mut at = 0;
-    let mut step = |s: &str, want: &str, at: &mut usize, seen: &mut Vec<u8>| {
+    let step = |s: &str, want: &str, at: &mut usize, seen: &mut Vec<u8>| {
         type_in(&master, s);
         *at = read_until(&master, seen, *at, want);
     };
@@ -1853,6 +1856,133 @@ fn proc_of_another_hosts_process() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Orphaned process groups across hosts (docs/processes.md, step 9): a
+/// group whose only link to its session is a member in another host isn't
+/// orphaned. A background job in bash's host, one of whose members is a
+/// moved bash's child with no link in its own host, reads the terminal:
+/// the job stops (SIGTTIN), rather than the read failing with EIO as it
+/// would in an orphaned group.
+#[test]
+#[ignore = "needs nix"]
+fn orphaned_groups_across_hosts() {
+    use std::os::fd::AsRawFd;
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::PathBuf::from(linux_package("coreutils")).join("bin");
+    let dir = tempfile::tempdir().unwrap();
+    let status = dir.path().join("status");
+    let type_in = |master: &OwnedFd, s: &str| assert_eq!(unsafe { libc::write(master.as_raw_fd(), s.as_ptr().cast(), s.len()) }, s.len() as isize);
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let (mut child, master) = in_a_terminal(&[bash.as_os_str(), "--norc".as_ref(), "-i".as_ref()], &[("HOME", &home)], 24, 80);
+    let (mut seen, mut at) = (Vec::new(), 0);
+    let mut step = |s: &str, want: &str, seen: &mut Vec<u8>| {
+        type_in(&master, s);
+        at = read_until(&master, seen, at, want);
+    };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    step(&format!("export PATH={}; PS1='P> '\n", cu.display()), "P> ", &mut seen);
+    step(
+        &format!("{{ MACWL_NEW_HOST=1 {} -c \"(cat < /dev/tty; echo \\$? > {}) & exit\"; sleep 5; }} &\n", bash.display(), status.display()),
+        "P> ",
+        &mut seen,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    step("jobs\n", "Stopped", &mut seen);
+    // (Until bash has heard of the job's end: its `wait` on a job it
+    // thinks stopped returns at once.)
+    step("kill -KILL %1; while [[ $(jobs) == *Stopped* ]]; do sleep 0.1; done; echo gone\n", "gone", &mut seen);
+    assert!(!status.exists(), "cat's read ended: {:?}", std::fs::read_to_string(&status));
+    type_in(&master, "exit\n");
+    // (Bounded: a shell that doesn't go says why on its terminal.)
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let st = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if std::time::Instant::now() > end {
+            let _ = child.kill();
+            let _ = read_until(&master, &mut seen, at, "\u{0}never");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(st.success(), "{st:?}: {}", String::from_utf8_lossy(&seen));
+}
+
+/// A guest reading a named FIFO (its stdin, here) sees the end when the
+/// last writer closes it: on macOS neither kqueue nor `poll` says so, so
+/// such a read blocks in the host, which does.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn a_fifos_end_ends_a_read() {
+    use std::io::{BufRead, BufReader};
+    let path = format!("{}/../../target/guest/procs", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    // The writer: opened as the reader is (each open waits for the other),
+    // held a moment, closed.
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(w);
+        })
+    };
+    let stdin = std::fs::File::open(&fifo).unwrap();
+    let mut child = macwl_run()
+        .args([path.as_os_str(), "many".as_ref(), "1".as_ref(), "hold".as_ref()])
+        .stdin(stdin)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("1 alive"));
+    writer.join().unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let st = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if std::time::Instant::now() > end {
+            let _ = child.kill();
+            panic!("the read didn't end with the FIFO's writer");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(st.success(), "{st:?}");
+    assert_eq!(lines.next().map(Result::unwrap).as_deref(), Some("procs many ok"));
+}
+
+/// A move made while others wait for the CPU: the hand-off (the new host
+/// starting) goes to a worker rather than hold the CPU, and the process
+/// moves all the same (its exit status comes back). With more busy
+/// processes than CPUs, every such execve is a worker's, as the system
+/// call log says.
+#[test]
+#[ignore = "needs nix"]
+fn a_move_under_load_is_a_workers() {
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::Path::new(&linux_package("coreutils")).join("bin");
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("strace");
+    let script = format!(
+        "export PATH={cu}; for i in $(seq 24); do while :; do :; done & done; sleep 0.5
+         for i in $(seq 5); do MACWL_NEW_HOST=1 {bash} -c 'exit 3'; echo -n \"$? \"; done; echo; kill $(jobs -p)",
+        cu = cu.display(),
+        bash = bash.display(),
+    );
+    let out = macwl_run().env("MACWL_STRACE", &log).arg(&bash).arg("-c").arg(&script).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "3 3 3 3 3 \n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let mut moved_by_workers = 0;
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default();
+        moved_by_workers += text.lines().filter(|l| l.contains(" execve(") && l.ends_with("= Return(-602) (worker)")).count();
+    }
+    assert_eq!(moved_by_workers, 5);
 }
 
 /// A moved process's host dying ends it in its parent's eyes as killed by
