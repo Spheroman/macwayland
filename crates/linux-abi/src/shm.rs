@@ -224,7 +224,7 @@ impl ShmFile {
         }
         self.header()
             .seals
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| (old & SEAL_SEAL == 0).then_some(old | seals))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| (old & SEAL_SEAL == 0).then_some(old | seals))
             .map(|_| ())
             .map_err(|_| errno::EPERM)
     }

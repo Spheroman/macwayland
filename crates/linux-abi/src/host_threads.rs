@@ -60,7 +60,7 @@ impl Drop for HostThread {
 /// Take a thread from the budget, or None if it's spent.
 pub fn reserve() -> Option<HostThread> {
     let budget = budget();
-    LIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < budget).then_some(n + 1)).ok().map(|_| HostThread(()))
+    LIVE.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < budget).then_some(n + 1)).ok().map(|_| HostThread(()))
 }
 
 /// How many of the budget's threads are taken.
