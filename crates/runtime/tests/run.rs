@@ -334,6 +334,47 @@ fn a_unix_socket_path_longer_than_macos_allows() {
     assert_eq!(exit, Exit::Code(0));
 }
 
+/// The GPU (docs/gpu.md, step 2): Mesa's Venus driver finds the render
+/// node, `/dev/dri/renderD128`, and runs Vulkan on the Mac's GPU through
+/// it (virglrenderer's render server on KosmicKrisp): `vulkaninfo` names
+/// the device, and dEQP-VK's smoke and basic synchronization tests (fences,
+/// timeline semaphores, events: the node's syncobjs) pass.
+#[test]
+#[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
+fn venus_through_the_render_node() {
+    let build = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gpu/build.sh")).stderr(std::process::Stdio::null()).output().unwrap();
+    assert!(build.status.success(), "gpu/build.sh failed");
+    let env: Vec<(String, String)> = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("export ")?.split_once('=').map(|(k, v)| (k.to_string(), v.replace("${MESA_KK_EXPERIMENTAL-custom_border}", "custom_border"))))
+        .collect();
+    let mesa = std::path::PathBuf::from(linux_package("mesa"));
+    let gpu = || {
+        let mut cmd = macwl_run();
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.env("MACWL_ENV_VK_ICD_FILENAMES", mesa.join("share/vulkan/icd.d/virtio_icd.aarch64.json"));
+        cmd
+    };
+    let tools = std::path::PathBuf::from(linux_package("vulkan-tools"));
+    let out = gpu().arg(tools.join("bin/vulkaninfo")).arg("--summary").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Virtio-GPU Venus (Apple"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+    let cts = std::path::PathBuf::from(linux_package("vulkan-cts"));
+    let dir = tempfile::tempdir().unwrap();
+    let out = gpu()
+        .current_dir(dir.path())
+        .arg(cts.join("bin/.deqp-vk-wrapped"))
+        .arg(format!("--deqp-archive-dir={}", cts.join("archive-dir").display()))
+        .arg("--deqp-case=dEQP-VK.api.smoke.*,dEQP-VK.synchronization.basic.*")
+        .args(["--deqp-log-images=disable", "--deqp-log-shader-sources=disable", "--deqp-log-filename=/dev/null"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let passed = text.lines().find(|l| l.trim_start().starts_with("Passed:")).unwrap_or_else(|| panic!("no totals: {text}"));
+    assert!(text.lines().any(|l| l.trim_start().starts_with("Failed:") && l.contains(" 0/")), "{passed}\n{}", text.lines().filter(|l| l.contains("Fail")).collect::<Vec<_>>().join("\n"));
+    assert!(!passed.contains(" 0/"), "{passed}");
+}
+
 /// B2: the unmodified Rust Wayland client, built for Linux, opens a window on
 /// macwl-compositor (running here on a thread) and its frames arrive intact.
 #[test]
