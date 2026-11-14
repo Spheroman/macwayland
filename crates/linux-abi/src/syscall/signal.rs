@@ -311,6 +311,19 @@ impl Pending {
         }
     }
 
+    /// Every signal pending, queued ones each, lowest number first (what a
+    /// process takes with it to another host).
+    pub(super) fn queued(&self) -> Vec<SigInfo> {
+        let mut out = Vec::new();
+        for sig in (1..=NSIG).filter(|&sig| self.bits & bit(sig) != 0) {
+            match self.info.get(&sig).filter(|q| !q.is_empty()) {
+                Some(q) => out.extend(q.iter().map(|i| SigInfo { timer: None, ..*i })),
+                None => out.push(SigInfo { signo: sig, ..Default::default() }),
+            }
+        }
+        out
+    }
+
     /// Whether any signal in `set` is pending.
     pub(super) fn any(&self, set: u64) -> bool {
         self.bits & set != 0

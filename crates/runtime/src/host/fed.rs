@@ -936,7 +936,7 @@ pub fn run_adopted() -> Result<Exit, Error> {
             }
         }
     }
-    let Ok((process, thread, exe, argv, envp)) = Process::decode_moved(&mut d, fds) else {
+    let Ok((process, thread, exe, argv, envp, pending)) = Process::decode_moved(&mut d, fds) else {
         refuse(&sock, errno::EINVAL);
         return Err(Error::Unexpected("a bad hand-off".into()));
     };
@@ -947,6 +947,11 @@ pub fn run_adopted() -> Result<Exit, Error> {
             return Err(Error::Unexpected(why));
         }
     };
+    // Its pending signals, as they were in the host it came from (its
+    // first thread's tid is its pid).
+    for (to_thread, info) in pending {
+        process.post(to_thread.then_some(pid), info);
+    }
     let pids = RangePids::new()?;
     let (Ok(send), Ok(answer)) = (sock.try_clone(), sock.try_clone()) else {
         refuse(&sock, errno::EAGAIN);

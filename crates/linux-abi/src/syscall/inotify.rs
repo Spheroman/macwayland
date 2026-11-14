@@ -168,6 +168,29 @@ impl Drop for Inotify {
 }
 
 
+impl Inotify {
+    /// For a process moving to another host: each watch's (wd, host path,
+    /// mask). (Events not yet read stay behind.)
+    pub fn state(&self) -> Vec<(i32, Vec<u8>, u32)> {
+        self.0.lock().watches.iter().map(|(&wd, w)| (wd, w.path.clone(), w.mask)).collect()
+    }
+}
+
+/// A new inotify instance watching what `Inotify::state` gave, with the
+/// same watch descriptors.
+pub(crate) fn inotify_copy(watches: Vec<(i32, Vec<u8>, u32)>, nonblock: bool) -> Result<FdEntry, i64> {
+    let (entry, shared) = new_instance(nonblock)?;
+    for (wd, path, mask) in watches {
+        let Ok(path) = CString::new(path) else { continue };
+        if let Ok(watch) = new_watch(&shared, wd, &path, mask) {
+            let mut state = shared.lock();
+            state.next_wd = state.next_wd.max(wd + 1);
+            state.watches.insert(wd, watch);
+        }
+    }
+    Ok(entry)
+}
+
 fn new_instance(nonblock: bool) -> Result<(FdEntry, Arc<Shared>), i64> {
     let kq = kfd::new_kqueue(nonblock)?;
     kfd::change(kq.as_raw_fd(), kfd::user_event(libc::EV_ADD | libc::EV_CLEAR, 0))?;

@@ -127,6 +127,44 @@ pub(super) fn wait(p: &Process, t: &Thread, kq: RawFd) -> Result<(), i64> {
     super::block::poll(p, t, &mut vec![libc::pollfd { fd: kq, events: libc::POLLIN, revents: 0 }], None).map(|_| ())
 }
 
+impl EventFd {
+    /// For a process moving to another host: (count, semaphore).
+    pub fn state(&self) -> (u64, bool) {
+        (self.count, self.semaphore)
+    }
+}
+
+impl TimerFd {
+    /// For a process moving to another host: (clock, interval, time to
+    /// the next expiry).
+    pub fn state(&self) -> (u64, Duration, Option<Duration>) {
+        (self.clock, self.interval, self.deadline.map(|d| d.saturating_duration_since(Instant::now())))
+    }
+}
+
+/// A new eventfd in the state `EventFd::state` gave (a process that moved
+/// to this host had it).
+pub(crate) fn eventfd_copy(count: u64, semaphore: bool, nonblock: bool) -> Result<FdEntry, i64> {
+    let kq = new_kqueue(nonblock)?;
+    change(kq.as_raw_fd(), user_event(libc::EV_ADD | libc::EV_CLEAR, 0))?;
+    if count != 0 {
+        change(kq.as_raw_fd(), user_event(0, libc::NOTE_TRIGGER))?;
+    }
+    let mut entry = FdEntry::new(kq);
+    entry.kind = FileKind::EventFd(Mutex::new(EventFd { count, semaphore }));
+    Ok(entry)
+}
+
+/// A new timerfd in the state `TimerFd::state` gave.
+pub(crate) fn timerfd_copy(clock: u64, interval: Duration, left: Option<Duration>, nonblock: bool) -> Result<FdEntry, i64> {
+    let kq = new_kqueue(nonblock)?;
+    let deadline = left.map(|l| Instant::now() + l);
+    arm(kq.as_raw_fd(), deadline)?;
+    let mut entry = FdEntry::new(kq);
+    entry.kind = FileKind::TimerFd(Mutex::new(TimerFd { clock, deadline, interval }));
+    Ok(entry)
+}
+
 pub(super) fn nonblocking(file: &OpenFile) -> bool {
     let flags = unsafe { libc::fcntl(file.host.as_raw_fd(), libc::F_GETFL) };
     flags & libc::O_NONBLOCK != 0

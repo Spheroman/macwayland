@@ -136,11 +136,15 @@ impl Process {
     /// filesystem view and working directory, dispositions (handlers reset,
     /// as by an exec; ignored signals kept) and `t`'s mask, rlimits, umask,
     /// `prctl` flags, the program's path, name, argv and environment, and
-    /// the guest numbers of the fds it inherits. Those fds are returned, to
-    /// be passed alongside: only files the host can hand over as they are
-    /// (files, pipes, sockets, terminals); an epoll set, eventfd, timerfd,
-    /// signalfd, inotify instance or pidfd is a kqueue of this host's, and
-    /// isn't passed on. (Pending signals don't go with it.)
+    /// the guest numbers of the fds it inherits, and its pending signals
+    /// (the process's and `t`'s, which an exec keeps). The fds the host
+    /// can hand over as they are (files, pipes, sockets, terminals) are
+    /// returned, to be passed alongside. An epoll set, eventfd, timerfd,
+    /// signalfd or inotify instance is a kqueue of this host's: its state
+    /// goes instead (an epoll set's interests, an eventfd's count, a
+    /// timer's interval and time left, a signalfd's mask, an inotify
+    /// instance's watches, but not events it hasn't read), and the new
+    /// host makes one like it. A pidfd isn't passed on.
     pub fn encode_for_move(&self, t: &Thread, exec: &Exec, e: &mut Encoder) -> Vec<(usize, std::sync::Arc<crate::fs::OpenFile>)> {
         self.fs.encode(e);
         let mut signals = self.signals().clone();
@@ -163,14 +167,58 @@ impl Process {
         for (n, _) in &fds {
             e.u64(*n as u64);
         }
+        // The kqueue-backed fds it inherits, by their state.
+        let made: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| !matches!(f.kind, crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_))).collect();
+        e.u64(made.len() as u64);
+        for (n, f) in &made {
+            e.u64(*n as u64);
+            let nonblock = super::kfd::nonblocking(f);
+            match &f.kind {
+                crate::fs::FileKind::Epoll(set) => {
+                    let set = set.lock().unwrap_or_else(|e| e.into_inner());
+                    e.u64(1).u64(set.len() as u64);
+                    for (&fd, i) in set.iter() {
+                        e.i64(fd as i64).u64(i.events as u64).u64(i.data);
+                    }
+                }
+                crate::fs::FileKind::EventFd(state) => {
+                    let (count, semaphore) = state.lock().unwrap_or_else(|e| e.into_inner()).state();
+                    e.u64(2).u64(count).bool(semaphore);
+                }
+                crate::fs::FileKind::TimerFd(timer) => {
+                    let (clock, interval, left) = timer.lock().unwrap_or_else(|e| e.into_inner()).state();
+                    e.u64(3).u64(clock).u64(interval.as_nanos() as u64).bool(left.is_some()).u64(left.map_or(0, |l| l.as_nanos() as u64));
+                }
+                crate::fs::FileKind::Inotify(inotify) => {
+                    let watches = inotify.state();
+                    e.u64(4).u64(watches.len() as u64);
+                    for (wd, path, mask) in watches {
+                        e.i64(wd as i64).bytes(&path).u64(mask as u64);
+                    }
+                }
+                crate::fs::FileKind::SignalFd(signalfd) => drop(e.u64(5).u64(signalfd.mask())),
+                crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_) => unreachable!(),
+            }
+            e.bool(nonblock);
+        }
+        let process = self.signals().pending.queued();
+        let thread = t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).queued();
+        for list in [process, thread] {
+            e.u64(list.len() as u64);
+            for i in list {
+                e.u64(i.signo).i64(i.code as i64).i64(i.pid as i64).u64(i.uid as u64).i64(i.status as i64).u64(i.addr);
+            }
+        }
         fds
     }
 
     /// The new host's side of [`Process::encode_for_move`]: the process
     /// (with `fds`, the passed files, in order, at their guest numbers), its
-    /// thread, and the program's guest path, argv and environment.
+    /// thread, the program's guest path, argv and environment, and the
+    /// signals pending for it (true: for its thread), for the caller to
+    /// post once it runs.
     #[allow(clippy::type_complexity)]
-    pub fn decode_moved(d: &mut Decoder, fds: Vec<OwnedFd>) -> Result<(Process, Thread, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>), Truncated> {
+    pub fn decode_moved(d: &mut Decoder, fds: Vec<OwnedFd>) -> Result<(Process, Thread, Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<(bool, signal::SigInfo)>), Truncated> {
         let mut p = Process::new("/");
         p.fs = Filesystem::decode(d)?;
         let (signals, thread_signals) = signal::Signals::decode(d)?;
@@ -196,11 +244,73 @@ impl Process {
         for host in fds {
             p.fds.insert_at(d.u64()? as usize, crate::fs::FdEntry::new(host));
         }
+        // Its kqueue-backed fds, made again here; then what its epoll sets
+        // watched, once every fd is in place. (One that can't be made is
+        // left out, as if it had been closed.)
+        let mut epolls = Vec::new();
+        for _ in 0..d.count(16)? {
+            let n = d.u64()? as usize;
+            let ns = std::time::Duration::from_nanos;
+            let made = match d.u64()? {
+                1 => {
+                    let watched = (0..d.count(24)?)
+                        .map(|_| Ok((d.i64()? as i32, crate::fs::Interest { events: d.u64()? as u32, data: d.u64()? })))
+                        .collect::<Result<Vec<_>, Truncated>>()?;
+                    d.bool()?;
+                    epolls.push((n, watched));
+                    super::epoll::new_instance()
+                }
+                2 => {
+                    let (count, semaphore, nonblock) = (d.u64()?, d.bool()?, d.bool()?);
+                    super::kfd::eventfd_copy(count, semaphore, nonblock)
+                }
+                3 => {
+                    let (clock, interval, has_left, left, nonblock) = (d.u64()?, ns(d.u64()?), d.bool()?, ns(d.u64()?), d.bool()?);
+                    super::kfd::timerfd_copy(clock, interval, has_left.then_some(left), nonblock)
+                }
+                4 => {
+                    let watches = (0..d.count(24)?).map(|_| Ok((d.i64()? as i32, d.bytes()?, d.u64()? as u32))).collect::<Result<Vec<_>, Truncated>>()?;
+                    super::inotify::inotify_copy(watches, d.bool()?)
+                }
+                5 => {
+                    let (mask, nonblock) = (d.u64()?, d.bool()?);
+                    super::signalfd_copy(&p.inbox, mask, nonblock)
+                }
+                _ => return Err(Truncated),
+            };
+            if let Ok(entry) = made {
+                p.fds.insert_at(n, entry);
+            }
+        }
+        for (epfd, watched) in epolls {
+            for (fd, interest) in watched {
+                super::epoll::rewatch(&p.fds, epfd as u64, fd, interest);
+            }
+        }
         p.set_exe(exe.clone());
         p.set_comm(&comm);
         let mut t = Thread::main(&p);
         t.signals = thread_signals;
-        Ok((p, t, exe, argv, envp))
+        // Its pending signals, the process's and the thread's.
+        let mut pending = Vec::new();
+        for to_thread in [false, true] {
+            for _ in 0..d.count(48)? {
+                let info = signal::SigInfo {
+                    signo: d.u64()?,
+                    code: d.i64()? as i32,
+                    pid: d.i64()? as i32,
+                    uid: d.u64()? as u32,
+                    status: d.i64()? as i32,
+                    addr: d.u64()?,
+                    timer: None,
+                };
+                if !(1..=64).contains(&info.signo) {
+                    return Err(Truncated);
+                }
+                pending.push((to_thread, info));
+            }
+        }
+        Ok((p, t, exe, argv, envp, pending))
     }
 
     /// The core replaced the program (other threads gone, `t` the one left):

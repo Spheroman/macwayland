@@ -1,7 +1,8 @@
 //! `signalfd`: signals read from a file instead of run as handlers.
 //!
 //! A program blocks the signals and reads them as `signalfd_siginfo`s, taken
-//! from the process's pending set. Like an `eventfd`, it's a host kqueue with
+//! from the reading thread's pending set, then the process's (as Linux's
+//! `dequeue_signal`). Like an `eventfd`, it's a host kqueue with
 //! a user event, so it can be polled and watched by epoll. The user event is
 //! triggered whenever a signal is made pending (and spuriously at times: a
 //! read then finds nothing and waits again). Signals from outside arrive as
@@ -21,7 +22,7 @@ use std::{
 
 use super::{
     kfd, ok,
-    signal::{Inbox, SigInfo, ThreadSignals},
+    signal::{Inbox, SigInfo},
     Process, Thread,
 };
 use crate::{
@@ -178,15 +179,18 @@ pub(crate) fn signalfd_read(p: &Process, t: &Thread, file: &OpenFile, signalfd: 
         let mut n = 0;
         {
             let mut s = p.signals();
-            // Host signals and timers' too, for the process (no thread).
-            p.take_external(&mut s, &ThreadSignals::default(), -1);
+            // Host signals and timers' too. As on Linux, the reading
+            // thread's own signals (a `raise`, a `tgkill` to it) come
+            // first, then the process's.
+            p.take_external(&mut s, &t.signals, t.tid);
+            let mut mine = t.signals.pending.lock().unwrap_or_else(|e| e.into_inner());
             while n + SIGINFO_SIZE <= buf.len() {
-                let Some(info) = s.pending.take(mask) else { break };
+                let Some(info) = mine.take(mask).or_else(|| s.pending.take(mask)) else { break };
                 buf[n..n + SIGINFO_SIZE].copy_from_slice(&siginfo(&info));
                 n += SIGINFO_SIZE;
             }
             if n > 0 {
-                if s.pending.any(mask) {
+                if s.pending.any(mask) || mine.any(mask) {
                     kfd::change(kq, kfd::user_event(0, libc::NOTE_TRIGGER))?;
                 }
                 return Ok(n as i64);

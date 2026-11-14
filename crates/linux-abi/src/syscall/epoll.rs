@@ -52,6 +52,17 @@ pub(super) fn epoll_create1(p: &Process, flags: u64) -> Result<i64, i64> {
     Ok(p.fds.insert(new_instance()?.cloexec(flags & EPOLL_CLOEXEC != 0)))
 }
 
+/// Make epoll instance `epfd` watch `fd` (a process that moved to this host
+/// had it watching).
+pub(crate) fn rewatch(table: &crate::fs::FdTable, epfd: u64, fd: i32, interest: Interest) {
+    let (Ok(ep), Ok(target)) = (table.get(epfd), table.get(fd as u64)) else { return };
+    if let Ok(set) = interests(&ep)
+        && register(ep.host.as_raw_fd(), target.host.as_raw_fd(), fd, Some(interest.events)).is_ok()
+    {
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(fd, interest);
+    }
+}
+
 fn interests(file: &OpenFile) -> Result<&Mutex<BTreeMap<i32, Interest>>, i64> {
     match &file.kind {
         FileKind::Epoll(set) => Ok(set),

@@ -1442,7 +1442,13 @@ impl Kernel for TableKernel {
 
     fn getpgid(&self, p: &Process, pid: i64) -> Result<i64, i64> {
         let pid = if pid == 0 { p.pid } else { pid };
-        self.table()?.state().procs.get(&pid).map(|e| e.pgid).ok_or(errno::ESRCH)
+        let table = self.table()?;
+        let here = table.state().procs.get(&pid).map(|e| e.pgid);
+        // Another host's process: as its host says (step 9).
+        match here {
+            Some(v) => Ok(v),
+            None => table.federated_status(pid, None).map(|s| s.pgid),
+        }
     }
 
     fn setpgid(&self, p: &Process, pid: i64, pgid: i64) -> Result<i64, i64> {
@@ -1487,7 +1493,13 @@ impl Kernel for TableKernel {
 
     fn getsid(&self, p: &Process, pid: i64) -> Result<i64, i64> {
         let pid = if pid == 0 { p.pid } else { pid };
-        self.table()?.state().procs.get(&pid).map(|e| e.sid).ok_or(errno::ESRCH)
+        let table = self.table()?;
+        let here = table.state().procs.get(&pid).map(|e| e.sid);
+        // Another host's process: as its host says (step 9).
+        match here {
+            Some(v) => Ok(v),
+            None => table.federated_status(pid, None).map(|s| s.sid),
+        }
     }
 
     fn setsid(&self, p: &Process) -> Result<i64, i64> {
