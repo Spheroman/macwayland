@@ -9,6 +9,7 @@
 pub mod abi;
 pub mod errno;
 pub mod fs;
+pub mod host_threads;
 pub mod hostinfo;
 pub mod identity;
 pub mod memory;
@@ -18,5 +19,6 @@ pub mod shm;
 pub mod syscall;
 pub mod wire;
 
-pub use memory::{Fault, GuestMemory, Region};
+pub use memory::{Fault, GuestMemory, Region, SharedKey};
+pub use proc::RemoteView;
 pub use syscall::{dispatch, Action, Process};

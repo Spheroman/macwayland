@@ -25,7 +25,14 @@ aarch64-unknown-linux-musl-gcc -O2 -Wall -Wl,--dynamic-linker=/lib/ld-musl-aarch
 install -m 755 "$(aarch64-unknown-linux-musl-gcc -print-file-name=libc.so)" "$root/target/guest/ld-musl-aarch64.so.1"
 echo "target/guest/hello-dyn target/guest/hello-distro target/guest/ld-musl-aarch64.so.1"
 
-# The Rust Wayland client, as a Linux binary (B2).
+# The Rust Wayland client, as a Linux binary (B2). The old copy goes first,
+# so that a build that fails leaves none for the tests to run instead.
+rm -f "$root/target/guest/hello-client"
+if ! rustup target list --installed 2>/dev/null | grep -qx aarch64-unknown-linux-musl; then
+    echo "build-guest.sh: no Rust standard library for aarch64-unknown-linux-musl" >&2
+    echo "  (a toolchain update drops it): rustup target add aarch64-unknown-linux-musl" >&2
+    exit 1
+fi
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc \
     cargo build --quiet --release --manifest-path "$root/Cargo.toml" -p hello-client --target aarch64-unknown-linux-musl
 cp "$root/target/aarch64-unknown-linux-musl/release/hello-client" "$root/target/guest/hello-client"

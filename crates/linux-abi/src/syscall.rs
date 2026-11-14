@@ -6,40 +6,51 @@
 //! returns -ENOSYS and is logged once per call number, so running a program
 //! shows what to implement next.
 
+mod block;
+pub(crate) use block::can_block;
+pub use block::wait_woken;
 mod epoll;
 mod futex;
 mod inotify;
 mod io;
+mod kernel;
 mod kfd;
 mod mem;
 mod misc;
 mod net;
 mod path;
+pub(crate) mod pidfd;
 mod process;
 mod signal;
 mod signalfd;
 mod timer;
-mod tty;
+pub mod tty;
+pub use tty::{identify as tty_of, TtyId, TtyOp};
 #[cfg(test)]
 mod tests;
 
-pub(crate) use epoll::{new_instance as new_epoll, rewatch};
-pub(crate) use inotify::{inotify_copy, inotify_pending, inotify_read};
-pub(crate) use kfd::{eventfd_copy, timerfd_copy};
+pub(crate) use inotify::{inotify_pending, inotify_read};
+pub use kfd::now as kevent_now;
 pub(crate) use signalfd::{signalfd_copy, signalfd_read};
-pub use signalfd::SignalFd;
-pub use futex::{begin_wait as futex_begin_wait, finish_wait as futex_finish_wait, FutexWait, Waker};
-pub use timer::set_interrupt;
+pub use signalfd::{HostSignalWait, SignalFd};
+pub use futex::{finish_wait as futex_finish_wait, restarts_after_handler as futex_restarts_after_handler, waits as futex_waits, FutexWait, Waker};
+pub use kernel::{ChildInfo, CpuClock, HostKernel, Kernel, MacPrograms, ProcStatus, Waited, RUSAGE_SIZE};
 pub use inotify::Inotify;
 pub use kfd::{EventFd, TimerFd};
-pub use process::{answer_setpgid, ctl, exec_host, Exec, Fork, HostExec, Spawn};
-pub use signal::{set_kick, set_yield_check, Delivery, HandlerCall, SigInfo, StackT, HOST_PENDING};
+pub use process::{mac_environment, mac_programs_allowed, mac_spawn, Exec, Fork, HostExec, MacSpawn, Spawn};
+pub use signal::{catch_host_signals, set_kick, set_yield_check, Delivery, HandlerCall, Inbox, SigInfo, StackT};
+/// Signal numbers between Linux's and Darwin's (a client forwards the Mac
+/// side's to its Linux process, and ends as that process did).
+pub use signal::{from_darwin as signal_from_darwin, to_darwin as signal_to_darwin};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeSet, HashMap},
     os::fd::{AsFd, OwnedFd},
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::{
@@ -58,6 +69,10 @@ const IOV_MAX: u64 = 1024;
 /// host allocate without bound.
 const MAX_IO: u64 = 16 << 20;
 
+/// The tids of threads other than a process's first ([`Process::new_tid`]):
+/// above any pid.
+const THREAD_TIDS: std::ops::Range<i64> = 0x1000_0000..0x1800_0000;
+
 /// Per-process state the dispatcher works on (everything except memory, which
 /// the core owns and passes in). Shared by the process's threads.
 #[derive(Debug)]
@@ -72,15 +87,11 @@ pub struct Process {
     /// `prctl` flags.
     dumpable: AtomicBool,
     no_new_privs: AtomicBool,
-    /// Forked children not yet waited for.
-    children: Mutex<process::Children>,
-    /// If this process was forked: the control socket to its parent.
-    parent_ctl: Option<OwnedFd>,
-    /// The process's threads other than the caller's own view of itself, for
-    /// signals sent to one of them.
-    threads: Mutex<BTreeMap<i64, ThreadHandle>>,
-    /// Threads waiting in `futex`.
+    /// Its private futexes' number, in the futex table's keys.
     futexes: futex::Futexes,
+    /// Each thread's robust futex list (`set_robust_list`), by tid: what
+    /// the core lets go of as the thread ends ([`Process::release_robust`]).
+    robust: Mutex<HashMap<i64, u64>>,
     /// `exit_group` (or a fatal signal, or `execve`) is ending every thread.
     exiting: AtomicBool,
     /// POSIX timers.
@@ -92,14 +103,34 @@ pub struct Process {
     unimplemented: Mutex<BTreeSet<String>>,
     /// Which files are mapped where.
     file_maps: Mutex<mem::FileMaps>,
+    /// What the process asks of the world outside it: other processes,
+    /// groups, sessions, accounting (the host's process table; the host's
+    /// own calls for a process on its own, [`HostKernel`]).
+    pub kernel: Arc<dyn Kernel>,
+    /// Signals and timer expiries from outside its system calls, and who
+    /// to wake for them.
+    pub(crate) inbox: Arc<Inbox>,
+    /// The file mode creation mask.
+    umask: AtomicU32,
+    /// Interval timers (`setitimer`).
+    itimers: Mutex<timer::ITimers>,
+    /// Where its arguments and environment strings are in its memory
+    /// (start and end of each), as the loader laid them out: what
+    /// `/proc/<pid>/cmdline` and `environ` read, as Linux's do.
+    arg_area: Mutex<[u64; 4]>,
+    /// When it started, in ns since the machine booted (`/proc/<pid>/stat`).
+    pub started_ns: u64,
+    /// Its name (`/proc/<pid>/comm`): its program's, or what its main
+    /// thread called itself (PR_SET_NAME).
+    comm: Mutex<Vec<u8>>,
 }
 
 /// What other threads need of a thread: where to put signals for it, and how
 /// to get its attention.
 pub struct ThreadHandle {
-    pending: Arc<Mutex<signal::Pending>>,
-    waker: Arc<Waker>,
-    wake: Box<dyn Fn() + Send + Sync>,
+    pub(crate) pending: Arc<Mutex<signal::Pending>>,
+    pub(crate) waker: Arc<Waker>,
+    pub(crate) wake: Box<dyn Fn() + Send + Sync>,
 }
 
 impl std::fmt::Debug for ThreadHandle {
@@ -122,22 +153,75 @@ pub struct Thread {
     /// `set_tid_address` / CLONE_CHILD_CLEARTID: zeroed, and futex-woken, when
     /// the thread exits (how `pthread_join` knows).
     pub clear_child_tid: u64,
+    /// Its process's inbox, whose alerts reach its waker.
+    inbox: Arc<Inbox>,
+    /// What a call that parked waits for (see [`Thread::take_park`]).
+    park: Mutex<Option<Park>>,
+    /// The call is made again after a parked wait: the deadline that wait
+    /// had (Some(None): none), which the call keeps rather than starting
+    /// its timeout over.
+    retry: Option<Option<std::time::Instant>>,
+}
+
+/// What a call waits for, having returned [`errno::PARK`] to the core: its
+/// files (for the core to watch), its deadline, and (`futex`) the wait
+/// still queued; wakes reach it through the waker's unpark hook. The core holds this while the task waits, and gives back
+/// the deadline ([`Thread::set_retry`]) and the futex wait
+/// ([`futex_finish_wait`]) when it makes the call again.
+#[derive(Debug)]
+pub struct Park {
+    /// Host fds and the poll events it waits for (none: a wait in memory,
+    /// which the waker's unpark hook ends).
+    pub watch: Vec<(i32, i16)>,
+    pub deadline: Option<std::time::Instant>,
+    pub futex: Option<FutexWait>,
+    /// The files the call uses, kept open while it waits.
+    pub files: Vec<Arc<crate::fs::OpenFile>>,
 }
 
 impl Thread {
     /// The process's first thread (tid = pid).
     pub fn main(p: &Process) -> Thread {
-        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker: Waker::registered(), clear_child_tid: 0 }
+        let waker = p.inbox.new_waker();
+        Thread { tid: p.pid, signals: signal::ThreadSignals::default(), comm: Vec::new(), waker, clear_child_tid: 0, inbox: p.inbox.clone(), park: Mutex::new(None), retry: None }
     }
 
     /// A thread `self` creates (`clone` with CLONE_THREAD), as tid `tid`.
     pub fn spawn(&self, tid: i64) -> Thread {
-        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker: Waker::registered(), clear_child_tid: 0 }
+        let waker = self.inbox.new_waker();
+        Thread { tid, signals: self.signals.spawned(), comm: self.comm.clone(), waker, clear_child_tid: 0, inbox: self.inbox.clone(), park: Mutex::new(None), retry: None }
     }
 
     /// The signals it blocks (Linux numbering, bit n-1 for signal n).
     pub fn blocked_signals(&self) -> u64 {
         self.signals.blocked
+    }
+
+    /// What the call that returned [`errno::PARK`] waits for.
+    pub fn take_park(&self) -> Option<Park> {
+        self.park.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    pub(crate) fn set_park(&self, park: Park) {
+        *self.park.lock().unwrap_or_else(|e| e.into_inner()) = Some(park);
+    }
+
+    /// The next call is one made again after a parked wait, which had
+    /// `deadline` (None: it's a call like any other).
+    pub fn set_retry(&mut self, deadline: Option<Option<std::time::Instant>>) {
+        self.retry = deadline;
+    }
+
+    /// Whether the call is one made again after a parked wait.
+    pub(crate) fn retrying(&self) -> bool {
+        self.retry.is_some()
+    }
+
+    /// The deadline of a wait the call makes, `computed` from its timeout
+    /// now: the first time, that; made again after a parked wait, the one
+    /// it had then (a timeout runs from the call, not from each try).
+    pub(crate) fn deadline(&self, computed: Option<std::time::Instant>) -> Option<std::time::Instant> {
+        self.retry.unwrap_or(computed)
     }
 }
 
@@ -153,16 +237,41 @@ impl Process {
             rlimits: Mutex::new(misc::default_rlimits()),
             dumpable: AtomicBool::new(true),
             no_new_privs: AtomicBool::new(false),
-            children: Mutex::default(),
-            parent_ctl: None,
-            threads: Mutex::default(),
             futexes: futex::Futexes::default(),
+            robust: Mutex::default(),
             exiting: AtomicBool::new(false),
             tids: std::sync::atomic::AtomicI64::new(0),
             timers: Mutex::default(),
             unimplemented: Mutex::default(),
             file_maps: Mutex::default(),
+            kernel: Arc::new(HostKernel),
+            inbox: Arc::default(),
+            umask: AtomicU32::new(0o022),
+            itimers: Mutex::default(),
+            arg_area: Mutex::default(),
+            comm: Mutex::default(),
+            started_ns: (crate::hostinfo::uptime() * 1e9) as u64,
         }
+    }
+
+    /// Run against `kernel` from now on (a host's process table, when it
+    /// runs many processes).
+    pub fn set_kernel(&mut self, kernel: Arc<dyn Kernel>) {
+        self.inbox.mirror_host.store(kernel.host_signals(), Ordering::Relaxed);
+        self.kernel = kernel;
+    }
+
+    /// The file mode creation mask.
+    pub fn umask(&self) -> u32 {
+        self.umask.load(Ordering::Relaxed)
+    }
+
+    /// Set the file mode creation mask (and tell the kernel), returning the
+    /// old one.
+    pub fn set_umask(&self, mask: u32) -> u32 {
+        let old = self.umask.swap(mask & 0o777, Ordering::Relaxed);
+        self.kernel.umask_changed(self, mask & 0o777);
+        old
     }
 
     pub(crate) fn file_maps(&self) -> std::sync::MutexGuard<'_, mem::FileMaps> {
@@ -193,8 +302,68 @@ impl Process {
     /// host process is likely to have (Linux tids share the pid space), and
     /// unique within the process.
     pub fn new_tid(&self) -> i64 {
-        let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        0x1000_0000 + (self.pid % 0x8000) * 0x1000 + (n % 0x1000)
+        // 65536 a process (more threads than that can be blocked at once),
+        // skipping those still in use as they come round again.
+        loop {
+            let n = self.tids.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let tid = THREAD_TIDS.start + (self.pid % 0x800) * 0x1_0000 + (n % 0x1_0000);
+            if !self.inbox.threads().contains_key(&tid) {
+                return tid;
+            }
+        }
+    }
+
+    /// Whether `tid` may be a thread of process `pid`, from what
+    /// [`Process::new_tid`] makes of a pid (for another process's threads,
+    /// which only that process knows).
+    pub fn may_be_thread_of(pid: i64, tid: i64) -> bool {
+        tid == pid || (THREAD_TIDS.contains(&tid) && (tid - THREAD_TIDS.start) / 0x1_0000 == pid % 0x800)
+    }
+
+    /// Whether `tid` is a thread's other than a main one (whose tid is its
+    /// pid).
+    pub fn is_other_thread(tid: i64) -> bool {
+        THREAD_TIDS.contains(&tid)
+    }
+
+    /// Its program's arguments and environment are at `[args.0, args.1)`
+    /// and `[env.0, env.1)` (set as a program starts).
+    pub fn set_arg_area(&self, args: (u64, u64), env: (u64, u64)) {
+        *self.arg_area.lock().unwrap_or_else(|e| e.into_inner()) = [args.0, args.1, env.0, env.1];
+    }
+
+    /// Where its arguments and environment strings are: start and end of
+    /// each.
+    pub fn arg_area(&self) -> [u64; 4] {
+        *self.arg_area.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Its name, at most 15 bytes (Linux's TASK_COMM_LEN less the NUL).
+    pub fn set_comm(&self, name: &[u8]) {
+        *self.comm.lock().unwrap_or_else(|e| e.into_inner()) = name[..name.len().min(15)].to_vec();
+    }
+
+    /// Its name: as set, else its executable's base name.
+    pub fn comm(&self) -> Vec<u8> {
+        let comm = self.comm.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !comm.is_empty() {
+            return comm;
+        }
+        let exe = self.exe();
+        let name = exe.rsplit(|&b| b == b'/').next().unwrap_or_default();
+        name[..name.len().min(15)].to_vec()
+    }
+
+    /// Its threads' ids (those registered).
+    pub fn thread_ids(&self) -> Vec<i64> {
+        self.inbox.threads().keys().copied().collect()
+    }
+
+    /// The signals its threads block (none known here: masks are each
+    /// thread's own), ignore, and catch, as `/proc/<pid>/status` shows them.
+    pub fn signal_masks(&self) -> (u64, u64, u64) {
+        let s = self.signals();
+        (0, s.ignored_now(), s.caught())
     }
 
     /// Guest path of the running executable.
@@ -211,24 +380,21 @@ impl Process {
     /// called from other threads at any time) gets it to look.
     pub fn register_thread(&self, t: &Thread, wake: Box<dyn Fn() + Send + Sync>) {
         let handle = ThreadHandle { pending: t.signals.pending.clone(), waker: t.waker.clone(), wake };
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).insert(t.tid, handle);
+        self.inbox.threads().insert(t.tid, handle);
     }
 
     pub fn unregister_thread(&self, tid: i64) {
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).remove(&tid);
+        self.inbox.threads().remove(&tid);
     }
 
     /// How many threads are registered.
     pub fn thread_count(&self) -> usize {
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inbox.threads().len()
     }
 
     /// Wake every registered thread (to look at signals, or to exit).
     pub fn wake_all_threads(&self) {
-        for h in self.threads.lock().unwrap_or_else(|e| e.into_inner()).values() {
-            h.waker.wake();
-            (h.wake)();
-        }
+        self.inbox.wake_threads();
     }
 
     /// Start ending every thread (`exit_group`, a fatal signal, `execve`).
@@ -243,18 +409,39 @@ impl Process {
         self.exiting.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Wake up to `n` threads waiting in `futex` on `addr` (a thread's exit
-    /// with CLONE_CHILD_CLEARTID: what `pthread_join` waits for).
-    pub fn futex_wake(&self, addr: u64, n: u64) -> i64 {
-        self.futexes.wake(addr, n, u32::MAX)
+    /// A thread's exit with CLONE_CHILD_CLEARTID, its word zeroed: wake a
+    /// thread waiting on it (what `pthread_join` waits for), as a shared
+    /// futex, as Linux does.
+    pub fn futex_wake_cleared_tid<M: GuestMemory + ?Sized>(&self, mem: &M, addr: u64) -> i64 {
+        futex::wake_cleared_tid(self, mem, addr)
+    }
+
+    /// Thread `tid` has ended, or is replacing its program (`execve`, with
+    /// the old program's memory as `mem`): the robust futexes it holds are
+    /// marked as their owner's death leaves them, and their waiters woken
+    /// (EOWNERDEAD for the next to lock one), as Linux does.
+    pub fn release_robust<M: GuestMemory + ?Sized>(&self, tid: i64, mem: &M) {
+        let head = self.robust.lock().unwrap_or_else(|e| e.into_inner()).remove(&tid);
+        if let Some(head) = head {
+            futex::exit_robust_list(self, mem, tid, head);
+        }
+    }
+
+    /// The process has ended: every thread's robust futexes still held,
+    /// as for [`Process::release_robust`].
+    pub fn release_all_robust<M: GuestMemory + ?Sized>(&self, mem: &M) {
+        let all = std::mem::take(&mut *self.robust.lock().unwrap_or_else(|e| e.into_inner()));
+        for (tid, head) in all {
+            futex::exit_robust_list(self, mem, tid, head);
+        }
     }
 
     fn thread_pending(&self, tid: i64) -> Option<Arc<Mutex<signal::Pending>>> {
-        self.threads.lock().unwrap_or_else(|e| e.into_inner()).get(&tid).map(|h| h.pending.clone())
+        self.inbox.threads().get(&tid).map(|h| h.pending.clone())
     }
 
     fn wake_thread(&self, tid: i64) {
-        if let Some(h) = self.threads.lock().unwrap_or_else(|e| e.into_inner()).get(&tid) {
+        if let Some(h) = self.inbox.threads().get(&tid) {
             h.waker.wake();
             (h.wake)();
         }
@@ -267,6 +454,13 @@ impl Process {
             eprintln!("linux-abi: unimplemented {what}");
             seen.insert(what);
         }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // Host signal handlers mustn't look for its inbox any more.
+        self.stop_receiving_host_signals();
     }
 }
 
@@ -290,10 +484,12 @@ pub enum Action {
     /// Replace the program (`execve`). If the core can't load it, the call
     /// fails with the errno it reports.
     Exec(Exec),
-    /// Replace the program with a Mac one (`execve` of a Mach-O file): the
-    /// core tears down the VM and hands it to [`exec_host`], which returns
-    /// only on failure.
-    ExecHost(HostExec),
+    /// Run a Mac program for this process (`execve` of a Mach-O file): the
+    /// core spawns it as a process of its
+    /// own, and this process stands in for it in the process table (see
+    /// [`MacPrograms::StandIn`]). If it can't be started, the call fails
+    /// with the errno the spawn gave.
+    MacStandIn(HostExec),
     /// Start a thread (`clone` with CLONE_THREAD). The core makes it (with
     /// [`Process::new_tid`]) and returns its tid, or fails with EAGAIN.
     Spawn(Spawn),
@@ -302,6 +498,16 @@ pub enum Action {
 /// Run system call `nr` with arguments x0–x5, for thread `t`.
 pub fn dispatch<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, nr: u64, args: [u64; 6]) -> Action {
     let action = dispatch_call(p, t, mem, nr, args);
+    if action == Action::Return(-errno::PARK) {
+        // The call is made again when the wait is over, and sets a mask
+        // of its own again (ppoll's, sigsuspend's): the thread's own until
+        // then. And the files it uses stay open while it waits.
+        t.signals.end_wait_mask();
+        let files = crate::fs::take_in_flight();
+        if let Some(park) = t.park.get_mut().unwrap_or_else(|e| e.into_inner()) {
+            park.files = files;
+        }
+    }
     crate::fs::end_call();
     t.sync_host_mask();
     action
@@ -316,21 +522,37 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
             t.clear_child_tid = a0;
             Ok(t.tid)
         }
-        // Only consulted when a thread dies holding a robust futex.
-        nr::SET_ROBUST_LIST => Ok(0),
+        // Walked when the thread ends (see `Process::release_robust`).
+        nr::SET_ROBUST_LIST => {
+            if a1 != futex::ROBUST_HEAD_SIZE {
+                return Action::Return(-errno::EINVAL);
+            }
+            let mut robust = p.robust.lock().unwrap_or_else(|e| e.into_inner());
+            if a0 == 0 { robust.remove(&t.tid) } else { robust.insert(t.tid, a0) };
+            Ok(0)
+        }
+        nr::GET_ROBUST_LIST => {
+            // This process's threads only (Linux allows others' with
+            // ptrace's permission).
+            let tid = if a0 as i32 == 0 { t.tid } else { a0 as i32 as i64 };
+            if tid != t.tid && !p.inbox.threads().contains_key(&tid) {
+                return Action::Return(-errno::ESRCH);
+            }
+            let head = p.robust.lock().unwrap_or_else(|e| e.into_inner()).get(&tid).copied().unwrap_or(0);
+            mem.write_pod(a1, &head).and_then(|()| mem.write_pod(a2, &futex::ROBUST_HEAD_SIZE)).map(|()| 0)
+        }
         nr::GETPID => Ok(p.pid),
         nr::GETTID => Ok(t.tid),
-        nr::GETPPID => Ok(unsafe { libc::getppid() } as i64),
+        nr::GETPPID => Ok(p.kernel.getppid(p)),
         nr::GETUID => Ok(unsafe { libc::getuid() } as i64),
         nr::GETEUID => Ok(unsafe { libc::geteuid() } as i64),
         nr::GETGID => Ok(unsafe { libc::getgid() } as i64),
         nr::GETEGID => Ok(unsafe { libc::getegid() } as i64),
         nr::GETGROUPS => misc::getgroups(mem, a0, a1),
-        // The guest process is the host process: same pid, group and session.
-        nr::GETPGID => ok(unsafe { libc::getpgid(a0 as i32) } as i64),
-        nr::SETPGID => process::setpgid(p, a0 as i32 as i64, a1 as i32 as i64),
-        nr::GETSID => ok(unsafe { libc::getsid(a0 as i32) } as i64),
-        nr::SETSID => ok(unsafe { libc::setsid() } as i64),
+        nr::GETPGID => p.kernel.getpgid(p, a0 as i32 as i64),
+        nr::SETPGID => p.kernel.setpgid(p, a0 as i32 as i64, a1 as i32 as i64),
+        nr::GETSID => p.kernel.getsid(p, a0 as i32 as i64),
+        nr::SETSID => p.kernel.setsid(p),
         nr::SETUID => misc::setids(&[a0], false),
         nr::SETGID => misc::setids(&[a0], true),
         nr::SETREUID => misc::setids(&[a0, a1], false),
@@ -340,9 +562,14 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::GETRESUID => misc::getresids(mem, [a0, a1, a2], false),
         nr::GETRESGID => misc::getresids(mem, [a0, a1, a2], true),
         nr::SCHED_YIELD => Ok(0),
+        #[cfg(debug_assertions)]
+        nr::MACWL_TEST_PANIC => panic!("MACWL_TEST_PANIC from pid {} tid {}", p.pid, t.tid),
         // Every thread is SCHED_OTHER at nice 0, for now (docs/mn-threads.md,
         // step 5, is where priorities come in). getpriority returns 20 - nice.
         nr::GETPRIORITY => Ok(20),
+        // Lowering one's priority (nice >= 0) is allowed and, for now, has no
+        // effect; raising it needs CAP_SYS_NICE.
+        nr::SETPRIORITY => if (a2 as i32) < 0 { Err(errno::EACCES) } else { Ok(0) },
         nr::SCHED_GETSCHEDULER => Ok(0),
         nr::SCHED_GETPARAM => mem.write_pod(a1, &0i32).map(|()| 0),
         // SCHED_FIFO and SCHED_RR are 1 to 99; the others only 0.
@@ -352,6 +579,8 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         // Restartable sequences need the kernel to notice preemption; without
         // them glibc falls back on atomics, as on kernels before 4.18.
         nr::RSEQ => Err(errno::ENOSYS),
+        // A kernel built without it; Wine probes and does without.
+        nr::USERFAULTFD => Err(errno::ENOSYS),
         // glibc tries clone3 first and falls back on clone.
         nr::CLONE3 => Err(errno::ENOSYS),
         nr::CLONE => match process::clone(p, a0, a1, a2, a3, a4) {
@@ -362,26 +591,51 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
             Ok(action) => return action,
             Err(e) => Err(e),
         },
-        nr::WAIT4 => process::wait4(p, mem, a0 as i32 as i64 as u64, a1, a2, a3),
-        nr::WAITID => process::waitid(p, mem, a0, a1, a2, a3, a4),
+        nr::WAIT4 => process::wait4(p, t, mem, a0 as i32 as i64 as u64, a1, a2, a3),
+        nr::WAITID => process::waitid(p, t, mem, a0, a1, a2, a3, a4),
         // Advice only.
         nr::FADVISE64 | nr::READAHEAD => p.fds.host(a0).map(|_| 0),
         // Linux xattr names ("user.", "security."...) don't map onto Darwin's;
         // until they do, files look like they're on a filesystem without them.
         nr::SETXATTR..=nr::FREMOVEXATTR => Err(errno::EOPNOTSUPP),
-        nr::FUTEX => futex::futex(p, t, mem, a0, a1, a2, a3, a4, a5),
-        nr::CLOCK_GETTIME => misc::clock_gettime(mem, a0, a1, false),
-        nr::CLOCK_GETRES => misc::clock_gettime(mem, a0, a1, true),
+        nr::FUTEX => {
+            let r = futex::futex(p, t, mem, a0, a1, a2, a3, a4, a5);
+            // What glibc takes as fatal ("The futex facility returned an
+            // unexpected error code"): said once, with what was asked.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if let Err(e @ (errno::EINVAL | errno::EFAULT | errno::ENOSYS)) = r
+                && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("linux-abi: futex gave {e} (op {a1:#x}, uaddr {a0:#x}, timeout {a3:#x}), which glibc takes as fatal");
+            }
+            r
+        }
+        nr::FUTEX_WAITV => futex::waitv(p, t, mem, a0, a1, a2, a3, a4),
+        nr::FUTEX_WAIT => futex::wait2(p, t, mem, a0, a1, a2, a3, a4, a5),
+        nr::FUTEX_WAKE => futex::wake2(p, mem, a0, a1, a2, a3),
+        nr::FUTEX_REQUEUE => futex::requeue2(p, mem, a0, a1, a2, a3),
+        nr::CLOCK_GETTIME => misc::clock_gettime(p, mem, a0, a1, false),
+        nr::CLOCK_GETRES => misc::clock_gettime(p, mem, a0, a1, true),
+        nr::TIMES => misc::times(p, mem, a0),
         nr::GETTIMEOFDAY => misc::gettimeofday(mem, a0, a1),
-        nr::GETRUSAGE => misc::getrusage(mem, a0, a1),
+        nr::GETRUSAGE => misc::getrusage(p, mem, a0, a1),
         nr::SYSINFO => misc::sysinfo(mem, a0),
         nr::SCHED_GETAFFINITY => misc::sched_getaffinity(mem, a1, a2),
-        nr::NANOSLEEP => misc::nanosleep(mem, a0, a1),
-        nr::CLOCK_NANOSLEEP => misc::clock_nanosleep(mem, a0, a1, a2, a3),
+        // macOS has no CPU affinity: accept any mask, as if the scheduler
+        // honoured it.
+        nr::SCHED_SETAFFINITY => Ok(0),
+        nr::NANOSLEEP => misc::nanosleep(p, t, mem, a0, a1),
+        nr::CLOCK_NANOSLEEP => misc::clock_nanosleep(p, t, mem, a0, a1, a2, a3),
         nr::UNAME => misc::uname(mem, a0),
         nr::GETRANDOM => misc::getrandom(mem, a0, a1),
         nr::PRLIMIT64 => misc::prlimit64(p, mem, a0, a1, a2, a3),
         nr::PRCTL => misc::prctl(p, t, mem, a0, a1, a2),
+        nr::CAPGET => misc::capget(mem, a0, a1),
+        nr::CAPSET => misc::capset(mem, a0, a1),
+        nr::GET_MEMPOLICY => misc::get_mempolicy(mem, a0, a1, a2, a3, a4),
+        nr::PIDFD_OPEN => pidfd::pidfd_open(p, a0, a1),
+        nr::PIDFD_SEND_SIGNAL => pidfd::pidfd_send_signal(p, a0, a1, a2, a3),
+        nr::PIDFD_GETFD => pidfd::pidfd_getfd(p, a0, a1, a2),
 
         nr::RT_SIGACTION => signal::rt_sigaction(p, mem, a0, a1, a2, a3),
         nr::RT_SIGPROCMASK => signal::rt_sigprocmask(t, mem, a0, a1, a2, a3),
@@ -390,16 +644,18 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::RT_SIGPENDING => signal::rt_sigpending(p, t, mem, a0, a1),
         nr::RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(p, t, mem, a0, a1, a2, a3),
         nr::RT_SIGRETURN => return Action::SigReturn,
-        nr::KILL => signal::kill(p, a0 as i64, a1),
-        nr::TKILL => signal::tkill(p, t, None, a0 as i64, a1),
-        nr::TGKILL => signal::tkill(p, t, Some(a0 as i64), a1 as i64, a2),
-        nr::SETITIMER => misc::setitimer(mem, a0, a1, a2),
+        // pids are ints: the upper half of the register is whatever the
+        // caller left (glibc's `kill(-pgid)` leaves it zero).
+        nr::KILL => signal::kill(p, a0 as i32 as i64, a1),
+        nr::TKILL => signal::tkill(p, t, None, a0 as i32 as i64, a1),
+        nr::TGKILL => signal::tkill(p, t, Some(a0 as i32 as i64), a1 as i32 as i64, a2),
+        nr::SETITIMER => timer::setitimer(p, mem, a0, a1, a2),
         nr::TIMER_CREATE => timer::timer_create(p, t, mem, a0, a1, a2),
         nr::TIMER_SETTIME => timer::timer_settime(p, mem, a0, a1, a2, a3),
         nr::TIMER_GETTIME => timer::timer_gettime(p, mem, a0, a1),
         nr::TIMER_GETOVERRUN => timer::timer_getoverrun(p, a0),
         nr::TIMER_DELETE => timer::timer_delete(p, a0),
-        nr::GETITIMER => misc::setitimer(mem, a0, 0, a1),
+        nr::GETITIMER => timer::setitimer(p, mem, a0, 0, a1),
 
         nr::BRK => Ok(mem.brk(a0) as i64),
         nr::MMAP => mem::mmap(p, mem, args),
@@ -407,20 +663,20 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::MPROTECT => neg(mem.mprotect(a0, a1, a2)),
         nr::MADVISE => mem::madvise(p, mem, a0, a1, a2),
 
-        nr::READ => io::read(p, mem, a0, a1, a2),
-        nr::WRITE => io::write(p, mem, a0, a1, a2),
-        nr::READV => io::readv(p, mem, a0, a1, a2),
-        nr::WRITEV => io::writev(p, mem, a0, a1, a2),
-        nr::PREAD64 => io::pread(p, mem, a0, a1, a2, a3),
-        nr::PWRITE64 => io::pwrite(p, mem, a0, a1, a2, a3),
+        nr::READ => io::read(p, t, mem, a0, a1, a2),
+        nr::WRITE => io::write(p, t, mem, a0, a1, a2),
+        nr::READV => io::readv(p, t, mem, a0, a1, a2),
+        nr::WRITEV => io::writev(p, t, mem, a0, a1, a2),
+        nr::PREAD64 => io::pread(p, t, mem, a0, a1, a2, a3),
+        nr::PWRITE64 => io::pwrite(p, t, mem, a0, a1, a2, a3),
         nr::LSEEK => io::lseek(p, a0, a1 as i64, a2),
         nr::CLOSE => p.fds.remove(a0).map(|_| 0),
         nr::DUP => io::dup(p, a0),
         nr::DUP3 => io::dup3(p, a0, a1, a2),
         nr::FCNTL => io::fcntl(p, mem, a0, a1, a2),
-        nr::IOCTL => io::ioctl(p, mem, a0, a1, a2),
+        nr::IOCTL => io::ioctl(p, t, mem, a0, a1, a2),
         nr::PIPE2 => io::pipe2(p, mem, a0, a1),
-        nr::PPOLL => io::ppoll(p, mem, a0, a1, a2),
+        nr::PPOLL => io::ppoll(p, t, mem, a0, a1, a2, a3),
         nr::PSELECT6 => io::pselect6(p, t, mem, a0, [a1, a2, a3], a4, a5),
         nr::EPOLL_CREATE1 => epoll::epoll_create1(p, a0),
         nr::EVENTFD2 => kfd::eventfd2(p, a0, a1),
@@ -475,26 +731,26 @@ fn dispatch_call<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread, mem: &M, 
         nr::GETCWD => path::getcwd(p, mem, a0, a1),
         nr::CHDIR => path::chdir(p, mem, a0),
         nr::FCHDIR => path::fchdir(p, a0),
-        nr::UMASK => Ok(unsafe { libc::umask(a0 as libc::mode_t & 0o777) } as i64),
+        nr::UMASK => Ok(p.set_umask(a0 as u32) as i64),
 
         nr::SOCKET => net::socket(p, a0, a1, a2),
         nr::SOCKETPAIR => net::socketpair(p, mem, a0, a1, a2, a3),
         nr::BIND => net::bind(p, mem, a0, a1, a2),
         nr::LISTEN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::listen(h, a1 as i32) } as i64)),
-        nr::ACCEPT => net::accept4(p, mem, a0, a1, a2, 0),
-        nr::ACCEPT4 => net::accept4(p, mem, a0, a1, a2, a3),
-        nr::CONNECT => net::connect(p, mem, a0, a1, a2),
+        nr::ACCEPT => net::accept4(p, t, mem, a0, a1, a2, 0),
+        nr::ACCEPT4 => net::accept4(p, t, mem, a0, a1, a2, a3),
+        nr::CONNECT => net::connect(p, t, mem, a0, a1, a2),
         nr::GETSOCKNAME => net::getname(p, mem, a0, a1, a2, false),
         nr::GETPEERNAME => net::getname(p, mem, a0, a1, a2, true),
-        nr::SENDTO => net::sendto(p, mem, a0, a1, a2, a3, a4, a5),
-        nr::RECVFROM => net::recvfrom(p, mem, a0, a1, a2, a3, a4, a5),
+        nr::SENDTO => net::sendto(p, t, mem, a0, a1, a2, a3, a4, a5),
+        nr::RECVFROM => net::recvfrom(p, t, mem, a0, a1, a2, a3, a4, a5),
         nr::SETSOCKOPT => net::setsockopt(p, mem, a0, a1, a2, a3, a4),
         nr::GETSOCKOPT => net::getsockopt(p, mem, a0, a1, a2, a3, a4),
         nr::SHUTDOWN => p.fds.host(a0).and_then(|h| ok(unsafe { libc::shutdown(h, a1 as i32) } as i64)),
-        nr::SENDMSG => net::sendmsg(p, mem, a0, a1, a2),
-        nr::RECVMSG => net::recvmsg(p, mem, a0, a1, a2),
-        nr::SENDMMSG => net::sendmmsg(p, mem, a0, a1, a2, a3),
-        nr::RECVMMSG => net::recvmmsg(p, mem, a0, a1, a2, a3),
+        nr::SENDMSG => net::sendmsg(p, t, mem, a0, a1, a2),
+        nr::RECVMSG => net::recvmsg(p, t, mem, a0, a1, a2),
+        nr::SENDMMSG => net::sendmmsg(p, t, mem, a0, a1, a2, a3),
+        nr::RECVMMSG => net::recvmmsg(p, t, mem, a0, a1, a2, a3),
 
         _ => {
             p.unimplemented(format!("system call {nr} ({})", nr::name(nr)));

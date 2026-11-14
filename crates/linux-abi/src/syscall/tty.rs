@@ -196,6 +196,7 @@ fn get(host: i32) -> Result<libc::termios, i64> {
 /// Pseudo-terminal and controlling-terminal ioctls.
 pub const TIOCSCTTY: u64 = 0x540e;
 pub const TIOCNOTTY: u64 = 0x5422;
+pub const TIOCGSID: u64 = 0x5429;
 pub const TIOCGPTN: u64 = 0x8004_5430;
 pub const TIOCSPTLCK: u64 = 0x4004_5431;
 pub const TIOCGPTPEER: u64 = 0x5441;
@@ -266,10 +267,192 @@ pub(super) fn pty_ioctl<M: GuestMemory + ?Sized>(mem: &M, host: i32, req: u64, a
             ok(unsafe { libc::unlockpt(host) } as i64)?;
             open_peer(crate::abi::open_flags_to_darwin(arg))
         }
-        TIOCSCTTY => ok(unsafe { libc::ioctl(host, libc::TIOCSCTTY as u64, arg as libc::c_int) } as i64).map(|_| 0),
-        TIOCNOTTY => ok(unsafe { libc::ioctl(host, libc::TIOCNOTTY) } as i64).map(|_| 0),
         _ => Err(errno::ENOTTY),
     }
+}
+
+/// Which end of which pty an open file is: macOS names pty `n`'s slave
+/// `/dev/ttysNNN`, and Linux `/dev/pts/n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TtyId {
+    pub n: u32,
+    pub master: bool,
+}
+
+/// The pty `host` is an end of, if it is one.
+pub fn identify(host: i32) -> Option<TtyId> {
+    if unsafe { libc::isatty(host) } == 0 {
+        return None;
+    }
+    // Only a master answers TIOCPTYGNAME.
+    if let Ok(n) = pty_number(host) {
+        return Some(TtyId { n, master: true });
+    }
+    let mut name = [0 as libc::c_char; 128];
+    if unsafe { libc::ttyname_r(host, name.as_mut_ptr(), name.len()) } != 0 {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_bytes();
+    let n = std::str::from_utf8(name.strip_prefix(b"/dev/ttys")?).ok()?.parse().ok()?;
+    Some(TtyId { n, master: false })
+}
+
+/// What a process in the background of its controlling terminal does to
+/// it, for the job-control check (Linux's `__tty_check_change`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtyOp {
+    Read,
+    Write,
+    /// Changing its settings: `tcsetattr`, `tcsetpgrp`, `tcflush`, ...
+    Change,
+}
+
+pub const SIGINT: u64 = 2;
+pub const SIGQUIT: u64 = 3;
+pub const SIGTSTP: u64 = 20;
+pub const SIGTTIN: u64 = 21;
+pub const SIGTTOU: u64 = 22;
+
+/// Linux's rule for a process outside its terminal's foreground group doing
+/// `op`: Ok(None) to go ahead, Ok(Some(sig)) to send `sig` to its process
+/// group and have the call made again once that's been dealt with (Linux's
+/// ERESTARTSYS: a stop, then the call again when continued), or an error.
+/// `tostop`: the terminal's TOSTOP (a write is only checked with it);
+/// `ignored`: the caller blocks or ignores the signal; `orphaned`: its
+/// process group is orphaned (no one in the session outside it to continue
+/// it).
+pub fn background(op: TtyOp, tostop: bool, ignored: bool, orphaned: bool) -> Result<Option<u64>, i64> {
+    let sig = match op {
+        TtyOp::Read => SIGTTIN,
+        TtyOp::Write if !tostop => return Ok(None),
+        TtyOp::Write | TtyOp::Change => SIGTTOU,
+    };
+    if ignored {
+        // A background read can't wait for a stop that won't come; a write
+        // or change just goes ahead.
+        return if sig == SIGTTIN { Err(errno::EIO) } else { Ok(None) };
+    }
+    if orphaned {
+        return Err(errno::EIO);
+    }
+    Ok(Some(sig))
+}
+
+/// Whether the terminal open as `host` has TOSTOP set.
+pub fn tostop(host: i32) -> bool {
+    get(host).is_ok_and(|t| t.c_lflag & libc::TOSTOP != 0)
+}
+
+/// What the line discipline of a terminal does with bytes written to its
+/// master: its signal characters, from its termios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Keyboard {
+    pub isig: bool,
+    pub icanon: bool,
+    pub iexten: bool,
+    pub istrip: bool,
+    pub intr: u8,
+    pub quit: u8,
+    pub susp: u8,
+    pub lnext: u8,
+}
+
+impl Keyboard {
+    /// The rules of the terminal open as `host` (either end), as its termios
+    /// says now (whoever set it last).
+    pub fn of(host: i32) -> Result<Keyboard, i64> {
+        let t = get(host)?;
+        Ok(Keyboard {
+            isig: t.c_lflag & libc::ISIG != 0,
+            icanon: t.c_lflag & libc::ICANON != 0,
+            iexten: t.c_lflag & libc::IEXTEN != 0,
+            istrip: t.c_iflag & libc::ISTRIP != 0,
+            intr: t.c_cc[libc::VINTR],
+            quit: t.c_cc[libc::VQUIT],
+            susp: t.c_cc[libc::VSUSP],
+            lnext: t.c_cc[libc::VLNEXT],
+        })
+    }
+
+    /// The signals `data` raises, as Linux's `n_tty` reads it: each with the
+    /// index of the byte that raises it. `quoted`: a VLNEXT ended what was
+    /// written before, so the first byte is taken literally. Also returns
+    /// whether a VLNEXT at the end quotes what comes next.
+    pub fn signals(&self, data: &[u8], mut quoted: bool) -> (Vec<(usize, u64)>, bool) {
+        // Linux disables a character with 0; Darwin's termios says 0xff
+        // (_POSIX_VDISABLE) for the ones never set.
+        let is = |c: u8, cc: u8| cc != 0 && cc != 0xff && c == cc;
+        let mut out = Vec::new();
+        for (i, &b) in data.iter().enumerate() {
+            if quoted {
+                quoted = false;
+                continue;
+            }
+            let c = if self.istrip { b & 0x7f } else { b };
+            if self.isig {
+                let sig = if is(c, self.intr) {
+                    Some(SIGINT)
+                } else if is(c, self.quit) {
+                    Some(SIGQUIT)
+                } else if is(c, self.susp) {
+                    Some(SIGTSTP)
+                } else {
+                    None
+                };
+                if let Some(sig) = sig {
+                    out.push((i, sig));
+                    continue;
+                }
+            }
+            // Literal-next quotes the next byte only in canonical mode on
+            // Linux (n_tty handles it with the line editing characters).
+            if self.icanon && self.iexten && is(c, self.lnext) {
+                quoted = true;
+            }
+        }
+        (out, quoted)
+    }
+}
+
+/// Write `data` to pty master `host` as typed keys: up to and including
+/// each signal character, then `signal` for it, as the line discipline
+/// raises it on reading that byte. Returns what was written (or the error,
+/// if nothing was) and whether a VLNEXT now quotes the next byte.
+pub fn write_keys(host: i32, data: &[u8], keys: &Keyboard, quoted: bool, mut signal: impl FnMut(u64)) -> (Result<i64, i64>, bool) {
+    let (sigs, _) = keys.signals(data, quoted);
+    let mut done = 0usize;
+    let ends = sigs.iter().map(|&(i, sig)| (i + 1, Some(sig))).chain(std::iter::once((data.len(), None)));
+    for (end, sig) in ends {
+        while done < end {
+            let want = end - done;
+            let n = unsafe { libc::write(host, data[done..end].as_ptr().cast(), want) };
+            if n < 0 {
+                let e = super::last_errno();
+                if e == errno::EINTR && done > 0 {
+                    continue;
+                }
+                let quoted = keys.signals(&data[..done], quoted).1;
+                return (if done == 0 { Err(e) } else { Ok(done as i64) }, quoted);
+            }
+            done += n as usize;
+            if (n as usize) < want {
+                // A short write: the pty is full for now.
+                let quoted = keys.signals(&data[..done], quoted).1;
+                return (Ok(done as i64), quoted);
+            }
+        }
+        if let Some(sig) = sig {
+            signal(sig);
+        }
+    }
+    (Ok(done as i64), keys.signals(data, quoted).1)
+}
+
+/// A terminal's size, as `TIOCGWINSZ` says (None: not a terminal, or a
+/// master whose slave isn't open).
+pub fn winsize(host: i32) -> Option<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    (unsafe { libc::ioctl(host, libc::TIOCGWINSZ, &mut ws) } == 0).then_some(ws)
 }
 
 pub(super) fn ioctl<M: GuestMemory + ?Sized>(mem: &M, host: i32, req: u64, arg: u64) -> Result<i64, i64> {
@@ -326,6 +509,98 @@ pub(super) fn ioctl<M: GuestMemory + ?Sized>(mem: &M, host: i32, req: u64, arg: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cooked terminal's keys, as `stty sane` sets them.
+    fn sane() -> Keyboard {
+        Keyboard { isig: true, icanon: true, iexten: true, istrip: false, intr: 3, quit: 0x1c, susp: 0x1a, lnext: 0x16 }
+    }
+
+    #[test]
+    fn keyboard_signals_follow_the_termios() {
+        let k = sane();
+        assert_eq!(k.signals(b"ls\n", false), (vec![], false));
+        assert_eq!(k.signals(b"ab\x03cd\x1a\x1c", false), (vec![(2, SIGINT), (5, SIGTSTP), (6, SIGQUIT)], false));
+        // ISIG off (a full-screen program's raw mode): bytes, not signals.
+        assert_eq!(Keyboard { isig: false, ..k }.signals(b"\x03\x1a", false).0, vec![]);
+        // Other characters chosen (stty intr ^X), or turned off: 0 is
+        // Linux's _POSIX_VDISABLE, 0xff Darwin's.
+        let other = Keyboard { intr: 0x18, susp: 0, quit: 0xff, ..k };
+        assert_eq!(other.signals(b"\x03\x18\x1a\x1c\x00\xff", false).0, vec![(1, SIGINT)]);
+        // ISTRIP: the eighth bit goes before the comparison.
+        assert_eq!(Keyboard { istrip: true, ..k }.signals(b"\x83", false).0, vec![(0, SIGINT)]);
+        assert_eq!(k.signals(b"\x83", false).0, vec![]);
+    }
+
+    #[test]
+    fn literal_next_quotes_one_byte_in_canonical_mode() {
+        let k = sane();
+        // Ctrl-V Ctrl-C is a ^C character; the next Ctrl-C a signal.
+        assert_eq!(k.signals(b"\x16\x03\x03", false), (vec![(2, SIGINT)], false));
+        // Ctrl-V Ctrl-V quotes the second.
+        assert_eq!(k.signals(b"\x16\x16\x03", false), (vec![(2, SIGINT)], false));
+        // A Ctrl-V at the end of one write quotes the start of the next.
+        assert_eq!(k.signals(b"a\x16", false), (vec![], true));
+        assert_eq!(k.signals(b"\x03\x03", true), (vec![(1, SIGINT)], false));
+        // Not in non-canonical mode (Linux's n_tty), nor without IEXTEN.
+        assert_eq!(Keyboard { icanon: false, ..k }.signals(b"\x16\x03", false).0, vec![(1, SIGINT)]);
+        assert_eq!(Keyboard { iexten: false, ..k }.signals(b"\x16\x03", false).0, vec![(1, SIGINT)]);
+    }
+
+    #[test]
+    fn background_access_follows_linux() {
+        use TtyOp::*;
+        // Reads: SIGTTIN; EIO if it's blocked or ignored, or the group is
+        // orphaned.
+        assert_eq!(background(Read, false, false, false), Ok(Some(SIGTTIN)));
+        assert_eq!(background(Read, false, true, false), Err(errno::EIO));
+        assert_eq!(background(Read, false, false, true), Err(errno::EIO));
+        // Writes: only with TOSTOP; blocked or ignored, they go ahead.
+        assert_eq!(background(Write, false, false, false), Ok(None));
+        assert_eq!(background(Write, false, false, true), Ok(None));
+        assert_eq!(background(Write, true, false, false), Ok(Some(SIGTTOU)));
+        assert_eq!(background(Write, true, true, false), Ok(None));
+        assert_eq!(background(Write, true, false, true), Err(errno::EIO));
+        // Changes (tcsetattr, tcsetpgrp): SIGTTOU whatever TOSTOP says;
+        // with it blocked, they go ahead (bash's tcsetpgrp from a child).
+        assert_eq!(background(Change, false, false, false), Ok(Some(SIGTTOU)));
+        assert_eq!(background(Change, false, true, false), Ok(None));
+        assert_eq!(background(Change, false, true, true), Ok(None));
+        assert_eq!(background(Change, false, false, true), Err(errno::EIO));
+    }
+
+    /// Typed keys on a real pty: written up to each signal character, the
+    /// signal raised after it, all of it read on the slave.
+    #[test]
+    fn keys_are_written_around_their_signals() {
+        let (mut master, mut slave) = (0, 0);
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
+        let mut t = get(slave).unwrap();
+        // ISIG on, but no flushing on a signal, so the slave reads the rest.
+        t.c_lflag = (t.c_lflag | libc::ISIG | libc::NOFLSH) & !(libc::ICANON | libc::ECHO);
+        unsafe { libc::tcsetattr(slave, libc::TCSANOW, &t) };
+        let keys = Keyboard::of(master).unwrap();
+        assert!(keys.isig && keys.intr == 3);
+        let mut seen = Vec::new();
+        let (r, quoted) = write_keys(master, b"ab\x03cd\x1aef", &keys, false, |sig| {
+            let mut n: libc::c_int = 0;
+            unsafe { libc::ioctl(slave, libc::FIONREAD, &mut n) };
+            seen.push((sig, n));
+        });
+        assert_eq!((r, quoted), (Ok(8), false));
+        // Each signal, in order, once its byte had been written.
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), vec![SIGINT, SIGTSTP]);
+        let mut buf = [0u8; 16];
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let n = unsafe { libc::read(slave, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n >= 6, "read {n}");
+        assert!(buf[..n as usize].starts_with(b"ab"));
+        assert_eq!(identify(master), Some(TtyId { n: identify(slave).unwrap().n, master: true }));
+        assert!(!identify(slave).unwrap().master);
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
 
     #[test]
     fn round_trips_a_typical_terminal() {

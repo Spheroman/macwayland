@@ -3,19 +3,44 @@
 #   scripts/session.sh                 foot + bash from nixpkgs (aarch64-linux)
 #   MACWL_ROOT=<dir> scripts/session.sh  foot inside an extracted distro (its /bin/sh)
 # Cmd+Q quits. Needs: cargo build --release, nix (for foot), signed binaries.
+#
+# The session's Linux processes share one host (one Mac process, one VM:
+# docs/processes.md): the script starts it (`macwl-run --serve`) and exports MACWL_HOST, so the
+# D-Bus daemon, foot and everything started from the session (a Mac
+# terminal that sources its environment too) join it as its clients.
+# `macwl-run --ps` lists its processes.
+# Linux programs there can run Mac ones (open, pbcopy, git, ...), each a Mac
+# process of its own that the Linux process stands in for.
+#
+# For tests: MACWL_SESSION_COMPOSITOR=headless runs the headless compositor
+# (macwl-compositor, typed at with MACWL_TYPE, its frames dumped in the
+# session's directory) in place of the shell; MACWL_SESSION_DIR is the
+# session's directory (default /tmp/macwl-session-$UID, emptied first).
 set -e
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
-cargo build -q --release -p macwl-shell -p macwl-runtime
+if [ "$MACWL_SESSION_COMPOSITOR" = headless ]; then
+    compositor=macwl-compositor
+else
+    compositor=macwl-shell
+fi
+cargo build -q --release -p $compositor -p macwl-runtime
 scripts/sign-hv.sh target/release/macwl-run >/dev/null 2>&1
 
 linux_pkg() { nix build "nixpkgs#legacyPackages.aarch64-linux.$1.out" --max-jobs 0 --no-link --print-out-paths; }
 foot=$(linux_pkg foot)
+dbus=$(linux_pkg dbus)
 
-runtime=/tmp/macwl-session-$(id -u)
+runtime=${MACWL_SESSION_DIR:-/tmp/macwl-session-$(id -u)}
 rm -rf "$runtime"
 mkdir -p "$runtime"
-XDG_RUNTIME_DIR=$runtime target/release/macwl-shell &
+chmod 700 "$runtime"
+if [ $compositor = macwl-compositor ]; then
+    # Its frames go where it runs.
+    (cd "$runtime" && XDG_RUNTIME_DIR=$runtime exec "$root/target/release/$compositor") &
+else
+    XDG_RUNTIME_DIR=$runtime target/release/$compositor &
+fi
 shell=$!
 trap 'kill $shell 2>/dev/null' EXIT
 while [ ! -S "$runtime/wayland-mac" ]; do
@@ -25,12 +50,24 @@ done
 
 export WAYLAND_DISPLAY=wayland-mac XDG_RUNTIME_DIR=$runtime
 
+# One host for the session: everything below joins it.
+export MACWL_HOST="$runtime/macwl-host"
+# Mac programs are the host's to start (docs/processes.md, section 7).
+MACWL_MAC_PROGRAMS=1 target/release/macwl-run --serve "$MACWL_HOST" </dev/null &
+host=$!
+trap 'kill $shell $host 2>/dev/null' EXIT
+while [ ! -S "$MACWL_HOST" ]; do
+    kill -0 $host 2>/dev/null || exit 1
+    sleep 0.05
+done
+
 # A D-Bus session bus (nixpkgs' dbus-daemon, under macwl-run too).
-dbus=$(linux_pkg dbus)
 target/release/macwl-run "$dbus/bin/dbus-daemon" --config-file="$dbus/share/dbus-1/session.conf" \
     --address="unix:path=$runtime/bus" --nofork &
 bus=$!
-trap 'kill $shell $bus 2>/dev/null' EXIT
+# (The host goes by itself 2 s after its last process; told to end, it
+# ends the session's processes.)
+trap 'kill $shell $bus $host 2>/dev/null' EXIT
 while [ ! -S "$runtime/bus" ]; do
     kill -0 $bus 2>/dev/null || break
     sleep 0.1
@@ -60,5 +97,5 @@ else
     # NOSYSBASHRC: the Mac's /etc/bashrc would put the Mac's PATH back.
     MACWL_ENV_PATH=$path MACWL_ENV_NOSYSBASHRC=1 MACWL_ENV_LOCALE_ARCHIVE=$locales/lib/locale/locale-archive \
     MACWL_ENV_XDG_DATA_DIRS=$data MACWL_ENV_GDK_PIXBUF_MODULE_FILE=$pixbuf MACWL_ENV_GST_PLUGIN_SYSTEM_PATH_1_0=$gst \
-        target/release/macwl-run --mac-programs "$foot/bin/foot" "$bash/bin/bash"
+        target/release/macwl-run "$foot/bin/foot" "$bash/bin/bash"
 fi

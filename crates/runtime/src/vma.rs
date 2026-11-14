@@ -40,7 +40,7 @@ impl Vma {
 
 /// Non-overlapping regions, keyed by start address. Adjacent regions with the
 /// same protection and contiguous backing are merged.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Vmas {
     map: BTreeMap<u64, Vma>,
 }

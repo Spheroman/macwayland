@@ -1,13 +1,19 @@
 // Signal handlers: delivery and return, siginfo and ucontext, masks,
-// SA_RESTART, the alternate stack, faults, timers (a host signal arriving
+// SA_RESTART, calls that don't wait under a stream of signals, the
+// alternate stack, faults, timers (a host signal arriving
 // while the guest runs), signals from another process, and SIGPIPE.
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
 #include <sys/wait.h>
@@ -126,6 +132,55 @@ static void restart_and_eintr(void) {
     setitimer(ITIMER_REAL, &it, 0);
     CHECK(read(p[0], &c, 1) == -1 && errno == EINTR);
     close(p[0]), close(p[1]);
+}
+
+// Calls that don't wait aren't interrupted: on Linux a signal ends only a
+// wait, so a futex wake, a read or write that's ready, and a nonblocking
+// read never fail with EINTR, however signals come (glibc aborts on a
+// wake's EINTR: "The futex facility returned an unexpected error code").
+// Another thread signals this one all along, to a handler without
+// SA_RESTART.
+static volatile int pelting;
+static void *pelt(void *arg) {
+    pthread_t target = *(pthread_t *)arg;
+    while (pelting) {
+        pthread_kill(target, SIGUSR2);
+        for (volatile int i = 0; i < 20; i++) {}
+    }
+    return 0;
+}
+
+static void calls_that_dont_wait(void) {
+    install(SIGUSR2, on_signal, 0);
+    int p[2];
+    CHECK(pipe(p) == 0);
+    CHECK(fcntl(p[0], F_SETFL, O_NONBLOCK) == 0);
+    int efd = eventfd(0, EFD_NONBLOCK);
+    CHECK(efd >= 0);
+    static int word;
+    pthread_t self = pthread_self(), t;
+    int before = hits;
+    pelting = 1;
+    CHECK(pthread_create(&t, 0, pelt, &self) == 0);
+    char c;
+    uint64_t v = 1;
+    // 10000 rounds: the old bugs showed in nearly every run at this size,
+    // and it takes seconds, not minutes, under the signals.
+    for (int i = 0; i < 10000; i++) {
+        long r = syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+        if (r != 0) printf("futex wake: %ld errno %d (round %d)\n", r, errno, i);
+        CHECK(r == 0);
+        r = read(p[0], &c, 1);
+        CHECK(r == -1 && errno == EAGAIN);
+        CHECK(write(p[1], "y", 1) == 1);
+        CHECK(read(p[0], &c, 1) == 1 && c == 'y');
+        CHECK(write(efd, &v, 8) == 8);
+        CHECK(read(efd, &v, 8) == 8 && v == 1);
+    }
+    pelting = 0;
+    pthread_join(t, 0);
+    CHECK(hits > before);
+    close(p[0]), close(p[1]), close(efd);
 }
 
 static volatile sig_atomic_t got_chld;
@@ -249,6 +304,7 @@ int main(void) {
     faults();
     timer_interrupts_a_busy_loop();
     restart_and_eintr();
+    calls_that_dont_wait();
     from_another_process();
     sigpipe();
     posix_timers();

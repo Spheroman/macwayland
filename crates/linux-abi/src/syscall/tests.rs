@@ -98,7 +98,7 @@ impl T {
             Action::Return(v) => v,
             Action::Exit(c) | Action::ExitThread(c) => panic!("exited with {c}"),
             Action::SigReturn => panic!("rt_sigreturn wants the core"),
-            a @ (Action::Fork(_) | Action::Exec(_) | Action::ExecHost(_) | Action::Spawn(_)) => panic!("{} wants the core: {a:?}", nr::name(nr)),
+            a @ (Action::Fork(_) | Action::Exec(_) | Action::MacStandIn(_) | Action::Spawn(_)) => panic!("{} wants the core: {a:?}", nr::name(nr)),
         }
     }
 
@@ -892,6 +892,112 @@ fn futex_waits_and_wakes_across_threads() {
     });
 }
 
+/// PI locks (LOCK_PI handing over at UNLOCK_PI, TRYLOCK_PI, EDEADLK,
+/// EPERM), a robust futex whose owner thread ends with a waiter on it,
+/// WAKE_OP's arithmetic, and futex_waitv woken by its second futex.
+#[test]
+fn pi_robust_wake_op_and_waitv() {
+    use std::time::Duration;
+    let p = Process::new("/");
+    let mem = SyncMem(std::sync::Mutex::new(vec![0; 4096]));
+    let call = |t: &mut Thread, nr: u64, a: &[u64]| -> i64 {
+        let mut args = [0; 6];
+        args[..a.len()].copy_from_slice(a);
+        match dispatch(&p, t, &mem, nr, args) {
+            Action::Return(v) => v,
+            other => panic!("{other:?}"),
+        }
+    };
+    let u32_at = |a: u64| {
+        let mut b = [0; 4];
+        mem.read(a, &mut b).unwrap();
+        u32::from_le_bytes(b)
+    };
+    const WAITERS: u32 = 0x8000_0000;
+    const OWNER_DIED: u32 = 0x4000_0000;
+    const LOCK_PI: u64 = 6;
+    const UNLOCK_PI: u64 = 7;
+    const TRYLOCK_PI: u64 = 8;
+    let word = BASE;
+    let mut a = Thread::main(&p).spawn(2);
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, LOCK_PI, 0, 0]), 0, "free: taken");
+    assert_eq!(u32_at(word), 2);
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, LOCK_PI, 0, 0]), -errno::EDEADLK);
+    std::thread::scope(|s| {
+        let b = s.spawn(|| {
+            let mut b = Thread::main(&p).spawn(3);
+            assert_eq!(call(&mut b, nr::FUTEX, &[word, TRYLOCK_PI, 0, 0]), -errno::EAGAIN);
+            assert_eq!(call(&mut b, nr::FUTEX, &[word, UNLOCK_PI, 0, 0]), -errno::EPERM, "not its own");
+            call(&mut b, nr::FUTEX, &[word, LOCK_PI, 0, 0])
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(u32_at(word), 2 | WAITERS, "a waiter marked");
+        assert_eq!(call(&mut a, nr::FUTEX, &[word, UNLOCK_PI, 0, 0]), 0);
+        assert_eq!(b.join().unwrap(), 0);
+        assert_eq!(u32_at(word), 3 | WAITERS, "handed to the waiter");
+    });
+    let mut b = Thread::main(&p).spawn(3);
+    assert_eq!(call(&mut b, nr::FUTEX, &[word, UNLOCK_PI, 0, 0]), 0);
+    assert_eq!(u32_at(word), 0, "no one waits");
+
+    // A robust list: its head at H, one entry at E, the futex word 16 past
+    // each entry. Thread 4 holds it; a waiter waits; 4 ends.
+    let (h, e) = (BASE + 64, BASE + 128);
+    let robust = e + 16;
+    mem.write(h, &[e.to_le_bytes(), 16u64.to_le_bytes(), 0u64.to_le_bytes()].concat()).unwrap();
+    mem.write(e, &h.to_le_bytes()).unwrap();
+    mem.write(robust, &(4 | WAITERS).to_le_bytes()).unwrap();
+    let mut owner = Thread::main(&p).spawn(4);
+    assert_eq!(call(&mut owner, nr::SET_ROBUST_LIST, &[h, 23]), -errno::EINVAL);
+    assert_eq!(call(&mut owner, nr::SET_ROBUST_LIST, &[h, 24]), 0);
+    let got = BASE + 256;
+    assert_eq!(call(&mut owner, nr::GET_ROBUST_LIST, &[0, got, got + 8]), 0);
+    assert_eq!(u32_at(got) as u64, h);
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            let mut w = Thread::main(&p).spawn(5);
+            call(&mut w, nr::FUTEX, &[robust, 0, (4 | WAITERS) as u64, 0])
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        p.release_robust(4, &mem);
+        assert_eq!(waiter.join().unwrap(), 0, "woken by the owner's end");
+    });
+    assert_eq!(u32_at(robust), WAITERS | OWNER_DIED);
+
+    // WAKE_OP: word2 += 5, then (old 0 == 0) a wake on both; no one waits.
+    let word2 = BASE + 512;
+    let op = (1u64 << 28) | (5 << 12); // FUTEX_OP_ADD 5, FUTEX_OP_CMP_EQ 0
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, 5, 1, 1, word2, op]), 0);
+    assert_eq!(u32_at(word2), 5);
+    let shift = (8u64 << 28) | (2 << 28) | (4 << 12); // OR (1 << 4)
+    assert_eq!(call(&mut a, nr::FUTEX, &[word, 5, 1, 1, word2, shift]), 0);
+    assert_eq!(u32_at(word2), 5 | 16);
+
+    // futex_waitv on three words, woken by the second.
+    let v = BASE + 1024;
+    let words = [BASE + 2048, BASE + 2052, BASE + 2056];
+    let mut entries = Vec::new();
+    for w in words {
+        entries.extend([0u64.to_le_bytes(), w.to_le_bytes(), (2u64 | 128).to_le_bytes()].concat());
+    }
+    mem.write(v, &entries).unwrap();
+    assert_eq!(call(&mut a, nr::FUTEX_WAITV, &[v, 0, 0, 0, 0]), -errno::EINVAL, "none");
+    mem.write(words[2], &1u32.to_le_bytes()).unwrap();
+    assert_eq!(call(&mut a, nr::FUTEX_WAITV, &[v, 3, 0, 0, 0]), -errno::EAGAIN, "one differs");
+    mem.write(words[2], &0u32.to_le_bytes()).unwrap();
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| {
+            let mut w = Thread::main(&p).spawn(6);
+            call(&mut w, nr::FUTEX_WAITV, &[v, 3, 0, 0, 0])
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(call(&mut a, nr::FUTEX_WAKE, &[words[1], u32::MAX as u64, 1, 2 | 128]), 1, "futex2 wake");
+        assert_eq!(waiter.join().unwrap(), 1, "the second woke it");
+    });
+    // Its other entries left their queues.
+    assert_eq!(call(&mut a, nr::FUTEX, &[words[0], 129, 1]), 0);
+}
+
 #[test]
 fn epoll_on_pipes() {
     let mut t = T::new();
@@ -1274,24 +1380,19 @@ fn signal_numbers_translate() {
 }
 
 #[test]
-fn fork_state_round_trips() {
-    use crate::wire::{Decoder, Encoder};
-    use std::os::fd::{FromRawFd, OwnedFd};
+fn a_fork_child_inherits_its_parents_state() {
     let mut t = T::new();
     let fd = t.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     t.p.set_exe(b"/bin/prog".to_vec());
     let ign = t.put(&[1u64.to_le_bytes(), [0; 8], [0; 8], [0; 8]].concat());
     t.ok(nr::RT_SIGACTION, &[13, ign, 0, 8]);
-    let mut e = Encoder::default();
-    let host: Vec<OwnedFd> = t.p.encode_for_fork(&t.th, &mut e).into_iter().map(|h| unsafe { OwnedFd::from_raw_fd(libc::dup(h)) }).collect();
-    let (ctl, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let (q, mut qt) = Process::decode_forked(&mut Decoder(&e.0), host, ctl.into()).unwrap();
+    let (q, mut qt) = t.p.fork_in_host(&t.th, t.p.pid + 1);
     assert_eq!(q.exe(), t.p.exe());
     assert_eq!(q.fs.root(), t.p.fs.root());
     assert!(q.fds.cloexec(fd).unwrap());
     assert_eq!(q.fds.get(fd).unwrap().path, t.p.fds.get(fd).unwrap().path);
     // SIGPIPE stays ignored; exec drops close-on-exec fds and keeps SIG_IGN.
-    q.exec_done(&mut qt, b"/bin/other".to_vec());
+    q.exec_done(&mut qt, b"/bin/other".to_vec(), b"other");
     assert!(q.fds.get(fd).is_err());
     let old = t.buf(32);
     let mut a = [0; 6];
@@ -1503,23 +1604,18 @@ fn inotify_reports_changes() {
 
 #[test]
 fn inotify_goes_to_a_forked_child() {
-    use std::os::fd::{FromRawFd, OwnedFd};
     let mut t = T::new();
     let d = t.s("/d");
     t.ok(nr::MKDIRAT, &[FDCWD, d, 0o755]);
     let fd = t.ok(nr::INOTIFY_INIT1, &[0o4000]);
     let wd = t.ok(nr::INOTIFY_ADD_WATCH, &[fd, d, 0x100 /* IN_CREATE */]);
-    // As a fork does: the table encoded, and decoded with its host fds.
-    let mut e = crate::wire::Encoder::default();
-    let host = t.p.fds.encode(&mut e);
-    let mut fds = host.iter().map(|&h| unsafe { OwnedFd::from_raw_fd(libc::dup(h)) });
-    let child = crate::fs::FdTable::decode(&mut crate::wire::Decoder(&e.0), &mut fds).unwrap();
-    let file = child.get(fd).unwrap();
+    let (child, _) = t.p.fork_in_host(&t.th, t.p.pid + 1);
+    let file = child.fds.get(fd).unwrap();
     std::fs::write(t.root().join("d/new"), "x").unwrap();
     let mut buf = [0u8; 64];
     let start = std::time::Instant::now();
     let n = loop {
-        match inotify_read(&file, &mut buf) {
+        match inotify_read(&t.p, &t.th, &file, &mut buf) {
             Ok(n) => break n as usize,
             Err(e) if e == errno::EAGAIN && start.elapsed().as_secs() < 5 => std::thread::sleep(std::time::Duration::from_millis(20)),
             Err(e) => panic!("read: {e}"),
@@ -1566,4 +1662,100 @@ fn memfd_seals() {
     // A dup sees the same seals (they're the object's).
     let dup = t.ok(nr::DUP, &[fd]);
     assert_eq!(t.ok(nr::FCNTL, &[dup, GET_SEALS]), SEAL | SHRINK | GROW | WRITE);
+}
+
+/// A fork inside the host (many processes in one VM): open files shared
+/// (one offset), dispositions copied; signals posted from another process
+/// taken in, ignored ones dropped; SIGCHLD's disposition read for the
+/// kernel.
+#[test]
+fn a_fork_in_the_host_shares_open_files() {
+    let mut t = T::new();
+    let fd = t.open("f", O_RDWR | O_CREAT);
+    t.write_str(fd, "abcdef");
+    t.ok(nr::LSEEK, &[fd, 0, 0]);
+    let ign = t.put(&[1u64.to_le_bytes(), [0; 8], [0; 8], [0; 8]].concat());
+    t.ok(nr::RT_SIGACTION, &[12, ign, 0, 8]); // SIGUSR2 ignored
+    let (child, mut cth) = t.p.fork_in_host(&t.th, 4242);
+    assert_eq!((child.pid, cth.tid), (4242, 4242));
+    let b = t.buf(3);
+    assert_eq!(dispatch(&child, &mut cth, &t.m, nr::READ, [fd, b, 3, 0, 0, 0]), Action::Return(3));
+    assert_eq!(t.get(b, 3), b"abc");
+    assert_eq!(t.ok(nr::LSEEK, &[fd, 0, 1]), 3, "one open file description: the offset moved for the parent too");
+    assert_eq!(dispatch(&child, &mut cth, &t.m, nr::CLOSE, [fd, 0, 0, 0, 0, 0]), Action::Return(0));
+    assert_eq!(t.read_n(fd, 3), b"def", "closed in the child only");
+
+    child.post(None, SigInfo::user(12, signal::SI_USER, 77));
+    child.post(None, SigInfo::user(10, signal::SI_USER, 77));
+    assert_eq!(child.next_delivery(&mut cth), Some(Delivery::Kill(10)), "SIGUSR2 ignored (copied), SIGUSR1 kills");
+    assert_eq!(child.child_policy(), (false, true));
+    t.ok(nr::RT_SIGACTION, &[17, ign, 0, 8]);
+    assert_eq!(t.p.child_policy(), (true, true), "SIGCHLD ignored: children reaped as they end");
+}
+
+/// A thread blocked in a host call is woken by its waker's pipe alone, with
+/// no interrupt to its host thread at all (the extreme of an interrupt lost
+/// just before the call sleeps): a read of an empty pipe, a sleep, a poll
+/// and a read of an eventfd all end once the process is ending.
+#[test]
+fn a_blocked_call_wakes_without_an_interrupt() {
+    use std::sync::Arc;
+    for case in ["read", "nanosleep", "ppoll", "eventfd"] {
+        let root = tempfile::tempdir().unwrap();
+        let p = Arc::new(Process::new(root.path()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = p.clone();
+        let blocked = std::thread::spawn(move || {
+            let mut th = Thread::main(&p2);
+            // Its wake does nothing: only the waker's pipe can end the call.
+            p2.register_thread(&th, Box::new(|| {}));
+            let m = FlatMem(std::cell::RefCell::new(vec![0; 4096]));
+            let call = |th: &mut Thread, nr: u64, a: [u64; 6]| match dispatch(&*p2, th, &m, nr, a) {
+                Action::Return(v) => v,
+                other => panic!("{other:?}"),
+            };
+            let (nr, args) = match case {
+                "read" | "ppoll" => {
+                    assert_eq!(call(&mut th, nr::PIPE2, [BASE, 0, 0, 0, 0, 0]), 0);
+                    let mut fds = [0u8; 8];
+                    m.read(BASE, &mut fds).unwrap();
+                    let rfd = u32::from_le_bytes(fds[..4].try_into().unwrap()) as u64;
+                    if case == "read" {
+                        (nr::READ, [rfd, BASE + 64, 1, 0, 0, 0])
+                    } else {
+                        m.write(BASE + 64, &[rfd as u8, 0, 0, 0, 1, 0, 0, 0]).unwrap(); // { fd, POLLIN }
+                        (nr::PPOLL, [BASE + 64, 1, 0, 0, 0, 0])
+                    }
+                }
+                "nanosleep" => {
+                    m.write(BASE + 64, &[100u64.to_le_bytes(), 0u64.to_le_bytes()].concat()).unwrap();
+                    (nr::NANOSLEEP, [BASE + 64, 0, 0, 0, 0, 0])
+                }
+                _ => {
+                    let efd = call(&mut th, nr::EVENTFD2, [0, 0, 0, 0, 0, 0]) as u64;
+                    (nr::READ, [efd, BASE + 64, 8, 0, 0, 0])
+                }
+            };
+            tx.send(()).unwrap();
+            call(&mut th, nr, args)
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        p.set_exiting(true);
+        assert_eq!(blocked.join().unwrap(), -errno::EINTR, "{case}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{case}");
+    }
+}
+
+/// Another process's threads are known by their tids alone: those its
+/// threads get say which process they may be of.
+#[test]
+fn a_tid_says_which_process_it_may_be_of() {
+    let p = Process::new("/");
+    let tid = p.new_tid();
+    assert!(Process::may_be_thread_of(p.pid, tid));
+    assert!(Process::may_be_thread_of(p.pid, p.pid), "the first thread's tid is the pid");
+    assert!(!Process::may_be_thread_of(p.pid + 1, tid));
+    assert!(Process::is_other_thread(tid) && !Process::is_other_thread(p.pid));
 }

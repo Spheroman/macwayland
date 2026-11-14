@@ -9,19 +9,20 @@
 //!
 //! Signals from outside arrive as host signals. For each signal the guest has
 //! a handler for, a host handler is installed ([`Process::sync_host_signals`])
-//! that marks it pending in [`HOST_PENDING`] and kicks the vCPU (the core's
+//! that marks it pending in the [`Inbox`] of the process host signals are
+//! for ([`Process::receive_host_signals`]) and kicks the vCPU (the core's
 //! [`set_kick`] hook). Ignored and default dispositions are the host's own, so
 //! a default SIGINT kills and SIGTSTP stops the host process directly.
 
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
     },
 };
 
-use super::{Process, Thread};
+use super::{futex::Waker, Process, Thread};
 use crate::{
     abi::Timespec,
     errno,
@@ -45,10 +46,105 @@ const SA_RESTORER: u64 = 0x0400_0000;
 pub const SI_USER: i32 = 0;
 const SI_TKILL: i32 = -6;
 
-/// Signals (Linux numbering, bit n-1) raised by host signal handlers, not yet
-/// taken into a process's pending set.
-pub static HOST_PENDING: AtomicU64 = AtomicU64::new(0);
-/// How the core gets a running vCPU to stop and look at [`HOST_PENDING`].
+/// What reaches a process from outside its system calls: host signals and
+/// expired timers' signals, not yet taken into its pending sets, and the
+/// signalfds and threads to wake for them. Each process has its own (several
+/// will share a host once processes share a VM); timer threads keep it, and
+/// host signal handlers reach it without locks.
+#[derive(Debug)]
+pub struct Inbox {
+    /// Host signals (Linux numbering, bit n-1) caught for the process.
+    host_pending: AtomicU64,
+    /// Expired timers' signals: (thread, siginfo).
+    pub(super) fired: Mutex<Vec<(Option<i64>, SigInfo)>>,
+    /// Its signalfds' kqueues (their own copies), for host signal handlers
+    /// to trigger: a fixed table, as a handler can't take a lock. -1 is free.
+    pub(super) kqueues: [AtomicI32; 32],
+    /// Its threads' wakers, for waking them all (a timer expired).
+    wakers: Mutex<Vec<Weak<Waker>>>,
+    /// Its registered threads: where signals for one of them go, and how to
+    /// get each one's attention wherever it is (in the guest, in a host call
+    /// on a CPU or a worker). Here rather than in the process, so that a
+    /// timer's thread, which holds only the inbox, reaches its own process's
+    /// threads and no one else's.
+    threads: Mutex<BTreeMap<i64, super::ThreadHandle>>,
+    /// Whether its threads' masks are mirrored onto their host threads
+    /// ([`super::Kernel::host_signals`]).
+    pub(super) mirror_host: AtomicBool,
+}
+
+impl Default for Inbox {
+    fn default() -> Self {
+        Inbox {
+            host_pending: AtomicU64::new(0),
+            fired: Mutex::default(),
+            kqueues: [const { AtomicI32::new(-1) }; 32],
+            wakers: Mutex::default(),
+            threads: Mutex::default(),
+            mirror_host: AtomicBool::new(true),
+        }
+    }
+}
+
+impl Inbox {
+    /// A new waker for one of the process's threads, which [`alert`] reaches.
+    pub(super) fn new_waker(&self) -> Arc<Waker> {
+        let w = Arc::new(Waker::new());
+        let mut all = self.wakers.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Arc::downgrade(&w));
+        w
+    }
+
+    pub(super) fn threads(&self) -> std::sync::MutexGuard<'_, BTreeMap<i64, super::ThreadHandle>> {
+        self.threads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Get the attention of every thread of the process, and only its: those
+    /// asleep in the runtime (their wakers), in the guest or blocked in a
+    /// host call (their own wake, which kicks their vCPU or interrupts their
+    /// host thread).
+    pub(super) fn wake_threads(&self) {
+        for w in self.wakers.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()) {
+            w.wake();
+        }
+        for h in self.threads().values() {
+            h.waker.wake();
+            (h.wake)();
+        }
+    }
+
+    /// Take the host signals caught for this inbox (bit n-1 for Linux
+    /// signal n).
+    pub fn take_host_pending(&self) -> u64 {
+        self.host_pending.swap(0, Ordering::AcqRel)
+    }
+
+    /// Host signals are for this inbox from now on: a host of many
+    /// processes keeps one of its own and routes what lands in it (see
+    /// [`super::HostSignalWait`]). It must live as long as the host process.
+    pub fn receive_host_signals(self: &Arc<Self>) {
+        HOST_TARGET.store(Arc::as_ptr(self).cast_mut(), Ordering::Release);
+    }
+}
+
+/// Catch the Linux signals `signals` on the host (for whatever inbox
+/// receives host signals), whatever any guest's disposition: for a host of
+/// many processes, which keeps no process's dispositions on the host.
+pub fn catch_host_signals(signals: &[u64]) {
+    for &sig in signals {
+        let Some(darwin) = to_darwin(sig) else { continue };
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = host_handler as *const () as libc::sighandler_t;
+        unsafe { libc::sigaction(darwin, &sa, std::ptr::null_mut()) };
+    }
+}
+
+/// The inbox host signals are for: the host's own (whose thread hands them
+/// to the process table), or a process on its own's.
+static HOST_TARGET: AtomicPtr<Inbox> = AtomicPtr::new(std::ptr::null_mut());
+
+/// How the core gets a running vCPU to stop and look at pending signals.
 static KICK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// How the core says the thread making a call is wanted elsewhere: its CPU
@@ -79,8 +175,11 @@ pub fn set_kick(kick: fn()) {
 }
 
 extern "C" fn host_handler(sig: libc::c_int) {
-    HOST_PENDING.fetch_or(bit(from_darwin(sig)), Ordering::AcqRel);
-    super::signalfd::notify();
+    // Safety: the target is cleared before its process goes, and the inbox
+    // lives as long as that (or longer, held by a timer).
+    let Some(inbox) = (unsafe { HOST_TARGET.load(Ordering::Acquire).as_ref() }) else { return };
+    inbox.host_pending.fetch_or(bit(from_darwin(sig)), Ordering::AcqRel);
+    super::signalfd::notify(inbox);
     let kick = KICK.load(Ordering::Acquire);
     if !kick.is_null() {
         let kick: fn() = unsafe { std::mem::transmute(kick) };
@@ -135,12 +234,21 @@ pub struct SigInfo {
     pub addr: u64,
     /// For a timer's signal: its id, overrun count, and `sigev_value`.
     pub timer: Option<(i32, i32, u64)>,
+    /// SIGCHLD's `si_status`: the child's exit code, or the signal that
+    /// ended, stopped or continued it.
+    pub status: i32,
 }
 
 impl SigInfo {
-    /// From another process (or ourselves, with `kill`).
-    pub fn user(signo: u64, code: i32) -> Self {
-        SigInfo { signo, code, pid: std::process::id() as i32, uid: unsafe { libc::getuid() }, ..Default::default() }
+    /// From process `pid` (another, or ourselves, with `kill`).
+    pub fn user(signo: u64, code: i32, pid: i64) -> Self {
+        SigInfo { signo, code, pid: pid as i32, uid: unsafe { libc::getuid() }, ..Default::default() }
+    }
+
+    /// SIGCHLD from child `pid`: `code` CLD_EXITED, CLD_KILLED, CLD_STOPPED,
+    /// ...
+    pub fn child(pid: i64, code: i32, status: i32) -> Self {
+        SigInfo { signo: 17, code, pid: pid as i32, uid: unsafe { libc::getuid() }, status, ..Default::default() }
     }
 
     /// A fault at `addr`.
@@ -161,26 +269,59 @@ impl SigInfo {
         } else {
             b[16..20].copy_from_slice(&self.pid.to_le_bytes());
             b[20..24].copy_from_slice(&self.uid.to_le_bytes());
+            b[24..28].copy_from_slice(&self.status.to_le_bytes());
         }
         b
     }
 }
 
+/// The first real-time signal (the kernel's SIGRTMIN; C libraries keep the
+/// first few for themselves). Real-time signals queue: each one sent is
+/// delivered. A standard signal is pending once, however often it's sent.
+const FIRST_REALTIME: u64 = 32;
+
+/// The most of one real-time signal queued at once (Linux bounds them by
+/// RLIMIT_SIGPENDING, per user; this bounds the memory they take).
+const MAX_QUEUED: usize = 1024;
+
 /// Raised signals not yet delivered, with the details of each.
 #[derive(Debug, Clone, Default)]
 pub struct Pending {
     bits: u64,
-    info: BTreeMap<u64, SigInfo>,
+    info: BTreeMap<u64, std::collections::VecDeque<SigInfo>>,
 }
 
 impl Pending {
     fn add(&mut self, info: SigInfo) {
         let sig = info.signo;
-        if self.bits & bit(sig) == 0 {
-            self.info.insert(sig, info);
-        }
         self.bits |= bit(sig);
-        super::signalfd::notify();
+        let queued = self.info.entry(sig).or_default();
+        // A timer's signal is queued once: expiries while it's pending count
+        // as its overrun, as on Linux.
+        if let Some((id, overrun, _)) = info.timer
+            && let Some(prev) = queued.iter_mut().find(|i| i.timer.is_some_and(|t| t.0 == id))
+        {
+            if let Some(t) = &mut prev.timer {
+                t.1 = t.1.saturating_add(overrun.saturating_add(1));
+            }
+            return;
+        }
+        if queued.is_empty() || (sig >= FIRST_REALTIME && queued.len() < MAX_QUEUED) {
+            queued.push_back(info);
+        }
+    }
+
+    /// Every signal pending, queued ones each, lowest number first (what a
+    /// process takes with it to another host).
+    pub(super) fn queued(&self) -> Vec<SigInfo> {
+        let mut out = Vec::new();
+        for sig in (1..=NSIG).filter(|&sig| self.bits & bit(sig) != 0) {
+            match self.info.get(&sig).filter(|q| !q.is_empty()) {
+                Some(q) => out.extend(q.iter().map(|i| SigInfo { timer: None, ..*i })),
+                None => out.push(SigInfo { signo: sig, ..Default::default() }),
+            }
+        }
+        out
     }
 
     /// Whether any signal in `set` is pending.
@@ -195,8 +336,14 @@ impl Pending {
             return None;
         }
         let sig = ready.trailing_zeros() as u64 + 1;
-        self.bits &= !bit(sig);
-        Some(self.info.remove(&sig).unwrap_or(SigInfo { signo: sig, ..Default::default() }))
+        let queued = self.info.get_mut(&sig);
+        let info = queued.and_then(|q| q.pop_front());
+        // Pending still while more are queued (real-time signals).
+        if self.info.get(&sig).is_none_or(|q| q.is_empty()) {
+            self.bits &= !bit(sig);
+            self.info.remove(&sig);
+        }
+        Some(info.unwrap_or(SigInfo { signo: sig, ..Default::default() }))
     }
 
     fn discard(&mut self, sig: u64) {
@@ -218,11 +365,17 @@ pub struct Signals {
     signalfd_watched: u64,
     /// Dispositions changed since the host's were last set to match.
     host_stale: bool,
+    /// The signals ignored now, by SIG_IGN or a default of ignore (bit n-1
+    /// for signal n): kept as the dispositions change, as every blocking call
+    /// asks ([`Process::signal_ready`]).
+    ignored: u64,
 }
 
 impl Default for Signals {
     fn default() -> Self {
-        Signals { actions: [SigAction::default(); NSIG as usize], pending: Pending::default(), signalfd_watched: 0, host_stale: true }
+        let mut s = Signals { actions: [SigAction::default(); NSIG as usize], pending: Pending::default(), signalfd_watched: 0, host_stale: true, ignored: 0 };
+        s.actions_changed();
+        s
     }
 }
 
@@ -242,6 +395,14 @@ pub struct ThreadSignals {
 }
 
 impl ThreadSignals {
+    /// A wait with a mask of its own (`rt_sigsuspend`, `ppoll`...) parks
+    /// rather than end: the thread's own mask is back until it's made again.
+    pub(super) fn end_wait_mask(&mut self) {
+        if let Some(mask) = self.suspend_saved.take() {
+            self.blocked = mask;
+        }
+    }
+
     /// A new thread's: its creator's mask, no alternate stack, nothing pending.
     pub(super) fn spawned(&self) -> Self {
         ThreadSignals { blocked: self.blocked, ..Default::default() }
@@ -249,6 +410,17 @@ impl ThreadSignals {
 }
 
 impl Signals {
+    /// The dispositions changed: what's ignored now.
+    fn actions_changed(&mut self) {
+        self.ignored = (1..=NSIG)
+            .filter(|&sig| match self.actions[sig as usize - 1].handler {
+                SIG_IGN => true,
+                SIG_DFL => !terminates_by_default(sig) && !stops_by_default(sig),
+                _ => false,
+            })
+            .fold(0, |m, sig| m | bit(sig));
+    }
+
     /// The dispositions, and the forking thread's mask and alternate stack.
     pub fn encode(&self, t: &ThreadSignals, e: &mut Encoder) {
         for a in &self.actions {
@@ -266,6 +438,7 @@ impl Signals {
             *a = SigAction { handler: d.u64()?, flags: d.u64()?, restorer: d.u64()?, mask: d.u64()? };
         }
         s.signalfd_watched = d.u64()?;
+        s.actions_changed();
         let t = ThreadSignals {
             blocked: d.u64()?,
             altstack: StackT { sp: d.u64()?, flags: d.i64()? as i32, _pad: 0, size: d.u64()? },
@@ -285,6 +458,7 @@ impl Signals {
         }
         t.altstack = StackT::default();
         self.host_stale = true;
+        self.actions_changed();
     }
 
     /// Whether a signal raised now is dropped at once: ignored, and (for a
@@ -298,6 +472,16 @@ impl Signals {
         }
     }
 
+    /// The signals ignored by SIG_IGN.
+    pub(super) fn ignored_now(&self) -> u64 {
+        self.ignored()
+    }
+
+    /// The signals with a handler.
+    pub(super) fn caught(&self) -> u64 {
+        (1..=NSIG).filter(|&sig| !matches!(self.actions[sig as usize - 1].handler, SIG_DFL | SIG_IGN)).fold(0, |m, sig| m | bit(sig))
+    }
+
     /// The signals set to be ignored (bit n-1 for signal n).
     pub(super) fn ignored(&self) -> u64 {
         (1..=NSIG).filter(|&sig| self.actions[sig as usize - 1].handler == SIG_IGN).fold(0, |m, sig| m | bit(sig))
@@ -307,33 +491,108 @@ impl Signals {
         self.actions[sig as usize - 1].handler == SIG_IGN && blocked & bit(sig) == 0
     }
 
-    fn take_host_pending(&mut self) {
-        let from_host = HOST_PENDING.swap(0, Ordering::AcqRel);
+    fn take_host_pending(&mut self, inbox: &Inbox) {
+        // Looked at first: a swap writes the line every thread of the
+        // process reads, on every blocking call, though it's nearly always 0.
+        if inbox.host_pending.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let from_host = inbox.host_pending.swap(0, Ordering::AcqRel);
         for sig in (1..=NSIG).filter(|&sig| from_host & bit(sig) != 0) {
             self.pending.add(SigInfo { signo: sig, code: SI_USER, ..Default::default() });
         }
     }
 }
 
-/// A signal arrived from outside a system call (a timer): get every thread's
-/// attention, as a host signal's handler does.
-pub(super) fn alert() {
-    super::signalfd::notify();
-    let kick = KICK.load(Ordering::Acquire);
-    if !kick.is_null() {
-        let kick: fn() = unsafe { std::mem::transmute(kick) };
-        kick();
-    }
-    super::futex::wake_all_wakers();
-    super::timer::interrupt_host();
+/// A signal arrived from outside a system call (a timer) for the process
+/// with `inbox`: get its threads' attention, and no other process's (many
+/// share a host: kicking every vCPU and interrupting every host thread, as a
+/// host signal's handler does, would interrupt them all).
+pub(super) fn alert(inbox: &Inbox) {
+    super::signalfd::notify(inbox);
+    inbox.wake_threads();
 }
 
 impl Process {
+    /// Host signals are for this process from now on (the runtime's one
+    /// process; a host of many will keep them for itself).
+    pub fn receive_host_signals(&self) {
+        HOST_TARGET.store(Arc::as_ptr(&self.inbox).cast_mut(), Ordering::Release);
+    }
+
+    /// Stop receiving host signals, if this process was (it's going).
+    pub(super) fn stop_receiving_host_signals(&self) {
+        let ours = Arc::as_ptr(&self.inbox).cast_mut();
+        let _ = HOST_TARGET.compare_exchange(ours, std::ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// A signal was made pending for the process: its signalfds' readers
+    /// look.
+    pub(super) fn signal_added(&self) {
+        super::signalfd::notify(&self.inbox);
+    }
+
+    /// A signal for the process (`tid` None) or one of its threads, from
+    /// outside its own calls: another process of the host, or the kernel
+    /// (SIGCHLD). It waits in the inbox until a thread takes it in (as it
+    /// returns to the guest, or in a wait for signals, which it ends), and
+    /// the threads are woken to look. Dropped at once if ignored, as Linux
+    /// does when it's sent.
+    pub fn post(&self, tid: Option<i64>, info: SigInfo) {
+        if self.signals().drops(info.signo, 0) {
+            return;
+        }
+        self.discard_contrary(info.signo);
+        self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner()).push((tid, info));
+        self.signal_added();
+        match tid {
+            Some(tid) => self.wake_thread(tid),
+            None => self.wake_all_threads(),
+        }
+    }
+
+    /// Whether thread `t` blocks or ignores `sig` (SIG_IGN): what Linux's
+    /// terminal checks call ignored.
+    pub fn blocks_or_ignores(&self, t: &Thread, sig: u64) -> bool {
+        t.signals.blocked & bit(sig) != 0 || self.signals().actions[sig as usize - 1].handler == SIG_IGN
+    }
+
+    /// `sig` is being sent: as Linux does as it's generated, a SIGCONT
+    /// discards pending stop signals, and a stop signal a pending SIGCONT
+    /// (so a job continued just after it was told to stop runs on).
+    fn discard_contrary(&self, sig: u64) {
+        const SIGCONT: u64 = 18;
+        let gone = match sig {
+            SIGCONT => STOPS,
+            19..=22 => bit(SIGCONT),
+            _ => return,
+        };
+        self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, i)| bit(i.signo) & gone == 0);
+        let mut s = self.signals();
+        for sig in (1..=NSIG).filter(|&g| gone & bit(g) != 0) {
+            s.pending.discard(sig);
+            for h in self.inbox.threads().values() {
+                h.pending.lock().unwrap_or_else(|e| e.into_inner()).discard(sig);
+            }
+        }
+    }
+
+    /// What SIGCHLD's disposition says about children: whether they're
+    /// reaped as they end, rather than left for `wait` (SIG_IGN or
+    /// SA_NOCLDWAIT), and whether their stops are reported with a SIGCHLD
+    /// (not with SA_NOCLDSTOP).
+    pub fn child_policy(&self) -> (bool, bool) {
+        const SA_NOCLDSTOP: u64 = 1;
+        const SA_NOCLDWAIT: u64 = 2;
+        let a = self.signals().actions[17 - 1];
+        (a.handler == SIG_IGN || a.flags & SA_NOCLDWAIT != 0, a.flags & SA_NOCLDSTOP == 0)
+    }
+
     /// Take in signals that arrived from outside: host signals, and expired
     /// timers' (for the process, thread `tid`, or another thread).
     pub(super) fn take_external(&self, s: &mut Signals, ts: &ThreadSignals, tid: i64) {
-        s.take_host_pending();
-        let fired = std::mem::take(&mut *super::timer::FIRED.lock().unwrap_or_else(|e| e.into_inner()));
+        s.take_host_pending(&self.inbox);
+        let fired = std::mem::take(&mut *self.inbox.fired.lock().unwrap_or_else(|e| e.into_inner()));
         for (target, info) in fired {
             match target {
                 Some(t) if t == tid => ts.pending.lock().unwrap_or_else(|e| e.into_inner()).add(info),
@@ -377,6 +636,29 @@ impl Process {
         self.signals.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The signals in `set` (bit n-1 for signal n) start out ignored, as a
+    /// program inherits SIG_IGN across `execve`: a client's process, those
+    /// the Mac process that started the client ignored (`nohup`, a
+    /// non-interactive shell's `&`).
+    pub fn ignore_signals(&self, set: u64) {
+        let mut s = self.signals();
+        for sig in (1..=NSIG).filter(|&sig| set & bit(sig) != 0 && bit(sig) & UNBLOCKABLE == 0) {
+            s.actions[sig as usize - 1].handler = SIG_IGN;
+        }
+        s.host_stale = true;
+        s.actions_changed();
+    }
+}
+
+impl Thread {
+    /// The thread blocks `mask` (bit n-1 for signal n) from now on: a
+    /// client's process starts with the mask the client was started with.
+    pub fn set_blocked_signals(&mut self, mask: u64) {
+        self.signals.blocked = mask & !UNBLOCKABLE;
+    }
+}
+
+impl Process {
     /// The next signal for thread `t` to act on, if any: pending (for it or
     /// the process), not blocked, not ignored. For a handler, the thread's
     /// mask is updated as the handler runs with it.
@@ -401,8 +683,12 @@ impl Process {
                 SIG_DFL if terminates_by_default(sig) => return Some(Delivery::Kill(sig)),
                 SIG_DFL => {
                     if stops_by_default(sig) {
-                        // Job control: stop the host process, as Linux would.
-                        unsafe { libc::raise(libc::SIGSTOP) };
+                        // Job control: the process stops, as Linux would.
+                        // (Not holding its signals: stopping tells the
+                        // parent, whose signals the kernel may take.)
+                        drop(s);
+                        self.kernel.stop(self, sig);
+                        s = self.signals();
                     }
                     continue;
                 }
@@ -419,11 +705,24 @@ impl Process {
     /// Whether a signal is waiting that thread `t` would act on now (so a
     /// blocking wait should give up with EINTR).
     pub fn signal_ready(&self, t: &Thread) -> bool {
-        self.take_external(&mut self.signals(), &t.signals, t.tid);
-        let pending = self.signals().pending.bits
-            | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits
-            | HOST_PENDING.load(Ordering::Acquire);
-        pending & !t.signals.blocked != 0
+        // One hold of the signals: every blocking call asks, several times.
+        let mut s = self.signals();
+        self.take_external(&mut s, &t.signals, t.tid);
+        let pending = s.pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits | self.inbox.host_pending.load(Ordering::Acquire);
+        pending & !t.signals.blocked & !self.ignoring(&s) != 0
+    }
+
+    /// Signals that would be ignored now, which (on Linux, where they're
+    /// dropped as they're sent unless blocked) wake and interrupt nothing.
+    /// Signals from other processes arrive in memory: a child's SIGCHLD at
+    /// its default action mustn't end its parent's `wait4` with EINTR. (For
+    /// a process on its own that mirrors the host, the host's own
+    /// dispositions do that already.)
+    fn ignoring(&self, s: &Signals) -> u64 {
+        if self.inbox.mirror_host.load(Ordering::Relaxed) {
+            return 0;
+        }
+        s.ignored
     }
 
     /// A fault thread `t` can't continue past (SIGSEGV, SIGBUS, SIGILL...): its
@@ -439,8 +738,12 @@ impl Process {
         Delivery::Handler(start_handler(&mut s, &mut t.signals, sig, action, action.handler, info))
     }
 
-    /// Make the host's signal dispositions match the guest's, if they changed.
+    /// Make the host's signal dispositions match the guest's, if they changed
+    /// (and the host process is this Linux process alone).
     pub fn sync_host_signals(&self) {
+        if !self.inbox.mirror_host.load(Ordering::Relaxed) {
+            return;
+        }
         let mut s = self.signals();
         if !std::mem::take(&mut s.host_stale) {
             return;
@@ -467,6 +770,8 @@ impl Process {
 /// The signals the terminal sends a process that touches it from the
 /// background: SIGTSTP, SIGTTIN, SIGTTOU.
 const JOB_CONTROL: u64 = (1 << (20 - 1)) | (1 << (21 - 1)) | (1 << (22 - 1));
+/// The stop signals: SIGSTOP and the job-control ones.
+const STOPS: u64 = JOB_CONTROL | (1 << (19 - 1));
 
 impl Thread {
     /// `rt_sigreturn`: the handler's done; back to the mask it saved.
@@ -490,6 +795,9 @@ impl Thread {
     }
 
     fn sync_host_mask_from(&mut self, host_blocked: u64) {
+        if !self.inbox.mirror_host.load(Ordering::Relaxed) {
+            return;
+        }
         self.signals.host_blocked = host_blocked;
         let want = self.signals.blocked & JOB_CONTROL;
         if want == self.signals.host_blocked {
@@ -536,6 +844,7 @@ fn start_handler(s: &mut Signals, ts: &mut ThreadSignals, sig: u64, action: SigA
     if action.flags & SA_RESETHAND != 0 {
         s.actions[sig as usize - 1] = SigAction::default();
         s.host_stale = true;
+        s.actions_changed();
     }
     HandlerCall {
         info,
@@ -620,6 +929,7 @@ pub(super) fn rt_sigaction<M: GuestMemory + ?Sized>(p: &Process, mem: &M, sig: u
             s.pending.discard(sig);
         }
         s.host_stale = true;
+        s.actions_changed();
     }
     Ok(0)
 }
@@ -674,26 +984,28 @@ fn stops_by_default(sig: u64) -> bool {
     matches!(sig, 19..=22)
 }
 
-/// `kill(target, sig)`: to this process (or its group), the signal is made
-/// pending, for a thread to deliver as its call returns; to another process
-/// (or group), it's the host's `kill`, with the number translated.
+/// `kill(target, sig)`: to this process, the signal is made pending, for a
+/// thread to deliver as its call returns; to anything else (another process,
+/// a group, every process), it's the kernel's to route.
 pub(super) fn kill(p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
     if sig > NSIG {
         return Err(errno::EINVAL);
     }
-    if target == -1 {
-        // Every process the user owns: on a Mac that's the whole login session.
-        p.unimplemented("kill(-1, ...) (signalling every process)".into());
-        return Err(errno::EPERM);
+    if target != p.pid {
+        return p.kernel.kill(p, target, sig);
     }
-    if target != p.pid && target != 0 {
-        let darwin = if sig == 0 { 0 } else { to_darwin(sig).ok_or(errno::EINVAL)? };
-        return super::ok(unsafe { libc::kill(target as i32, darwin) } as i64);
-    }
+    kill_self(p, sig)
+}
+
+/// `kill` of the caller's own process.
+pub(super) fn kill_self(p: &Process, sig: u64) -> Result<i64, i64> {
     if sig != 0 {
+        p.discard_contrary(sig);
         let mut s = p.signals();
         if !s.drops(sig, 0) {
-            s.pending.add(SigInfo::user(sig, SI_USER));
+            s.pending.add(SigInfo::user(sig, SI_USER, p.pid));
+            drop(s);
+            p.signal_added();
         }
     }
     Ok(0)
@@ -701,18 +1013,19 @@ pub(super) fn kill(p: &Process, target: i64, sig: u64) -> Result<i64, i64> {
 
 /// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`: to one thread.
 pub(super) fn tkill(p: &Process, t: &mut Thread, tgid: Option<i64>, tid: i64, sig: u64) -> Result<i64, i64> {
-    if sig > NSIG || tid <= 0 {
+    if sig > NSIG || tid <= 0 || tgid.is_some_and(|g| g <= 0) {
         return Err(errno::EINVAL);
     }
     if tgid.is_some_and(|g| g != p.pid) {
-        return kill(p, tid, sig); // another process's thread: the best we can do
+        return p.kernel.tgkill(p, tgid, tid, sig); // another process's thread
     }
     let target = if tid == t.tid { Some(t.signals.pending.clone()) } else { p.thread_pending(tid) };
     let Some(pending) = target else {
-        return if tgid.is_none() && tid != p.pid { kill(p, tid, sig) } else { Err(errno::ESRCH) };
+        return if tgid.is_none() { p.kernel.tgkill(p, None, tid, sig) } else { Err(errno::ESRCH) };
     };
     if sig != 0 && !p.signals().drops(sig, if tid == t.tid { t.signals.blocked } else { 0 }) {
-        pending.lock().unwrap_or_else(|e| e.into_inner()).add(SigInfo::user(sig, SI_TKILL));
+        pending.lock().unwrap_or_else(|e| e.into_inner()).add(SigInfo::user(sig, SI_TKILL, p.pid));
+        p.signal_added();
         if tid != t.tid {
             p.wake_thread(tid);
         }
@@ -740,13 +1053,15 @@ pub(super) fn rt_sigsuspend<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thread
     loop {
         let ready = {
             let mut s = p.signals();
-            p.take_external(&mut s, ts, tid);
-            (s.pending.bits | ts.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !ts.blocked
+            p.take_external(&mut s, &t.signals, tid);
+            (s.pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits) & !t.signals.blocked & !p.ignoring(&s)
         };
-        if ready != 0 {
+        if ready != 0 || p.exiting() {
             return Err(errno::EINTR);
         }
-        wait_for_host_signal();
+        // Whoever sends the thread a signal wakes it (a host signal too:
+        // the core wakes the threads it's for).
+        super::block::wait_woken(t, None)?;
     }
 }
 
@@ -763,45 +1078,9 @@ pub(super) fn rt_sigpending<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, me
     if size != 8 {
         return Err(errno::EINVAL);
     }
-    let bits = p.signals().pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits | HOST_PENDING.load(Ordering::Acquire);
+    let bits = p.signals().pending.bits | t.signals.pending.lock().unwrap_or_else(|e| e.into_inner()).bits | p.inbox.host_pending.load(Ordering::Acquire);
     mem.write_pod(set, &bits)?;
     Ok(0)
-}
-
-/// Sleep until a host signal arrives (handled ones mark themselves in
-/// [`HOST_PENDING`]; others act on the host process directly). Returns at
-/// once if one already has.
-pub(super) fn wait_for_host_signal() {
-    wait_for_host_signal_until(None);
-}
-
-/// [`wait_for_host_signal`], giving up at `deadline`. An expired timer counts
-/// as a signal arriving (it interrupts the sleep).
-fn wait_for_host_signal_until(deadline: Option<std::time::Instant>) {
-    unsafe {
-        // Block everything first, so a signal arriving between the check and
-        // the sleep isn't lost: sigsuspend unblocks atomically.
-        let (mut all, mut old): (libc::sigset_t, libc::sigset_t) = (0, 0);
-        libc::sigfillset(&mut all);
-        libc::sigprocmask(libc::SIG_BLOCK, &all, &mut old);
-        if HOST_PENDING.load(Ordering::Acquire) == 0 && !super::timer::any_fired() {
-            match deadline {
-                None => {
-                    libc::sigsuspend(&old);
-                }
-                Some(d) => {
-                    // No atomic timed sigsuspend on macOS: sleep with signals
-                    // unblocked, in short steps so one arriving just before
-                    // the sleep costs at most a step.
-                    let step = d.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_millis(10));
-                    libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-                    let ts = libc::timespec { tv_sec: 0, tv_nsec: step.as_nanos() as i64 };
-                    libc::nanosleep(&ts, std::ptr::null_mut());
-                }
-            }
-        }
-        libc::sigprocmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-    }
 }
 
 /// `rt_sigtimedwait`: take a pending signal in `set` (without running its
@@ -839,9 +1118,62 @@ pub(super) fn rt_sigtimedwait<M: GuestMemory + ?Sized>(p: &Process, t: &mut Thre
         if other != 0 || p.exiting() {
             return Err(errno::EINTR);
         }
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if !super::block::wait_woken(t, deadline)? {
             return Err(errno::EAGAIN);
         }
-        wait_for_host_signal_until(deadline);
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    fn sig(signo: u64, pid: i32) -> SigInfo {
+        SigInfo { signo, pid, ..Default::default() }
+    }
+
+    #[test]
+    fn realtime_signals_queue_standard_ones_dont() {
+        let mut p = Pending::default();
+        for pid in 1..=3 {
+            p.add(sig(34, pid));
+            p.add(sig(10, pid));
+        }
+        let all = bit(34) | bit(10);
+        // Lowest number first; SIGUSR1 once, with the first sender's details.
+        assert_eq!(p.take(all).map(|i| (i.signo, i.pid)), Some((10, 1)));
+        for pid in 1..=3 {
+            assert!(p.any(bit(34)), "still pending while more are queued");
+            assert_eq!(p.take(all).map(|i| (i.signo, i.pid)), Some((34, pid)), "in the order sent");
+        }
+        assert!(!p.any(all));
+        assert!(p.take(all).is_none());
+    }
+
+    #[test]
+    fn a_pending_timer_signal_counts_expiries_as_overrun() {
+        let mut p = Pending::default();
+        let timer = |id: i32, overrun: i32| SigInfo { signo: 34, code: -2, timer: Some((id, overrun, 0)), ..Default::default() };
+        p.add(timer(1, 0));
+        p.add(timer(2, 0));
+        p.add(timer(1, 0)); // timer 1 again while its signal waits
+        p.add(timer(1, 2)); // and again, three expiries late
+        let first = p.take(bit(34)).unwrap();
+        assert_eq!(first.timer.map(|t| (t.0, t.1)), Some((1, 4)), "1 + (1 + 2) expiries folded in");
+        assert_eq!(p.take(bit(34)).unwrap().timer.map(|t| t.0), Some(2), "another timer's signal queued on its own");
+        assert!(!p.any(bit(34)));
+    }
+
+    #[test]
+    fn realtime_queue_is_bounded() {
+        let mut p = Pending::default();
+        for pid in 0..(MAX_QUEUED as i32 + 10) {
+            p.add(sig(40, pid));
+        }
+        let mut n = 0;
+        while p.take(bit(40)).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, MAX_QUEUED);
     }
 }

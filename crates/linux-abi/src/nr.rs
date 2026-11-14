@@ -42,6 +42,7 @@ pub const EXIT_GROUP: u64 = 94;
 pub const SET_TID_ADDRESS: u64 = 96;
 pub const FUTEX: u64 = 98;
 pub const SET_ROBUST_LIST: u64 = 99;
+pub const GET_ROBUST_LIST: u64 = 100;
 pub const NANOSLEEP: u64 = 101;
 pub const CLOCK_GETTIME: u64 = 113;
 pub const CLOCK_GETRES: u64 = 114;
@@ -50,7 +51,10 @@ pub const SCHED_GETPARAM: u64 = 121;
 pub const SCHED_GETAFFINITY: u64 = 123;
 pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
 pub const SCHED_GET_PRIORITY_MIN: u64 = 126;
+pub const SETPRIORITY: u64 = 140;
 pub const GETPRIORITY: u64 = 141;
+pub const SCHED_SETAFFINITY: u64 = 122;
+pub const USERFAULTFD: u64 = 282;
 pub const READAHEAD: u64 = 213;
 pub const SCHED_YIELD: u64 = 124;
 pub const GETITIMER: u64 = 102;
@@ -110,6 +114,10 @@ pub const WAIT4: u64 = 260;
 pub const CLONE3: u64 = 435;
 pub const CLOSE_RANGE: u64 = 436;
 pub const EPOLL_PWAIT2: u64 = 441;
+pub const FUTEX_WAITV: u64 = 449;
+pub const FUTEX_WAKE: u64 = 454;
+pub const FUTEX_WAIT: u64 = 455;
+pub const FUTEX_REQUEUE: u64 = 456;
 pub const FADVISE64: u64 = 223;
 pub const STATX: u64 = 291;
 pub const RSEQ: u64 = 293;
@@ -161,6 +169,16 @@ pub const GETTIMEOFDAY: u64 = 169;
 pub const SYSINFO: u64 = 179;
 pub const MADVISE: u64 = 233;
 pub const CLOCK_NANOSLEEP: u64 = 115;
+pub const CAPGET: u64 = 90;
+pub const TIMES: u64 = 153;
+pub const CAPSET: u64 = 91;
+pub const GET_MEMPOLICY: u64 = 236;
+pub const PIDFD_SEND_SIGNAL: u64 = 424;
+pub const PIDFD_OPEN: u64 = 434;
+pub const PIDFD_GETFD: u64 = 438;
+/// Not Linux's: a call debug builds answer by panicking, to test that a
+/// runtime error in one process's call ends that process alone.
+pub const MACWL_TEST_PANIC: u64 = 0x4d57_0001;
 
 /// Names of system calls 0–243 (the generic table; 244–259 are reserved for
 /// architecture-specific calls, which arm64 doesn't have).
@@ -278,6 +296,11 @@ mod tests {
             (SET_TID_ADDRESS, "set_tid_address"),
             (FUTEX, "futex"),
             (SET_ROBUST_LIST, "set_robust_list"),
+            (GET_ROBUST_LIST, "get_robust_list"),
+            (FUTEX_WAITV, "futex_waitv"),
+            (FUTEX_WAKE, "futex_wake"),
+            (FUTEX_WAIT, "futex_wait"),
+            (FUTEX_REQUEUE, "futex_requeue"),
             (NANOSLEEP, "nanosleep"),
             (CLOCK_GETTIME, "clock_gettime"),
             (CLOCK_GETRES, "clock_getres"),

@@ -1,7 +1,14 @@
-//! The emulated `/proc`: just the parts programs commonly rely on —
-//! `/proc/self/{exe,cwd,fd/N,maps,mounts,mountinfo}` (and the same under
-//! `/proc/<our pid>`), and the machine's `cpuinfo`, `meminfo`, `mounts`,
-//! `uptime`, `loadavg` and `version` (from [`crate::hostinfo`]).
+//! The emulated `/proc`: the system files programs and `ps`/`top` read
+//! (`cpuinfo`, `meminfo`, `stat`, `mounts`, `uptime`, `loadavg`, `version`,
+//! from [`crate::hostinfo`] and the host), and `/proc/<pid>` for every
+//! process the kernel has (`self` and `thread-self` too): `stat`, `status`,
+//! `statm`, `cmdline`, `environ`, `comm`, `maps`, `fd/`, `exe`, `cwd`,
+//! `task/<tid>/` and `mounts`/`mountinfo`. That's every process of the host,
+//! from its process table and from each process's own state and memory
+//! ([`Kernel::with_process`]) (for a process on its own, `HostKernel`, the
+//! process itself). Directories list what's in them.
+//!
+//! [`Kernel::with_process`]: crate::syscall::Kernel::with_process
 
 use std::{
     ffi::CStr,
@@ -10,23 +17,41 @@ use std::{
 
 use crate::{
     errno,
-    fs::{FdEntry, Target},
+    fs::{DirEntry, DirSnapshot, FdEntry, Target},
     hostinfo,
     memory::GuestMemory,
     shm,
-    syscall::{last_errno, Process},
+    syscall::{last_errno, ProcStatus, Process},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Node {
-    /// `/proc`, `/proc/self`, `/proc/self/fd`.
+    /// `/proc`.
+    Root,
+    /// A file of the machine's, whose contents are made when it's opened.
+    Info(Generated),
+    /// Something of process `pid` (its thread `tid`, under `task/`).
+    Pid { pid: i64, tid: Option<i64>, what: Of },
+}
+
+/// What of a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Of {
     Dir,
+    FdDir,
+    TaskDir,
     Exe,
     Cwd,
     Fd(u64),
     Maps,
-    /// A file whose contents are made when it's opened.
-    Info(Generated),
+    Stat,
+    Status,
+    Statm,
+    Cmdline,
+    Environ,
+    Comm,
+    Mounts,
+    MountInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,51 +59,170 @@ enum Generated {
     CpuInfo,
     MemInfo,
     Mounts,
-    MountInfo,
     Uptime,
     LoadAvg,
     Version,
+    Stat,
+    PidMax,
+}
+
+/// The files of a process's directory (and of a thread's, under `task/`).
+const PID_FILES: [(&[u8], Of); 11] = [
+    (b"stat", Of::Stat),
+    (b"status", Of::Status),
+    (b"statm", Of::Statm),
+    (b"cmdline", Of::Cmdline),
+    (b"environ", Of::Environ),
+    (b"comm", Of::Comm),
+    (b"maps", Of::Maps),
+    (b"exe", Of::Exe),
+    (b"cwd", Of::Cwd),
+    (b"mounts", Of::Mounts),
+    (b"mountinfo", Of::MountInfo),
+];
+
+const MACHINE_FILES: [(&[u8], Generated); 7] = [
+    (b"cpuinfo", Generated::CpuInfo),
+    (b"meminfo", Generated::MemInfo),
+    (b"mounts", Generated::Mounts),
+    (b"uptime", Generated::Uptime),
+    (b"loadavg", Generated::LoadAvg),
+    (b"version", Generated::Version),
+    (b"stat", Generated::Stat),
+];
+
+fn number(s: &[u8]) -> Option<i64> {
+    std::str::from_utf8(s).ok()?.parse().ok().filter(|&n: &i64| n > 0)
+}
+
+/// Run `f` with process `pid`'s state and memory: the caller's own, or
+/// another's the kernel runs.
+fn with<T>(p: &Process, mem: &dyn GuestMemory, pid: i64, f: impl FnOnce(&Process, &dyn GuestMemory) -> T) -> Result<T, i64> {
+    if pid == p.pid {
+        return Ok(f(p, mem));
+    }
+    let mut f = Some(f);
+    let mut out = None;
+    p.kernel.with_process(p, pid, &mut |q, m| out = f.take().map(|f| f(q, m)))?;
+    out.ok_or(errno::ESRCH)
+}
+
+/// What `/proc/<pid>` shows of a process this kernel doesn't run (one in
+/// another host, docs/processes.md step 9), from its host: what would
+/// otherwise be read from its state and memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteView {
+    pub exe: Vec<u8>,
+    pub cwd: Vec<u8>,
+    pub tids: Vec<i64>,
+    /// Its fds, and where each points (`fd/N`'s link).
+    pub fds: Vec<(u64, Vec<u8>)>,
+    pub environ: Vec<u8>,
+    pub maps: Vec<u8>,
+    pub mounts: Vec<u8>,
+    pub mountinfo: Vec<u8>,
+}
+
+impl RemoteView {
+    /// Process `q`'s (with memory `m`), for another host to show.
+    pub fn of(q: &Process, m: &dyn GuestMemory) -> RemoteView {
+        RemoteView {
+            exe: q.exe(),
+            cwd: q.fs.cwd(),
+            tids: q.thread_ids(),
+            fds: q.fds.numbers().into_iter().filter_map(|n| Some((n, fd_link(q, n).ok()?))).collect(),
+            environ: strings(q, m, true),
+            maps: maps(q, m),
+            mounts: mounts(q, false).into_bytes(),
+            mountinfo: mounts(q, true).into_bytes(),
+        }
+    }
+
+    pub fn encode(&self, e: &mut crate::wire::Encoder) {
+        e.bytes(&self.exe).bytes(&self.cwd).u64(self.tids.len() as u64);
+        for &t in &self.tids {
+            e.i64(t);
+        }
+        e.u64(self.fds.len() as u64);
+        for (n, link) in &self.fds {
+            e.u64(*n).bytes(link);
+        }
+        e.bytes(&self.environ).bytes(&self.maps).bytes(&self.mounts).bytes(&self.mountinfo);
+    }
+
+    pub fn decode(d: &mut crate::wire::Decoder) -> Result<RemoteView, crate::wire::Truncated> {
+        let (exe, cwd) = (d.bytes()?, d.bytes()?);
+        let tids = (0..d.count(8)?).map(|_| d.i64()).collect::<Result<_, _>>()?;
+        let fds = (0..d.count(16)?).map(|_| Ok((d.u64()?, d.bytes()?))).collect::<Result<_, crate::wire::Truncated>>()?;
+        Ok(RemoteView { exe, cwd, tids, fds, environ: d.bytes()?, maps: d.bytes()?, mounts: d.bytes()?, mountinfo: d.bytes()? })
+    }
+}
+
+/// Process `pid` as its host shows it, if it's another host's.
+fn remote(p: &Process, pid: i64) -> Result<RemoteView, i64> {
+    p.kernel.remote_view(p, pid)
 }
 
 /// Parse a path below `/proc` (e.g. `self/fd/3`).
-fn parse(p: &Process, rest: &[u8]) -> Result<Node, i64> {
+fn parse(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Node, i64> {
     let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
-    let Some((&who, below)) = parts.split_first() else { return Ok(Node::Dir) };
-    if below.is_empty() {
-        let info = match who {
-            b"cpuinfo" => Some(Generated::CpuInfo),
-            b"meminfo" => Some(Generated::MemInfo),
-            b"mounts" => Some(Generated::Mounts),
-            b"uptime" => Some(Generated::Uptime),
-            b"loadavg" => Some(Generated::LoadAvg),
-            b"version" => Some(Generated::Version),
-            _ => None,
-        };
-        if let Some(info) = info {
-            return Ok(Node::Info(info));
+    let Some((&who, below)) = parts.split_first() else { return Ok(Node::Root) };
+    if below.is_empty()
+        && let Some(&(_, info)) = MACHINE_FILES.iter().find(|(name, _)| *name == who)
+    {
+        return Ok(Node::Info(info));
+    }
+    // How wide a pid gets (`top` sizes its column by it).
+    if parts == [b"sys" as &[u8], b"kernel", b"pid_max"] {
+        return Ok(Node::Info(Generated::PidMax));
+    }
+    let (pid, mut tid) = match who {
+        b"self" => (p.pid, None),
+        // The calling thread isn't known here: the main one's.
+        b"thread-self" => (p.pid, Some(p.pid)),
+        n => (number(n).ok_or(errno::ENOENT)?, None),
+    };
+    let status = p.kernel.proc_status(p, pid).map_err(|_| errno::ENOENT)?;
+    let mut below = below;
+    if let [b"task", rest @ ..] = below {
+        match rest {
+            [] => return Ok(Node::Pid { pid, tid: None, what: Of::TaskDir }),
+            [t, more @ ..] => {
+                let t = number(t).ok_or(errno::ENOENT)?;
+                let known = t == pid
+                    || with(p, mem, pid, |q, _| q.thread_ids().contains(&t)).or_else(|_| remote(p, pid).map(|r| r.tids.contains(&t))).unwrap_or(false);
+                if !known {
+                    return Err(errno::ENOENT);
+                }
+                tid = Some(t);
+                below = more;
+            }
         }
     }
-    let pid = p.pid.to_string();
-    if !matches!(who, b"self" | b"thread-self") && who != pid.as_bytes() {
-        return Err(errno::ENOENT);
-    }
-    match below {
-        [] | [b"fd"] => Ok(Node::Dir),
-        [b"exe"] if !p.exe().is_empty() => Ok(Node::Exe),
-        [b"cwd"] => Ok(Node::Cwd),
-        [b"maps"] => Ok(Node::Maps),
-        [b"mounts"] => Ok(Node::Info(Generated::Mounts)),
-        [b"mountinfo"] => Ok(Node::Info(Generated::MountInfo)),
+    let zombie = status.state == b'Z';
+    let what = match below {
+        [] => Of::Dir,
+        [b"fd"] => Of::FdDir,
         [b"fd", n] => {
             let n = std::str::from_utf8(n).ok().and_then(|n| n.parse().ok()).ok_or(errno::ENOENT)?;
-            p.fds.get(n).map_err(|_| errno::ENOENT)?;
-            Ok(Node::Fd(n))
+            with(p, mem, pid, |q, _| q.fds.get(n).is_ok())
+                .or_else(|_| remote(p, pid).map(|r| r.fds.iter().any(|&(m, _)| m == n)))
+                .ok()
+                .filter(|&ok| ok)
+                .ok_or(errno::ENOENT)?;
+            Of::Fd(n)
         }
-        _ => Err(errno::ENOENT),
+        [name] => PID_FILES.iter().find(|(n, _)| n == name).map(|&(_, of)| of).ok_or(errno::ENOENT)?,
+        _ => return Err(errno::ENOENT),
+    };
+    // A zombie has its table entry and nothing else.
+    if zombie && !matches!(what, Of::Dir | Of::Stat | Of::Status | Of::Statm | Of::Cmdline | Of::Comm) {
+        return Err(errno::ENOENT);
     }
+    Ok(Node::Pid { pid, tid, what })
 }
 
-/// What `/proc/self/fd/N` points to.
+/// What `/proc/<pid>/fd/N` points to.
 fn fd_link(p: &Process, fd: u64) -> Result<Vec<u8>, i64> {
     let entry = p.fds.get(fd)?;
     if let Some(path) = &entry.path {
@@ -89,14 +233,22 @@ fn fd_link(p: &Process, fd: u64) -> Result<Vec<u8>, i64> {
         return Err(last_errno());
     }
     Ok(match st.st_mode & libc::S_IFMT {
-        libc::S_IFSOCK => format!("socket:[{}]", st.st_ino),
-        libc::S_IFIFO => format!("pipe:[{}]", st.st_ino),
-        _ => "anon_inode:[unknown]".into(),
-    }
-    .into_bytes())
+        libc::S_IFSOCK => format!("socket:[{}]", st.st_ino).into_bytes(),
+        libc::S_IFIFO => format!("pipe:[{}]", st.st_ino).into_bytes(),
+        // A file opened by the host (stdin from /dev/null, a terminal): the
+        // path macOS knows it by.
+        _ => {
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            if unsafe { libc::fcntl(entry.host.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == 0 {
+                buf.iter().position(|&b| b == 0).map_or(buf.to_vec(), |n| buf[..n].to_vec())
+            } else {
+                b"anon_inode:[unknown]".to_vec()
+            }
+        }
+    })
 }
 
-/// Host path of a guest path, following symlinks.
+/// Host path of process `p`'s guest path, following symlinks.
 fn host_of(p: &Process, guest: &[u8]) -> Result<std::ffi::CString, i64> {
     match p.fs.resolve(&p.fds, crate::abi::at::FDCWD as u64, guest, true)?.target {
         Target::Host(h) => Ok(h),
@@ -104,77 +256,362 @@ fn host_of(p: &Process, guest: &[u8]) -> Result<std::ffi::CString, i64> {
     }
 }
 
-pub(crate) fn readlink(p: &Process, rest: &[u8]) -> Result<Vec<u8>, i64> {
-    match parse(p, rest)? {
-        Node::Exe => Ok(p.exe()),
-        Node::Cwd => Ok(p.fs.cwd()),
-        Node::Fd(n) => fd_link(p, n),
-        Node::Dir | Node::Maps | Node::Info(_) => Err(errno::EINVAL),
+pub(crate) fn readlink(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Vec<u8>, i64> {
+    // /proc/self and /proc/thread-self are links to the process's own.
+    match rest.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect::<Vec<_>>().as_slice() {
+        [b"self"] => return Ok(p.pid.to_string().into_bytes()),
+        [b"thread-self"] => return Ok(format!("{}/task/{}", p.pid, p.pid).into_bytes()),
+        _ => {}
+    }
+    match parse(p, mem, rest)? {
+        Node::Pid { pid, what: Of::Exe, .. } => with(p, mem, pid, |q, _| q.exe()).or_else(|_| remote(p, pid).map(|r| r.exe))?.pipe_nonempty(),
+        Node::Pid { pid, what: Of::Cwd, .. } => with(p, mem, pid, |q, _| q.fs.cwd()).or_else(|_| remote(p, pid).map(|r| r.cwd)),
+        Node::Pid { pid, what: Of::Fd(n), .. } => match with(p, mem, pid, |q, _| fd_link(q, n)) {
+            Ok(link) => link,
+            Err(_) => remote_fd(p, pid, n),
+        },
+        _ => Err(errno::EINVAL),
     }
 }
 
-pub(crate) fn exists(p: &Process, rest: &[u8]) -> Result<(), i64> {
-    parse(p, rest).map(|_| ())
+/// Where another host's process's fd `n` points.
+fn remote_fd(p: &Process, pid: i64, n: u64) -> Result<Vec<u8>, i64> {
+    remote(p, pid)?.fds.into_iter().find(|&(m, _)| m == n).map(|(_, link)| link).ok_or(errno::ENOENT)
 }
 
-/// `stat` (following links) of a `/proc` path.
-pub(crate) fn stat(p: &Process, rest: &[u8]) -> Result<libc::stat, i64> {
+/// A process with no executable has no `exe` link (ENOENT).
+trait NonEmpty {
+    fn pipe_nonempty(self) -> Result<Vec<u8>, i64>;
+}
+
+impl NonEmpty for Vec<u8> {
+    fn pipe_nonempty(self) -> Result<Vec<u8>, i64> {
+        if self.is_empty() { Err(errno::ENOENT) } else { Ok(self) }
+    }
+}
+
+pub(crate) fn exists(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<(), i64> {
+    parse(p, mem, rest).map(|_| ())
+}
+
+/// `stat` of a `/proc` path; `lstat` (`follow` false) of one of its links
+/// (`self`, `exe`, `cwd`, `fd/N`) is the link's own.
+pub(crate) fn stat(p: &Process, mem: &dyn GuestMemory, rest: &[u8], follow: bool) -> Result<libc::stat, i64> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = match parse(p, rest)? {
-        Node::Dir => {
-            st.st_mode = libc::S_IFDIR | 0o555;
-            st.st_nlink = 2;
+    if !follow {
+        let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let link = matches!(parts.as_slice(), [b"self"] | [b"thread-self"])
+            || matches!(parse(p, mem, rest)?, Node::Pid { what: Of::Exe | Of::Cwd | Of::Fd(_), .. });
+        if link {
+            st.st_mode = libc::S_IFLNK | 0o777;
+            st.st_nlink = 1;
+            st.st_uid = unsafe { libc::getuid() };
+            st.st_gid = unsafe { libc::getgid() };
+            return Ok(st);
+        }
+    }
+    let dir = |st: &mut libc::stat| {
+        st.st_mode = libc::S_IFDIR | 0o555;
+        st.st_nlink = 2;
+    };
+    let node = parse(p, mem, rest)?;
+    let r = match node {
+        Node::Root => {
+            dir(&mut st);
+            return Ok(st);
+        }
+        Node::Pid { pid, what: Of::Dir | Of::FdDir | Of::TaskDir, .. } => {
+            dir(&mut st);
+            // A process's directory is its user's, and dated from its start
+            // (what `ps` shows as the user, and some tools as the start).
+            st.st_uid = unsafe { libc::getuid() };
+            st.st_gid = unsafe { libc::getgid() };
+            if let Ok(s) = p.kernel.proc_status(p, pid) {
+                let wall = boot_time() as f64 + s.start_ns as f64 / 1e9;
+                st.st_mtime = wall as i64;
+                st.st_ctime = wall as i64;
+            }
             return Ok(st);
         }
         // Like Linux's, these are empty to stat: their size is known only
         // once read.
-        Node::Maps | Node::Info(_) => {
+        Node::Info(_) | Node::Pid { .. } if !matches!(node, Node::Pid { what: Of::Exe | Of::Cwd | Of::Fd(_), .. }) => {
             st.st_mode = libc::S_IFREG | 0o444;
             st.st_nlink = 1;
+            st.st_uid = unsafe { libc::getuid() };
+            st.st_gid = unsafe { libc::getgid() };
             return Ok(st);
         }
-        Node::Exe => unsafe { libc::stat(host_of(p, &p.exe())?.as_ptr(), &mut st) },
-        Node::Cwd => unsafe { libc::stat(host_of(p, &p.fs.cwd())?.as_ptr(), &mut st) },
-        Node::Fd(n) => unsafe { libc::fstat(p.fds.host(n)?, &mut st) },
+        // Another host's process's: its paths, as this process sees them
+        // (hosts of a session share the filesystem's view).
+        Node::Pid { pid, what: what @ (Of::Exe | Of::Cwd | Of::Fd(_)), .. } if with(p, mem, pid, |_, _| ()).is_err() => {
+            let r = remote(p, pid)?;
+            let path = match what {
+                Of::Exe => r.exe,
+                Of::Cwd => r.cwd,
+                Of::Fd(n) => r.fds.into_iter().find(|&(m, _)| m == n).map(|(_, l)| l).filter(|l| l.starts_with(b"/")).ok_or(errno::ENOENT)?,
+                _ => unreachable!(),
+            };
+            unsafe { libc::stat(host_of(p, &path)?.as_ptr(), &mut st) }
+        }
+        Node::Pid { pid, what: Of::Exe, .. } => with(p, mem, pid, |q, _| -> Result<i32, i64> { Ok(unsafe { libc::stat(host_of(q, &q.exe())?.as_ptr(), &mut st) }) })??,
+        Node::Pid { pid, what: Of::Cwd, .. } => with(p, mem, pid, |q, _| -> Result<i32, i64> { Ok(unsafe { libc::stat(host_of(q, &q.fs.cwd())?.as_ptr(), &mut st) }) })??,
+        Node::Pid { pid, what: Of::Fd(n), .. } => with(p, mem, pid, |q, _| -> Result<i32, i64> { Ok(unsafe { libc::fstat(q.fds.get(n)?.host.as_raw_fd(), &mut st) }) })??,
+        _ => unreachable!(),
     };
     if r < 0 { Err(last_errno()) } else { Ok(st) }
 }
 
+/// A directory's listing, as an open fd's (`getdents64`).
+fn listing(names: impl IntoIterator<Item = (Vec<u8>, u8)>) -> DirSnapshot {
+    let mut entries = vec![DirEntry { ino: 1, kind: libc::DT_DIR, name: b".".to_vec() }, DirEntry { ino: 1, kind: libc::DT_DIR, name: b"..".to_vec() }];
+    entries.extend(names.into_iter().enumerate().map(|(i, (name, kind))| DirEntry { ino: 2 + i as u64, kind, name }));
+    DirSnapshot { entries, next: 0, fixed: true }
+}
+
 /// Open a `/proc` path; returns the new fd's entry.
-pub(crate) fn open<M: GuestMemory + ?Sized>(p: &Process, mem: &M, rest: &[u8]) -> Result<FdEntry, i64> {
-    let open_host = |guest: &[u8]| -> Result<FdEntry, i64> {
-        let fd = unsafe { libc::open(host_of(p, guest)?.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+pub(crate) fn open(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<FdEntry, i64> {
+    let mut path = b"/proc/".to_vec();
+    path.extend_from_slice(rest);
+    let open_host = |q: &Process, guest: &[u8]| -> Result<FdEntry, i64> {
+        let fd = unsafe { libc::open(host_of(q, guest)?.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(last_errno());
         }
         Ok(FdEntry::new(unsafe { OwnedFd::from_raw_fd(fd) }).path(guest.to_vec()))
     };
-    match parse(p, rest)? {
-        Node::Exe => open_host(&p.exe()),
-        Node::Cwd => open_host(&p.fs.cwd()),
-        // Linux reopens the file; sharing the open file is close enough.
-        Node::Fd(n) => {
-            let entry = p.fds.get(n)?;
-            let host = entry.host.try_clone().map_err(|e| errno::from_io(&e))?;
-            Ok(FdEntry { path: entry.path.clone(), ..FdEntry::new(host) })
+    let file = |contents: Vec<u8>| -> Result<FdEntry, i64> { Ok(generated(&contents)?.path(path.clone())) };
+    let dir = |listing: DirSnapshot| -> Result<FdEntry, i64> { Ok(generated(b"")?.path(path.clone()).dir(listing)) };
+    let (pid, tid, what) = match parse(p, mem, rest)? {
+        Node::Root => {
+            let mut names: Vec<(Vec<u8>, u8)> = MACHINE_FILES.iter().map(|(n, _)| (n.to_vec(), libc::DT_REG)).collect();
+            names.push((b"self".to_vec(), libc::DT_LNK));
+            names.push((b"thread-self".to_vec(), libc::DT_LNK));
+            let mut pids = p.kernel.pids(p);
+            pids.sort_unstable();
+            names.extend(pids.into_iter().map(|pid| (pid.to_string().into_bytes(), libc::DT_DIR)));
+            return dir(listing(names));
         }
-        Node::Maps => Ok(generated(&maps(p, mem))?.path(b"/proc/self/maps".to_vec())),
         Node::Info(info) => {
             let contents = match info {
                 Generated::CpuInfo => hostinfo::cpuinfo(),
                 Generated::MemInfo => hostinfo::meminfo(),
                 Generated::Mounts => mounts(p, false),
-                Generated::MountInfo => mounts(p, true),
                 Generated::Uptime => hostinfo::proc_uptime(),
-                Generated::LoadAvg => hostinfo::proc_loadavg(p.pid),
+                Generated::LoadAvg => hostinfo::proc_loadavg(p.kernel.pids(p).into_iter().max().unwrap_or(p.pid)),
                 Generated::Version => hostinfo::proc_version(),
+                Generated::Stat => system_stat(p),
+                Generated::PidMax => "4194304\n".into(),
             };
-            let mut path = b"/proc/".to_vec();
-            path.extend_from_slice(rest);
-            Ok(generated(contents.as_bytes())?.path(path))
+            return file(contents.into_bytes());
         }
-        Node::Dir => Err(errno::EOPNOTSUPP),
+        Node::Pid { pid, tid, what } => (pid, tid, what),
+    };
+    let status = p.kernel.proc_status(p, pid)?;
+    match what {
+        Of::Dir => {
+            let mut names: Vec<(Vec<u8>, u8)> = PID_FILES.iter().map(|(n, _)| (n.to_vec(), if matches!(*n, b"exe" | b"cwd") { libc::DT_LNK } else { libc::DT_REG })).collect();
+            names.push((b"fd".to_vec(), libc::DT_DIR));
+            if tid.is_none() {
+                names.push((b"task".to_vec(), libc::DT_DIR));
+            }
+            dir(listing(names))
+        }
+        Of::FdDir => {
+            let fds = with(p, mem, pid, |q, _| q.fds.numbers()).or_else(|_| remote(p, pid).map(|r| r.fds.into_iter().map(|(n, _)| n).collect()))?;
+            dir(listing(fds.into_iter().map(|n| (n.to_string().into_bytes(), libc::DT_LNK))))
+        }
+        Of::TaskDir => {
+            let mut tids = with(p, mem, pid, |q, _| q.thread_ids()).or_else(|_| remote(p, pid).map(|r| r.tids)).unwrap_or_default();
+            if !tids.contains(&pid) {
+                tids.push(pid);
+            }
+            tids.sort_unstable();
+            dir(listing(tids.into_iter().map(|t| (t.to_string().into_bytes(), libc::DT_DIR))))
+        }
+        Of::Exe => with(p, mem, pid, |q, _| open_host(q, &q.exe())).or_else(|_| remote(p, pid).map(|r| open_host(p, &r.exe)))?,
+        Of::Cwd => with(p, mem, pid, |q, _| open_host(q, &q.fs.cwd())).or_else(|_| remote(p, pid).map(|r| open_host(p, &r.cwd)))?,
+        // Linux reopens the file; sharing the open file is close enough.
+        Of::Fd(n) => with(p, mem, pid, |q, _| -> Result<FdEntry, i64> {
+            let entry = q.fds.get(n)?;
+            let host = entry.host.try_clone().map_err(|e| errno::from_io(&e))?;
+            Ok(FdEntry::new(host).path_opt(entry.path.clone()))
+        })
+        // Another host's: its file reopened by path, if it has one.
+        .or_else(|_| remote_fd(p, pid, n).map(|link| if link.starts_with(b"/") { open_host(p, &link) } else { Err(errno::ENXIO) }))?,
+        Of::Maps => file(with(p, mem, pid, |q, m| maps(q, m)).or_else(|_| remote(p, pid).map(|r| r.maps))?),
+        Of::Mounts => file(with(p, mem, pid, |q, _| mounts(q, false).into_bytes()).or_else(|_| remote(p, pid).map(|r| r.mounts))?),
+        Of::MountInfo => file(with(p, mem, pid, |q, _| mounts(q, true).into_bytes()).or_else(|_| remote(p, pid).map(|r| r.mountinfo))?),
+        Of::Cmdline => file(with(p, mem, pid, |q, m| strings(q, m, false)).unwrap_or_else(|_| status.cmdline.clone().unwrap_or_default())),
+        Of::Environ => file(with(p, mem, pid, |q, m| strings(q, m, true)).or_else(|_| remote(p, pid).map(|r| r.environ))?),
+        Of::Comm => file([comm(p, mem, pid), b"\n".to_vec()].concat()),
+        Of::Stat => file(pid_stat(p, mem, pid, tid.unwrap_or(pid), &status).into_bytes()),
+        Of::Status => file(pid_status(p, mem, pid, tid.unwrap_or(pid), &status).into_bytes()),
+        Of::Statm => {
+            let (size, rss) = with(p, mem, pid, |_, m| (vsize(m) / 4096, m.resident_pages())).unwrap_or((0, status.rss_pages));
+            file(format!("{size} {rss} 0 0 0 {size} 0\n").into_bytes())
+        }
     }
+}
+
+/// A process's argument (or environment) strings, read from its memory
+/// where the loader put them, as Linux does: what a program wrote over its
+/// own `argv` shows.
+fn strings(p: &Process, mem: &dyn GuestMemory, environ: bool) -> Vec<u8> {
+    let [a0, a1, e0, e1] = p.arg_area();
+    let (start, end) = if environ { (e0, e1) } else { (a0, a1) };
+    if end <= start || end - start > 1 << 21 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; (end - start) as usize];
+    if mem.read(start, &mut out).is_err() {
+        return Vec::new();
+    }
+    out
+}
+
+/// A process's name: its main thread's executable's base name, at most
+/// 15 bytes (Linux's TASK_COMM_LEN less the NUL).
+fn comm(p: &Process, mem: &dyn GuestMemory, pid: i64) -> Vec<u8> {
+    with(p, mem, pid, |q, _| q.comm()).or_else(|_| p.kernel.proc_status(p, pid).map(|s| s.comm)).unwrap_or_default()
+}
+
+/// The bytes a process has mapped.
+fn vsize(mem: &dyn GuestMemory) -> u64 {
+    mem.regions().iter().map(|r| r.end - r.start).sum()
+}
+
+/// When the Mac booted, in seconds since the epoch.
+fn boot_time() -> i64 {
+    let mut boot = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = size_of::<libc::timeval>();
+    unsafe { libc::sysctlbyname(c"kern.boottime".as_ptr(), (&mut boot as *mut libc::timeval).cast(), &mut len, std::ptr::null_mut(), 0) };
+    boot.tv_sec
+}
+
+/// Clock ticks (Linux's USER_HZ, 100 a second) in `ns`.
+fn ticks(ns: u64) -> u64 {
+    ns / 10_000_000
+}
+
+/// `/proc/<pid>/stat` (or a thread's, under `task/`): the fields `ps`,
+/// `top` and `pgrep` read, Linux's 52, in order.
+fn pid_stat(p: &Process, mem: &dyn GuestMemory, pid: i64, tid: i64, s: &ProcStatus) -> String {
+    let comm = String::from_utf8_lossy(&comm(p, mem, pid)).into_owned();
+    let (vsize, rss, area) = with(p, mem, pid, |q, m| (vsize(m), m.resident_pages(), q.arg_area())).unwrap_or((0, s.rss_pages, [0; 4]));
+    let (blocked, ignored, caught) = with(p, mem, pid, |q, _| q.signal_masks()).unwrap_or_default();
+    let fields: Vec<String> = vec![
+        tid.to_string(),
+        format!("({comm})"),
+        (s.state as char).to_string(),
+        s.ppid.to_string(),
+        s.pgid.to_string(),
+        s.sid.to_string(),
+        // tty_nr: /dev/pts/N is Linux's major 136, the minor split as
+        // new_encode_dev does.
+        s.tty.map_or(0, |n| (136u64 << 8) | (n as u64 & 0xff) | ((n as u64 >> 8) << 20)).to_string(),
+        s.tpgid.to_string(),
+        "4194304".into(), // flags: PF_RANDOMIZE
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(), // minflt, cminflt, majflt, cmajflt
+        ticks(s.user_ns).to_string(),
+        ticks(s.sys_ns).to_string(),
+        ticks(s.children_user_ns).to_string(),
+        ticks(s.children_sys_ns).to_string(),
+        "20".into(), // priority
+        "0".into(),  // nice
+        s.threads.to_string(),
+        "0".into(), // itrealvalue
+        ticks(s.start_ns).to_string(),
+        vsize.to_string(),
+        rss.to_string(),
+        u64::MAX.to_string(), // rsslim
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(), // startcode, endcode, startstack, kstkesp, kstkeip
+        "0".into(), // signal (pending: obsolete, as Linux)
+        blocked.to_string(),
+        ignored.to_string(),
+        caught.to_string(),
+        "0".into(),
+        "0".into(),
+        "0".into(), // wchan, nswap, cnswap
+        "17".into(), // exit_signal
+        "0".into(),  // processor
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(),
+        "0".into(), // rt_priority, policy, delayacct, guest_time, cguest_time
+        "0".into(),
+        "0".into(),
+        "0".into(), // start_data, end_data, start_brk
+        area[0].to_string(),
+        area[1].to_string(),
+        area[2].to_string(),
+        area[3].to_string(),
+        "0".into(), // exit_code
+    ];
+    fields.join(" ") + "\n"
+}
+
+/// `/proc/<pid>/status`.
+fn pid_status(p: &Process, mem: &dyn GuestMemory, pid: i64, tid: i64, s: &ProcStatus) -> String {
+    let comm = String::from_utf8_lossy(&comm(p, mem, pid)).into_owned();
+    let state = match s.state {
+        b'R' => "R (running)",
+        b'T' => "T (stopped)",
+        b'Z' => "Z (zombie)",
+        _ => "S (sleeping)",
+    };
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let (vsize, rss, umask, fds) = with(p, mem, pid, |q, m| (vsize(m), m.resident_pages(), q.umask(), q.fds.numbers().len())).unwrap_or((0, s.rss_pages, 0, 0));
+    let (blocked, ignored, caught) = with(p, mem, pid, |q, _| q.signal_masks()).unwrap_or_default();
+    let kb = |b: u64| b / 1024;
+    format!(
+        "Name:\t{comm}\nUmask:\t{umask:04o}\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{tid}\nPPid:\t{}\nTracerPid:\t0\n\
+         Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nFDSize:\t{}\nGroups:\t\nNStgid:\t{pid}\nNSpid:\t{tid}\n\
+         NSpgid:\t{}\nNSsid:\t{}\nVmPeak:\t{:>8} kB\nVmSize:\t{:>8} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{:>8} kB\n\
+         VmRSS:\t{:>8} kB\nRssAnon:\t{:>8} kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\nThreads:\t{}\nSigQ:\t0/0\n\
+         SigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nSigBlk:\t{blocked:016x}\nSigIgn:\t{ignored:016x}\nSigCgt:\t{caught:016x}\n\
+         CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\n\
+         CapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
+        s.ppid,
+        fds.next_power_of_two().max(64),
+        s.pgid,
+        s.sid,
+        kb(vsize),
+        kb(vsize),
+        rss * 4,
+        rss * 4,
+        rss * 4,
+        s.threads,
+    )
+}
+
+/// `/proc/stat`: the Mac's CPUs' time (the host's: a session's processes
+/// share its CPUs), boot time, and the processes the kernel has.
+fn system_stat(p: &Process) -> String {
+    let cpus = hostinfo::cpu_ticks();
+    let total = cpus.iter().fold([0u64; 4], |a, c| [a[0] + c[0], a[1] + c[1], a[2] + c[2], a[3] + c[3]]);
+    let line = |name: &str, [user, system, idle, nice]: [u64; 4]| format!("{name} {user} {nice} {system} {idle} 0 0 0 0 0 0\n");
+    let mut out = line("cpu ", total);
+    for (i, c) in cpus.iter().enumerate() {
+        out.push_str(&line(&format!("cpu{i}"), *c));
+    }
+    let pids = p.kernel.pids(p);
+    let running = pids.iter().filter(|&&pid| p.kernel.proc_status(p, pid).is_ok_and(|s| s.state == b'R')).count();
+    out.push_str(&format!(
+        "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n",
+        boot_time(),
+        pids.iter().max().copied().unwrap_or(p.pid),
+        running.max(1)
+    ));
+    out
 }
 
 /// A read-only file holding `contents`: a shared memory object, so it never

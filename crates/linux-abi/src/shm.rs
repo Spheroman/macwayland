@@ -16,6 +16,10 @@
 //!   are enforced as Linux does for shrinking, growing and writing;
 //! - reads and writes copy through a mapping; the file position belongs to
 //!   the fd entry (shared by `dup`, as Linux's open file description is);
+//! - the header names the object too (`id`, random), as an inode names a
+//!   file: macOS's `fstat` gives shm objects no inode, and the runtime
+//!   tells two mappings of one object by it (one shared window for both,
+//!   and one futex in it for every process);
 //! - private mappings copy, like other private file mappings.
 //!
 //! Host processes the fd is passed to (the compositor) just map it.
@@ -43,6 +47,8 @@ struct Header {
     size: AtomicU64,
     /// `F_SEAL_*`.
     seals: AtomicU64,
+    /// The object's identity: random, never 0 once set.
+    id: AtomicU64,
 }
 
 /// Seals (`F_ADD_SEALS`).
@@ -125,9 +131,20 @@ fn open_host(name: &CString, flags: i32, mode: u32) -> Result<OwnedFd, i64> {
         // Unsealable, as Linux's tmpfs files are; memfd_create with
         // MFD_ALLOW_SEALING opens it up (`allow_sealing`).
         file.header().seals.store(SEAL_SEAL, Ordering::Relaxed);
+        file.header().id.store(new_id(), Ordering::Relaxed);
         file.header().magic.store(MAGIC, Ordering::Release);
     }
     Ok(fd)
+}
+
+/// A new object's identity: random (objects are made by many host
+/// processes, and their names reused), and not 0, which means none yet.
+fn new_id() -> u64 {
+    let mut id = 0u64;
+    while id == 0 {
+        unsafe { libc::arc4random_buf((&mut id as *mut u64).cast(), 8) };
+    }
+    id
 }
 
 /// Map `[off, off + len)` of `fd` (`off` 16 KiB-aligned).
@@ -170,6 +187,21 @@ impl ShmFile {
         self.header().size.load(Ordering::Acquire)
     }
 
+    /// The object's identity, the same through every fd and mapping of it
+    /// (an object made before there were ids gets one now, through a
+    /// writable fd; through a read-only one it has none).
+    pub fn id(&self) -> Option<u64> {
+        let id = self.header().id.load(Ordering::Acquire);
+        if id != 0 || !self.writable {
+            return (id != 0).then_some(id);
+        }
+        let new = new_id();
+        match self.header().id.compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(new),
+            Err(theirs) => Some(theirs),
+        }
+    }
+
     /// The seals (`F_GET_SEALS`).
     pub fn seals(&self) -> u64 {
         self.header().seals.load(Ordering::Acquire)
@@ -192,7 +224,7 @@ impl ShmFile {
         }
         self.header()
             .seals
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| (old & SEAL_SEAL == 0).then_some(old | seals))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| (old & SEAL_SEAL == 0).then_some(old | seals))
             .map(|_| ())
             .map_err(|_| errno::EPERM)
     }
@@ -275,6 +307,8 @@ impl ShmFile {
         unsafe { libc::fstat(self.fd, &mut st) };
         st.st_mode |= libc::S_IFREG;
         st.st_size = self.size() as libc::off_t;
+        // Its inode, as a tmpfs file would have one.
+        st.st_ino = self.id().unwrap_or(0);
         st.st_blksize = 4096;
         st.st_blocks = self.size().div_ceil(512) as i64;
         st.st_nlink = 1;

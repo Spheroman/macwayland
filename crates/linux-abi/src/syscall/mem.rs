@@ -137,9 +137,10 @@ impl FileMaps {
 }
 
 /// Anonymous and shared mappings go straight to the core, and so do private
-/// read-only mappings of regular files where it can ([`GuestMemory::mmap_file`]).
-/// Other private file mappings are emulated by reading the file into an
-/// anonymous mapping, which is exact since nobody else sees them.
+/// mappings of regular files where it can ([`GuestMemory::mmap_file`]): all
+/// read-only ones, and writable ones of files open for writing. Other private
+/// file mappings are emulated by reading the file into an anonymous mapping,
+/// which misses later changes to the file.
 pub(super) fn mmap<M: GuestMemory + ?Sized>(p: &Process, mem: &M, args: [u64; 6]) -> Result<i64, i64> {
     let [addr, len, prot, flags, fd, offset] = args;
     let kind = flags & mm::MAP_TYPE;
@@ -176,8 +177,15 @@ pub(super) fn mmap<M: GuestMemory + ?Sized>(p: &Process, mem: &M, args: [u64; 6]
     let shm = ShmFile::of(host);
     let foreign = if shm.is_none() { foreign_shm(host, offset, len) } else { None };
     // A regular file mapped read-only (libraries, fonts) isn't read in at all
-    // if the memory can map it as it is.
-    if prot & mm::PROT_WRITE == 0 && shm.is_none() && foreign.is_none() && regular_file(host) {
+    // if the memory can map it as it is. Nor is one open for writing, which
+    // may change under the mapping: Linux shows those changes in pages the
+    // mapping hasn't written, and Wine's clients read wineserver's session
+    // object (window classes, desktops) that way, through a view mapped
+    // MAP_PRIVATE and PROT_WRITE, then made read-only. Writable mappings of
+    // read-only files (a library's data) are still copied in, at once rather
+    // than a page fault at a time.
+    let rdwr = unsafe { libc::fcntl(host, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDWR;
+    if (prot & mm::PROT_WRITE == 0 || rdwr) && shm.is_none() && foreign.is_none() && regular_file(host) {
         let base = mem.mmap_file(addr, len, prot, flags, host, offset);
         if base >= 0 {
             return Ok(named(base));

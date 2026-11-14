@@ -101,8 +101,9 @@ creates a D3D device, linked with d3dmetal-native (which finds and loads
 D3DMetal). It maps the shared ring and replays commands. Objects are named by IDs the guest allocates (so creating one
 needn't wait for an answer); the helper keeps an ID → COM pointer table.
 
-How a guest gets one: the guest can't start Mac programs except by
-replacing itself (`exec_host`), so something on the host does it. A
+How a guest gets one: a guest starts a Mac program only by `execve`
+(as a stand-in, `docs/processes.md` section 7), which isn't a helper it
+can talk to, so something on the host does it. A
 **broker** listens on a Unix socket, `$XDG_RUNTIME_DIR/macwl-d3d`, as the
 compositor and the session bus do; each connection gets a fresh helper
 (`posix_spawn`, never a fork of a process using Metal: see step 0) with the

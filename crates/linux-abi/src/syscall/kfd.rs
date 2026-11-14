@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{misc, ok, Process};
+use super::{misc, ok, Process, Thread};
 use crate::{
     abi::Timespec,
     errno,
@@ -47,8 +47,7 @@ pub(super) fn new_kqueue(nonblock: bool) -> Result<OwnedFd, i64> {
 }
 
 pub(super) fn change(kq: RawFd, ev: libc::kevent) -> Result<(), i64> {
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    ok(unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, &zero) } as i64).map(|_| ())
+    ok(now(kq, &[ev], &mut []) as i64).map(|_| ())
 }
 
 pub(super) fn user_event(flags: u16, fflags: u32) -> libc::kevent {
@@ -57,37 +56,94 @@ pub(super) fn user_event(flags: u16, fflags: u32) -> libc::kevent {
 
 /// Take whatever the kqueue has ready (so it reads as not ready again).
 pub(super) fn drain(kq: RawFd) {
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let mut out: [libc::kevent; 4] = unsafe { std::mem::zeroed() };
-    while unsafe { libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 4, &zero) } > 0 {}
+    while now(kq, &[], &mut out) > 0 {}
 }
 
-/// Block until the kqueue has something (a signal interrupts: EINTR).
-pub(super) fn wait(kq: RawFd) -> Result<(), i64> {
-    let mut out: libc::kevent = unsafe { std::mem::zeroed() };
-    ok(unsafe { libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null()) } as i64).map(|_| ())
+/// `kevent` that doesn't wait: apply `changes`, and take what's ready into
+/// `out` (the count, or -1 with errno set).
+///
+/// Every kqueue of ours is used through `kevent64` alone (a kqueue takes
+/// one kind of call or the other, and refuses the other kind once used):
+/// a look with nothing there takes ~11 µs through `kevent` with a zero
+/// timeout (it goes the way of a timed wait), and 0.13 µs through
+/// `kevent64` with KEVENT_FLAG_IMMEDIATE (measured, M5 Pro).
+pub fn now(kq: RawFd, changes: &[libc::kevent], out: &mut [libc::kevent]) -> i32 {
+    kevent64(kq, changes, out, libc::KEVENT_FLAG_IMMEDIATE, None)
 }
 
-pub(super) fn nonblocking(file: &OpenFile) -> bool {
-    let flags = unsafe { libc::fcntl(file.host.as_raw_fd(), libc::F_GETFL) };
-    flags & libc::O_NONBLOCK != 0
+/// `kevent`, through `kevent64` (see [`now`]): waiting up to `timeout`
+/// (None: for ever) unless `flags` says KEVENT_FLAG_IMMEDIATE.
+pub fn kevent64(kq: RawFd, changes: &[libc::kevent], out: &mut [libc::kevent], flags: u32, timeout: Option<&libc::timespec>) -> i32 {
+    let wide = |e: &libc::kevent| libc::kevent64_s {
+        ident: e.ident as u64,
+        filter: e.filter,
+        flags: e.flags,
+        fflags: e.fflags,
+        data: e.data as i64,
+        udata: e.udata as u64,
+        ext: [0; 2],
+    };
+    // On the stack for the usual few; (a signal handler calls this too,
+    // with one change and no events: no allocation then).
+    let mut small_changes: [libc::kevent64_s; 4] = unsafe { std::mem::zeroed() };
+    let big_changes: Vec<libc::kevent64_s>;
+    let changes64: &[libc::kevent64_s] = if changes.len() <= 4 {
+        for (w, e) in small_changes.iter_mut().zip(changes) {
+            *w = wide(e);
+        }
+        &small_changes[..changes.len()]
+    } else {
+        big_changes = changes.iter().map(wide).collect();
+        &big_changes
+    };
+    let mut small_out: [libc::kevent64_s; 4] = unsafe { std::mem::zeroed() };
+    let mut big_out: Vec<libc::kevent64_s>;
+    let out64: &mut [libc::kevent64_s] = if out.len() <= 4 {
+        &mut small_out[..out.len()]
+    } else {
+        big_out = vec![unsafe { std::mem::zeroed() }; out.len()];
+        &mut big_out
+    };
+    let n = unsafe {
+        libc::kevent64(kq, changes64.as_ptr(), changes64.len() as i32, out64.as_mut_ptr(), out64.len() as i32, flags, timeout.map_or(std::ptr::null(), |t| t))
+    };
+    for (o, e) in out.iter_mut().zip(&out64[..n.max(0) as usize]) {
+        *o = libc::kevent { ident: e.ident as usize, filter: e.filter, flags: e.flags, fflags: e.fflags, data: e.data as isize, udata: e.udata as usize as *mut libc::c_void };
+    }
+    n
+}
+
+/// Block until the kqueue has something (a signal interrupts: EINTR): for
+/// a host thread of the runtime's own.
+pub(super) fn wait_raw(kq: RawFd) -> Result<(), i64> {
+    let mut out: [libc::kevent; 1] = unsafe { std::mem::zeroed() };
+    ok(kevent64(kq, &[], &mut out, 0, None) as i64).map(|_| ())
+}
+
+/// Thread `t` of `p` waits until the kqueue has something, or it's called
+/// away (EINTR): see `block`.
+pub(super) fn wait(p: &Process, t: &Thread, kq: RawFd) -> Result<(), i64> {
+    super::block::poll(p, t, &mut vec![libc::pollfd { fd: kq, events: libc::POLLIN, revents: 0 }], None).map(|_| ())
 }
 
 impl EventFd {
-    /// For a forked child: (count, semaphore).
+    /// For a process moving to another host: (count, semaphore).
     pub fn state(&self) -> (u64, bool) {
         (self.count, self.semaphore)
     }
 }
 
 impl TimerFd {
-    /// For a forked child: (clock, interval, time to the next expiry).
+    /// For a process moving to another host: (clock, interval, time to
+    /// the next expiry).
     pub fn state(&self) -> (u64, Duration, Option<Duration>) {
         (self.clock, self.interval, self.deadline.map(|d| d.saturating_duration_since(Instant::now())))
     }
 }
 
-/// A forked child's copy of an eventfd.
+/// A new eventfd in the state `EventFd::state` gave (a process that moved
+/// to this host had it).
 pub(crate) fn eventfd_copy(count: u64, semaphore: bool, nonblock: bool) -> Result<FdEntry, i64> {
     let kq = new_kqueue(nonblock)?;
     change(kq.as_raw_fd(), user_event(libc::EV_ADD | libc::EV_CLEAR, 0))?;
@@ -99,7 +155,7 @@ pub(crate) fn eventfd_copy(count: u64, semaphore: bool, nonblock: bool) -> Resul
     Ok(entry)
 }
 
-/// A forked child's copy of a timerfd.
+/// A new timerfd in the state `TimerFd::state` gave.
 pub(crate) fn timerfd_copy(clock: u64, interval: Duration, left: Option<Duration>, nonblock: bool) -> Result<FdEntry, i64> {
     let kq = new_kqueue(nonblock)?;
     let deadline = left.map(|l| Instant::now() + l);
@@ -107,6 +163,11 @@ pub(crate) fn timerfd_copy(clock: u64, interval: Duration, left: Option<Duration
     let mut entry = FdEntry::new(kq);
     entry.kind = FileKind::TimerFd(Mutex::new(TimerFd { clock, deadline, interval }));
     Ok(entry)
+}
+
+pub(super) fn nonblocking(file: &OpenFile) -> bool {
+    let flags = unsafe { libc::fcntl(file.host.as_raw_fd(), libc::F_GETFL) };
+    flags & libc::O_NONBLOCK != 0
 }
 
 pub(super) fn eventfd2(p: &Process, initval: u64, flags: u64) -> Result<i64, i64> {
@@ -125,7 +186,7 @@ pub(super) fn eventfd2(p: &Process, initval: u64, flags: u64) -> Result<i64, i64
 }
 
 /// `read` on an eventfd: the count (or 1, for a semaphore), which resets.
-pub(crate) fn eventfd_read(file: &OpenFile, state: &Mutex<EventFd>, buf: &mut [u8]) -> Result<i64, i64> {
+pub(crate) fn eventfd_read(p: &Process, t: &Thread, file: &OpenFile, state: &Mutex<EventFd>, buf: &mut [u8]) -> Result<i64, i64> {
     if buf.len() < 8 {
         return Err(errno::EINVAL);
     }
@@ -147,7 +208,7 @@ pub(crate) fn eventfd_read(file: &OpenFile, state: &Mutex<EventFd>, buf: &mut [u
         if nonblocking(file) {
             return Err(errno::EAGAIN);
         }
-        wait(kq)?;
+        wait(p, t, kq)?;
     }
 }
 
@@ -255,7 +316,7 @@ pub(super) fn timerfd_gettime<M: GuestMemory + ?Sized>(p: &Process, mem: &M, fd:
 }
 
 /// `read` on a timerfd: how many times it has expired since the last read.
-pub(crate) fn timerfd_read(file: &OpenFile, timer: &Mutex<TimerFd>, buf: &mut [u8]) -> Result<i64, i64> {
+pub(crate) fn timerfd_read(p: &Process, t: &Thread, file: &OpenFile, timer: &Mutex<TimerFd>, buf: &mut [u8]) -> Result<i64, i64> {
     if buf.len() < 8 {
         return Err(errno::EINVAL);
     }
@@ -284,6 +345,6 @@ pub(crate) fn timerfd_read(file: &OpenFile, timer: &Mutex<TimerFd>, buf: &mut [u
         if nonblocking(file) {
             return Err(errno::EAGAIN);
         }
-        wait(kq)?;
+        wait(p, t, kq)?;
     }
 }

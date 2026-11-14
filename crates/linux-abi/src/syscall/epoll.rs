@@ -45,7 +45,15 @@ pub(crate) fn new_instance() -> Result<FdEntry, i64> {
     Ok(entry)
 }
 
-/// In a forked child: make epoll instance `epfd` watch `fd` again.
+pub(super) fn epoll_create1(p: &Process, flags: u64) -> Result<i64, i64> {
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return Err(errno::EINVAL);
+    }
+    Ok(p.fds.insert(new_instance()?.cloexec(flags & EPOLL_CLOEXEC != 0)))
+}
+
+/// Make epoll instance `epfd` watch `fd` (a process that moved to this host
+/// had it watching).
 pub(crate) fn rewatch(table: &crate::fs::FdTable, epfd: u64, fd: i32, interest: Interest) {
     let (Ok(ep), Ok(target)) = (table.get(epfd), table.get(fd as u64)) else { return };
     if let Ok(set) = interests(&ep)
@@ -53,13 +61,6 @@ pub(crate) fn rewatch(table: &crate::fs::FdTable, epfd: u64, fd: i32, interest: 
     {
         set.lock().unwrap_or_else(|e| e.into_inner()).insert(fd, interest);
     }
-}
-
-pub(super) fn epoll_create1(p: &Process, flags: u64) -> Result<i64, i64> {
-    if flags & !EPOLL_CLOEXEC != 0 {
-        return Err(errno::EINVAL);
-    }
-    Ok(p.fds.insert(new_instance()?.cloexec(flags & EPOLL_CLOEXEC != 0)))
 }
 
 fn interests(file: &OpenFile) -> Result<&Mutex<BTreeMap<i32, Interest>>, i64> {
@@ -91,7 +92,7 @@ fn register(kq: RawFd, host: RawFd, fd: i32, events: Option<u32>) -> Result<(), 
     }
     for change in changes {
         let mut result = change;
-        let n = unsafe { libc::kevent(kq, &change, 1, &mut result, 1, &libc::timespec { tv_sec: 0, tv_nsec: 0 }) };
+        let n = super::kfd::now(kq, &[change], std::slice::from_mut(&mut result));
         // Deleting a filter that wasn't there is fine.
         let failed = n < 0 || (n == 1 && result.flags & libc::EV_ERROR != 0 && result.data != 0 && result.data as i32 != libc::ENOENT);
         if failed && change.flags & libc::EV_DELETE == 0 {
@@ -104,6 +105,7 @@ fn register(kq: RawFd, host: RawFd, fd: i32, events: Option<u32>) -> Result<(), 
 
 pub(super) fn epoll_ctl<M: GuestMemory + ?Sized>(p: &Process, mem: &M, epfd: u64, op: u64, fd: u64, event: u64) -> Result<i64, i64> {
     let ep = p.fds.get(epfd)?;
+    crate::fs::hold(&ep);
     let set = interests(&ep)?;
     let target = p.fds.get(fd)?;
     if epfd == fd || std::ptr::eq(&*ep, &*target) {
@@ -159,19 +161,35 @@ pub(super) fn epoll_wait<M: GuestMemory + ?Sized>(
         return Err(errno::EINVAL);
     }
     let ep = p.fds.get(epfd)?;
+    crate::fs::hold(&ep);
     let set = interests(&ep)?;
     if sigmask != 0 {
         signal::wait_with_mask(t, mem.read_pod::<u64>(sigmask)?);
     }
-    if p.signal_ready(t) {
-        return Err(errno::EINTR);
-    }
     // Room for a read and a write event per fd.
     let n = (maxevents as usize).min(1024) * 2;
     let mut out: Vec<libc::kevent> = vec![unsafe { std::mem::zeroed() }; n];
-    let ts = timeout.map(|t| libc::timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
-    let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
-    let got = ok(unsafe { libc::kevent(ep.host.as_raw_fd(), std::ptr::null(), 0, out.as_mut_ptr(), n as i32, tsp) } as i64)? as usize;
+    let kq = ep.host.as_raw_fd();
+    let deadline = t.deadline(timeout.map(|ts| {
+        let now = std::time::Instant::now();
+        now.checked_add(std::time::Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)).unwrap_or(now + std::time::Duration::from_secs(1 << 32))
+    }));
+    // The kqueue reads as ready when it has events: the thread sleeps on it
+    // where a wakeup can't be missed (see `block`), then takes them.
+    let got = loop {
+        if p.signal_ready(t) {
+            return Err(errno::EINTR);
+        }
+        let got = ok(super::kfd::now(kq, &[], &mut out[..n]) as i64)? as usize;
+        if got > 0 || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break got;
+        }
+        let mut fds = vec![libc::pollfd { fd: kq, events: libc::POLLIN, revents: 0 }];
+        if super::block::poll(p, t, &mut fds, deadline)?.is_err() {
+            // Timed out: whatever came last.
+            break ok(super::kfd::now(kq, &[], &mut out[..n]) as i64)? as usize;
+        }
+    };
 
     // One epoll_event per guest fd, in the order kqueue reported them.
     let mut ready: Vec<(i32, u32)> = Vec::new();

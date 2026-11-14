@@ -185,6 +185,10 @@ pub mod ioctl {
     /// Share another file's blocks (reflink).
     pub const FICLONE: u64 = 0x4004_9409;
     pub const FICLONERANGE: u64 = 0x4020_940d;
+    /// ext2-style inode flags (chattr). Wine asks, to spot case-folded directories.
+    pub const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    /// FAT's directory listing with short names. Wine tries it on every directory.
+    pub const VFAT_IOCTL_READDIR_BOTH: u64 = 0x8230_7201;
     pub const TIOCGPGRP: u64 = 0x540f;
     pub const TIOCSPGRP: u64 = 0x5410;
     pub const TIOCGWINSZ: u64 = 0x5413;
@@ -251,6 +255,7 @@ pub mod net {
     pub const SO_SNDBUF: u64 = 7;
     pub const SO_RCVBUF: u64 = 8;
     pub const SO_KEEPALIVE: u64 = 9;
+    pub const SO_REUSEPORT: u64 = 15;
     pub const SO_PASSCRED: u64 = 16;
     pub const SO_PEERCRED: u64 = 17;
     pub const SO_RCVTIMEO: u64 = 20;

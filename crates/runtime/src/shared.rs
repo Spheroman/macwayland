@@ -2,9 +2,25 @@
 //! anonymous memory) and placed in the VM's physical address space above the
 //! private frame pool, so the guest and other host processes — a Wayland
 //! compositor reading a client's `wl_shm` buffer — see the same bytes.
+//!
+//! The windows are the VM's (one [`SharedWindows`] per
+//! [`crate::memory::Machine`]), counted by the address spaces that use them:
+//! a fork inside the VM maps the parent's windows as they are, at the same
+//! guest physical addresses, and a window goes once the last address space
+//! using it lets it go.
+//!
+//! A window is of an [`Object`]: a file (by device and inode), a shared
+//! memory object (by the id in its header), or shared anonymous memory. A
+//! mapping of a range of an object that a window already shows (with the
+//! same access) is that window: every process of a host mapping a library,
+//! a font, a `wl_shm` pool or a POSIX shm segment shares one host mapping
+//! and one place in guest physical memory, so the VM's stage 2 faults once
+//! per host rather than once per process. Futexes in shared memory are
+//! keyed by object and offset ([`SharedWindows::futex_key`]), so they're
+//! one futex wherever the object is mapped.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr::NonNull,
     sync::atomic::{AtomicU64, Ordering},
@@ -12,29 +28,70 @@ use std::{
 
 use linux_abi::{
     errno,
-    wire::{Decoder, Encoder, Truncated},
+    SharedKey,
 };
 
 use crate::{
     hv::{self, HvError},
-    paging::PHYS_SIZE,
+    paging::POOL_SIZE,
 };
 
 /// macOS's page size: host mappings (and so windows) are aligned to it.
 pub const HOST_PAGE: u64 = 16 << 10;
-/// Windows live between the private pool and the end of the VM's default
-/// 36-bit IPA space.
-const IPA_BASE: u64 = PHYS_SIZE;
-const IPA_LIMIT: u64 = 1 << 36;
+/// Windows live between the frame pool and the end of the VM's 40-bit IPA
+/// space: `[512 GiB, 1 TiB)`.
+const IPA_BASE: u64 = POOL_SIZE;
+const IPA_LIMIT: u64 = 1 << hv::IPA_BITS;
+
+/// What a window maps, so that two mappings of the same thing can be told:
+/// a regular file by device and inode, a shared memory object by its
+/// header's id, shared anonymous memory (and objects that can't be told, a
+/// host program's shm) by a number of their own, unique to this host
+/// process (its pid in the first word) and never looked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Object(pub [u64; 2]);
+
+const SHM_OBJECT: u64 = 1 << 40;
+const OWN_OBJECT: u64 = 2 << 40;
+
+impl Object {
+    /// What `fd` is, if it's something other mappings can be of.
+    fn of(fd: RawFd) -> Option<Object> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
+            return None;
+        }
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => Some(Object([st.st_dev as u32 as u64, st.st_ino])),
+            // POSIX shm objects have no file type.
+            0 => linux_abi::shm::ShmFile::of(fd).and_then(|f| f.id()).map(|id| Object([SHM_OBJECT, id])),
+            _ => None,
+        }
+    }
+
+    /// A new object of this host process's own.
+    fn own() -> Object {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Object([OWN_OBJECT | std::process::id() as u64, NEXT.fetch_add(1, Ordering::Relaxed)])
+    }
+
+    /// Whether another mapping can be of this object (and so may find a
+    /// window of it to share).
+    fn shareable(&self) -> bool {
+        self.0[0] & OWN_OBJECT == 0
+    }
+}
 
 struct Window {
     host: NonNull<u8>,
     len: u64,
     writable: bool,
-    /// What's mapped, from `offset`: the guest's file, or a POSIX shm object
-    /// for shared anonymous memory. Kept so a forked child can map it too.
-    fd: OwnedFd,
+    object: Object,
+    /// Where in what's mapped (the guest's file, or a POSIX shm object for
+    /// shared anonymous memory) it starts.
     offset: u64,
+    /// Address spaces using it.
+    users: u32,
 }
 
 /// A new, nameless POSIX shared memory object of `len` bytes. Unlike a file,
@@ -67,6 +124,9 @@ pub fn anonymous_shm(len: u64) -> Result<OwnedFd, i64> {
 pub struct SharedWindows {
     /// Keyed by guest physical start.
     windows: BTreeMap<u64, Window>,
+    /// The windows of each object (and access), by start: where a new
+    /// mapping of it looks for one showing its range.
+    by_object: HashMap<(Object, bool), Vec<u64>>,
     /// Free guest physical ranges, start → end.
     free: BTreeMap<u64, u64>,
     /// Whether the VM exists, so windows must be mapped into it as they're
@@ -74,32 +134,41 @@ pub struct SharedWindows {
     vm_live: bool,
 }
 
+// Safety: the pointers are into host mappings the windows own; the VM's
+// windows are reached only through its mutex.
+unsafe impl Send for SharedWindows {}
+
 impl Default for SharedWindows {
     fn default() -> Self {
-        SharedWindows { windows: BTreeMap::new(), free: BTreeMap::from([(IPA_BASE, IPA_LIMIT)]), vm_live: false }
+        SharedWindows { windows: BTreeMap::new(), by_object: HashMap::new(), free: BTreeMap::from([(IPA_BASE, IPA_LIMIT)]), vm_live: false }
     }
 }
 
 impl SharedWindows {
     /// Map `len` bytes of `fd` from `offset` (or new shared anonymous memory
-    /// if `fd` is None) and return the guest physical address of `offset`.
-    /// `offset` must be 4 KiB-aligned; the window itself starts at the 16 KiB
-    /// host page below it.
-    pub fn create(&mut self, fd: Option<RawFd>, offset: u64, len: u64, writable: bool) -> Result<u64, i64> {
+    /// if `fd` is None) for one address space, and return the window's start
+    /// (for [`SharedWindows::release`]) and the guest physical address of
+    /// `offset`. `offset` must be 4 KiB-aligned; the window itself starts at
+    /// the 16 KiB host page below it. If a window of the same object with
+    /// the same access shows the range already, that's the one, with one
+    /// more user.
+    pub fn create(&mut self, fd: Option<RawFd>, offset: u64, len: u64, writable: bool) -> Result<(u64, u64), i64> {
         let host_off = offset & !(HOST_PAGE - 1);
         let delta = offset - host_off;
         let host_len = (delta + len).next_multiple_of(HOST_PAGE);
-        let (fd, host_off) = match fd {
-            Some(fd) => {
-                let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if dup < 0 {
-                    return Err(errno::from_io(&std::io::Error::last_os_error()));
-                }
-                (unsafe { OwnedFd::from_raw_fd(dup) }, host_off)
-            }
-            None => (anonymous_shm(host_len)?, 0),
+        let object = fd.and_then(Object::of);
+        if let Some(object) = object
+            && let Some(start) = self.showing(object, writable, host_off, host_len)
+        {
+            let w = self.windows.get_mut(&start).expect("an indexed window");
+            w.users += 1;
+            return Ok((start, start + (offset - w.offset)));
+        }
+        // The mapping holds what it maps: the fd isn't needed after.
+        let window = match fd {
+            Some(fd) => map_host(fd, host_off, host_len, writable, object.unwrap_or_else(Object::own))?,
+            None => map_host(anonymous_shm(host_len)?.as_raw_fd(), 0, host_len, writable, Object::own())?,
         };
-        let window = map_host(fd, host_off, host_len, writable)?;
         let Some(ipa) = self.alloc(host_len) else {
             unsafe { libc::munmap(window.host.as_ptr().cast(), host_len as usize) };
             return Err(errno::ENOMEM);
@@ -112,8 +181,43 @@ impl SharedWindows {
             self.dealloc(ipa, host_len);
             return Err(errno::ENOMEM);
         }
+        self.insert(ipa, window);
+        Ok((ipa, ipa + delta))
+    }
+
+    /// The window of `object` (with access `writable`) that shows host
+    /// range `[off, off + len)` of it, if one does.
+    fn showing(&self, object: Object, writable: bool, off: u64, len: u64) -> Option<u64> {
+        self.by_object.get(&(object, writable))?.iter().copied().find(|start| {
+            let w = &self.windows[start];
+            w.offset <= off && off + len <= w.offset + w.len
+        })
+    }
+
+    fn insert(&mut self, ipa: u64, window: Window) {
+        if window.object.shareable() {
+            self.by_object.entry((window.object, window.writable)).or_default().push(ipa);
+        }
         self.windows.insert(ipa, window);
-        Ok(ipa + delta)
+    }
+
+    /// The key of a futex at guest physical address `pa` in a window: the
+    /// object and the offset in it, the same wherever it's mapped.
+    pub fn futex_key(&self, pa: u64) -> Option<SharedKey> {
+        let (start, _) = self.find(pa)?;
+        let w = &self.windows[&start];
+        Some(SharedKey { object: w.object.0, offset: w.offset + (pa - start) })
+    }
+
+    /// How many windows there are (for tests and measurements).
+    pub fn count(&self) -> usize {
+        self.windows.len()
+    }
+
+    /// Another address space uses the window starting at `start` (a fork
+    /// inside the VM).
+    pub fn add_user(&mut self, start: u64) {
+        self.windows.get_mut(&start).expect("no such window").users += 1;
     }
 
     /// Map every window into the (newly created) VM, and later ones as they
@@ -123,15 +227,6 @@ impl SharedWindows {
             map_window(ipa, w)?;
         }
         self.vm_live = true;
-        Ok(())
-    }
-
-    /// Unmap every window from the VM (which stays), for `execve`.
-    pub fn detach_vm(&mut self) -> Result<(), HvError> {
-        for (&ipa, w) in &self.windows {
-            hv::unmap(ipa, w.len as usize)?;
-        }
-        self.vm_live = false;
         Ok(())
     }
 
@@ -157,9 +252,21 @@ impl SharedWindows {
         self.windows.iter().map(|(&s, w)| (s, s + w.len)).collect()
     }
 
-    /// Unmap and free the window starting at `start`.
+    /// An address space is done with the window starting at `start`: once
+    /// none uses it, it's unmapped and freed.
     pub fn release(&mut self, start: u64) {
-        let w = self.windows.remove(&start).expect("no such window");
+        let w = self.windows.get_mut(&start).expect("no such window");
+        w.users -= 1;
+        if w.users > 0 {
+            return;
+        }
+        let w = self.windows.remove(&start).unwrap();
+        if let Some(starts) = self.by_object.get_mut(&(w.object, w.writable)) {
+            starts.retain(|&s| s != start);
+            if starts.is_empty() {
+                self.by_object.remove(&(w.object, w.writable));
+            }
+        }
         if self.vm_live
             && let Err(e) = hv::unmap(start, w.len as usize)
         {
@@ -201,65 +308,29 @@ impl SharedWindows {
 /// on the host side instead: nothing writes it (the guest's page tables and
 /// the VM mapping are read-only), and a private mapping still sees the file's
 /// changes in pages no one has written.
-fn map_host(fd: OwnedFd, offset: u64, len: u64, writable: bool) -> Result<Window, i64> {
+fn map_host(fd: RawFd, offset: u64, len: u64, writable: bool, object: Object) -> Result<Window, i64> {
     let rw = libc::PROT_READ | libc::PROT_WRITE;
     let (prot, flags) = if writable {
         (rw, libc::MAP_SHARED)
     } else {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
-        let read_only_fd = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY;
+        unsafe { libc::fstat(fd, &mut st) };
+        let read_only_fd = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY;
         if read_only_fd && st.st_mode & libc::S_IFMT == libc::S_IFREG {
             (rw, libc::MAP_PRIVATE)
         } else {
             (libc::PROT_READ, libc::MAP_SHARED)
         }
     };
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, prot, flags, fd.as_raw_fd(), offset as libc::off_t) };
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len as usize, prot, flags, fd, offset as libc::off_t) };
     if p == libc::MAP_FAILED {
         return Err(errno::from_io(&std::io::Error::last_os_error()));
     }
-    Ok(Window { host: NonNull::new(p.cast()).unwrap(), len, writable, fd, offset })
+    Ok(Window { host: NonNull::new(p.cast()).unwrap(), len, writable, object, offset, users: 1 })
 }
 
 impl SharedWindows {
-    /// Encode the windows for a forked child, which maps the same objects
-    /// (so they stay shared). Returns their fds, in order, to pass along.
-    pub fn encode(&self, e: &mut Encoder) -> Vec<RawFd> {
-        e.u64(self.windows.len() as u64);
-        for (&ipa, w) in &self.windows {
-            e.u64(ipa).u64(w.len).bool(w.writable).u64(w.offset);
-        }
-        self.windows.values().map(|w| w.fd.as_raw_fd()).collect()
-    }
 
-    pub fn decode(d: &mut Decoder, fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Self, Truncated> {
-        let mut s = SharedWindows::default();
-        for _ in 0..d.count(32)? {
-            let (ipa, len, writable, offset) = (d.u64()?, d.u64()?, d.bool()?, d.u64()?);
-            let fd = fds.next().ok_or(Truncated)?;
-            let w = map_host(fd, offset, len, writable).map_err(|_| Truncated)?;
-            s.reserve(ipa, len).ok_or(Truncated)?;
-            s.windows.insert(ipa, w);
-        }
-        Ok(s)
-    }
-
-    /// Take `[start, start + len)` out of the free IPA ranges.
-    fn reserve(&mut self, start: u64, len: u64) -> Option<()> {
-        let (&fs, &fe) = self.free.range(..=start).next_back()?;
-        if fe < start + len {
-            return None;
-        }
-        self.free.remove(&fs);
-        if fs < start {
-            self.free.insert(fs, start);
-        }
-        if start + len < fe {
-            self.free.insert(start + len, fe);
-        }
-        Some(())
-    }
 }
 
 fn map_window(ipa: u64, w: &Window) -> Result<(), HvError> {
@@ -285,8 +356,8 @@ mod tests {
     #[test]
     fn ipa_ranges_are_reused_and_coalesced() {
         let mut s = SharedWindows::default();
-        let a = s.create(None, 0, 4096, true).unwrap();
-        let b = s.create(None, 0, 20 << 10, true).unwrap();
+        let a = s.create(None, 0, 4096, true).unwrap().1;
+        let b = s.create(None, 0, 20 << 10, true).unwrap().1;
         assert_eq!(a, IPA_BASE);
         assert_eq!(b, IPA_BASE + HOST_PAGE, "4 KiB rounds up to one 16 KiB host page");
         assert_eq!(s.find(b + (20 << 10)), Some((b, b + 2 * HOST_PAGE)));
@@ -298,22 +369,21 @@ mod tests {
     #[test]
     fn unaligned_offset_lands_inside_the_window() {
         let mut s = SharedWindows::default();
-        let pa = s.create(None, 3 * 4096, 4096, true).unwrap();
+        let (start, pa) = s.create(None, 3 * 4096, 4096, true).unwrap();
+        assert_eq!(start, IPA_BASE);
         assert_eq!(pa, IPA_BASE + 3 * 4096);
         assert_eq!(s.find(pa), Some((IPA_BASE, IPA_BASE + HOST_PAGE)));
     }
 
     #[test]
-    fn a_decoded_copy_shares_the_same_memory() {
+    fn windows_go_with_their_last_user() {
         let mut s = SharedWindows::default();
-        let _first = s.create(None, 0, 4096, true).unwrap();
-        let pa = s.create(None, 0, 8192, true).unwrap();
-        let mut e = Encoder::default();
-        let fds: Vec<OwnedFd> = s.encode(&mut e).into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(libc::dup(fd)) }).collect();
-        let copy = SharedWindows::decode(&mut Decoder(&e.0), &mut fds.into_iter()).unwrap();
-        assert_eq!(copy.ranges(), s.ranges());
-        assert_eq!(copy.free, s.free);
-        unsafe { *s.ptr(pa).unwrap() = 42 };
-        assert_eq!(unsafe { *copy.ptr(pa).unwrap() }, 42, "shared, not copied");
+        let (start, _) = s.create(None, 0, 4096, true).unwrap();
+        s.add_user(start);
+        s.release(start);
+        assert_eq!(s.ranges().len(), 1, "still used");
+        s.release(start);
+        assert!(s.ranges().is_empty());
+        assert_eq!(s.free, BTreeMap::from([(IPA_BASE, IPA_LIMIT)]));
     }
 }

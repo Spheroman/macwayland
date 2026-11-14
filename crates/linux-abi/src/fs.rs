@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     cell::RefCell,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::AtomicU64,
         Arc, Mutex, RwLock,
     },
 };
@@ -37,6 +37,71 @@ pub struct OpenFile {
     pub pos: AtomicU64,
     /// What it is, if the dispatcher emulates it.
     pub kind: FileKind,
+    /// Whether a call on it can block (a pipe, socket, device), found out
+    /// the first time it's asked.
+    can_block: std::sync::OnceLock<bool>,
+    /// Whether it's a named FIFO (not a pipe), found out the first time
+    /// it's asked.
+    named_fifo: std::sync::OnceLock<bool>,
+    /// Which pty it's an end of, if any, found out the first time it's
+    /// asked.
+    tty: std::sync::OnceLock<Option<crate::syscall::TtyId>>,
+    /// What to do as the last reference to it goes (a pty master's
+    /// hangup).
+    on_close: CloseHook,
+}
+
+impl OpenFile {
+    /// Whether a read or write on it can block (not a regular file or a
+    /// directory).
+    pub fn can_block(&self) -> bool {
+        *self.can_block.get_or_init(|| crate::syscall::can_block(self.host.as_raw_fd()))
+    }
+
+    /// Whether it's a named FIFO (`mkfifo`), as opposed to a pipe: on macOS
+    /// neither kqueue nor `poll` says when a FIFO's last writer has gone
+    /// (a read then returns 0 at once), though they do for a pipe.
+    pub fn named_fifo(&self) -> bool {
+        *self.named_fifo.get_or_init(|| {
+            let host = self.host.as_raw_fd();
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(host, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+                return false;
+            }
+            // A pipe has no path.
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            unsafe { libc::fcntl(host, libc::F_GETPATH, buf.as_mut_ptr()) == 0 }
+        })
+    }
+
+    /// The pty it's an end of, if it is one.
+    pub fn tty(&self) -> Option<crate::syscall::TtyId> {
+        *self.tty.get_or_init(|| if self.can_block() { crate::syscall::tty_of(self.host.as_raw_fd()) } else { None })
+    }
+
+    /// Run `f` as the file closes for good (its last guest fd closed, and
+    /// no call holding it), before its host fd closes.
+    pub fn on_close(&self, f: Box<dyn FnOnce() + Send>) {
+        *self.on_close.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_close.0.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            f();
+        }
+    }
+}
+
+/// A file's [`OpenFile::on_close`].
+#[derive(Default)]
+struct CloseHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl std::fmt::Debug for CloseHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CloseHook")
+    }
 }
 
 /// Open files the dispatcher emulates on top of a host descriptor.
@@ -57,6 +122,9 @@ pub enum FileKind {
     /// A signalfd (a host kqueue with a user event, triggered as signals
     /// become pending).
     SignalFd(crate::syscall::SignalFd),
+    /// A pidfd for this pid: its host fd reads as ready once the process
+    /// has ended (see `syscall::pidfd`).
+    PidFd(i64),
 }
 
 /// One fd an epoll instance watches.
@@ -75,11 +143,13 @@ pub struct FdEntry {
     pub cloexec: bool,
     pub path: Option<Vec<u8>>,
     pub kind: FileKind,
+    /// A directory listing it has from the start (`/proc`'s directories).
+    pub dir: Option<DirSnapshot>,
 }
 
 impl FdEntry {
     pub fn new(host: OwnedFd) -> Self {
-        FdEntry { host, cloexec: false, path: None, kind: FileKind::Plain }
+        FdEntry { host, cloexec: false, path: None, kind: FileKind::Plain, dir: None }
     }
 
     pub fn cloexec(mut self, cloexec: bool) -> Self {
@@ -92,8 +162,19 @@ impl FdEntry {
         self
     }
 
+    pub fn path_opt(mut self, path: Option<Vec<u8>>) -> Self {
+        self.path = path;
+        self
+    }
+
+    /// A directory whose listing is `listing`.
+    pub fn dir(mut self, listing: DirSnapshot) -> Self {
+        self.dir = Some(listing);
+        self
+    }
+
     fn open(self) -> Slot {
-        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(None), pos: AtomicU64::new(0), kind: self.kind };
+        let file = OpenFile { host: self.host, path: self.path, dir: Mutex::new(self.dir), pos: AtomicU64::new(0), kind: self.kind, can_block: Default::default(), named_fifo: Default::default(), tty: Default::default(), on_close: Default::default() };
         Slot { file: Arc::new(file), cloexec: self.cloexec }
     }
 }
@@ -104,6 +185,9 @@ impl FdEntry {
 pub struct DirSnapshot {
     pub entries: Vec<DirEntry>,
     pub next: usize,
+    /// A listing made rather than read (`/proc`'s): rewinding starts it over
+    /// rather than reading the host directory again.
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +212,19 @@ thread_local! {
 /// The system call on this thread is done with the files it used.
 pub fn end_call() {
     IN_FLIGHT.with(|f| f.borrow_mut().clear());
+}
+
+/// The current system call uses `file` too (its host fd stays open until
+/// the call ends, or while the call waits parked: [`take_in_flight`]).
+pub(crate) fn hold(file: &Arc<OpenFile>) {
+    IN_FLIGHT.with(|f| f.borrow_mut().push(file.clone()));
+}
+
+/// The files the current call uses, for a wait that leaves this host
+/// thread (a parked task) to keep open: the host fds it watches mustn't be
+/// closed and reused while it waits.
+pub(crate) fn take_in_flight() -> Vec<Arc<OpenFile>> {
+    IN_FLIGHT.with(|f| std::mem::take(&mut *f.borrow_mut()))
 }
 
 /// Guest fd numbers → open files. Guest numbering is independent of the
@@ -170,6 +267,11 @@ impl FdTable {
         slots[fd] = Some(entry.open());
     }
 
+    /// A new fd for an open file another process has (`pidfd_getfd`).
+    pub fn insert_file(&self, file: Arc<OpenFile>, cloexec: bool) -> i64 {
+        Self::place(&mut self.slots(), 0, Slot { file, cloexec })
+    }
+
     /// `dup`: a new fd ≥ `min` for `fd`'s open file.
     pub fn dup_from(&self, fd: u64, min: usize, cloexec: bool) -> Result<i64, i64> {
         let mut slots = self.slots();
@@ -200,6 +302,11 @@ impl FdTable {
         let raw = file.host.as_raw_fd();
         IN_FLIGHT.with(|f| f.borrow_mut().push(file));
         Ok(raw)
+    }
+
+    /// The open fds' numbers, in order.
+    pub fn numbers(&self) -> Vec<u64> {
+        self.slots().iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| i as u64).collect()
     }
 
     pub fn cloexec(&self, fd: u64) -> Result<bool, i64> {
@@ -234,14 +341,16 @@ impl FdTable {
         drop(closed);
     }
 
-    /// Close every fd marked close-on-exec.
     /// The fds a new program inherits (those without close-on-exec): guest
-    /// number and host fd.
-    pub fn inherited(&self) -> Vec<(usize, RawFd)> {
+    /// number and open file, held (so another thread's `close` can't free
+    /// its host fd, or give the number to another file, while it's being
+    /// passed on).
+    pub fn inherited_files(&self) -> Vec<(usize, Arc<OpenFile>)> {
         let slots = self.slots();
-        slots.iter().enumerate().filter_map(|(n, s)| s.as_ref().filter(|s| !s.cloexec).map(|s| (n, s.file.host.as_raw_fd()))).collect()
+        slots.iter().enumerate().filter_map(|(n, s)| s.as_ref().filter(|s| !s.cloexec).map(|s| (n, s.file.clone()))).collect()
     }
 
+    /// Close every fd marked close-on-exec.
     pub fn close_on_exec(&self) {
         for slot in self.slots().iter_mut() {
             if slot.as_ref().is_some_and(|s| s.cloexec) {
@@ -250,125 +359,27 @@ impl FdTable {
         }
     }
 
-    /// Encode the table for a forked child. The host fds aren't in the
-    /// message: they're returned, in order, to be passed alongside it.
-    /// (Directory read positions aren't kept: the child's `getdents64`
-    /// starts a fresh snapshot.)
-    pub fn encode(&self, e: &mut Encoder) -> Vec<RawFd> {
-        let slots = self.slots();
-        let mut host = Vec::new();
-        e.u64(slots.len() as u64);
-        for slot in slots.iter() {
-            e.bool(slot.is_some());
-            if let Some(s) = slot {
-                e.bool(s.cloexec).opt_bytes(s.file.path.as_deref()).u64(s.file.pos.load(Ordering::Relaxed));
-                match &s.file.kind {
-                    FileKind::Plain => {
-                        e.u64(0);
-                        host.push(s.file.host.as_raw_fd());
-                    }
-                    // A kqueue can't go to another process: the child makes
-                    // its own and watches the same fds.
-                    FileKind::Epoll(set) => {
-                        let set = set.lock().unwrap_or_else(|e| e.into_inner());
-                        e.u64(1).u64(set.len() as u64);
-                        for (&fd, i) in set.iter() {
-                            e.i64(fd as i64).u64(i.events as u64).u64(i.data);
-                        }
-                        host.push(libc::STDERR_FILENO); // a placeholder
-                    }
-                    // Likewise kqueue-based eventfds and timerfds: the child
-                    // makes its own, in the same state.
-                    FileKind::EventFd(state) => {
-                        let (count, semaphore) = state.lock().unwrap_or_else(|e| e.into_inner()).state();
-                        e.u64(2).u64(count).bool(semaphore).bool(nonblocking(&s.file));
-                        host.push(libc::STDERR_FILENO);
-                    }
-                    FileKind::TimerFd(timer) => {
-                        let (clock, interval, left) = timer.lock().unwrap_or_else(|e| e.into_inner()).state();
-                        e.u64(3).u64(clock).u64(interval.as_nanos() as u64);
-                        e.bool(left.is_some()).u64(left.map_or(0, |l| l.as_nanos() as u64)).bool(nonblocking(&s.file));
-                        host.push(libc::STDERR_FILENO);
-                    }
-                    // And inotify instances: the child watches the same paths
-                    // (events not yet read stay with the parent).
-                    FileKind::SignalFd(signalfd) => {
-                        e.u64(5).u64(signalfd.mask()).bool(nonblocking(&s.file));
-                        host.push(libc::STDERR_FILENO);
-                    }
-                    FileKind::Inotify(inotify) => {
-                        let watches = inotify.state();
-                        e.u64(4).u64(watches.len() as u64);
-                        for (wd, path, mask) in watches {
-                            e.i64(wd as i64).bytes(&path).u64(mask as u64);
-                        }
-                        e.bool(nonblocking(&s.file));
-                        host.push(libc::STDERR_FILENO);
-                    }
-                }
-            }
-        }
-        host
+    /// A forked child's table, in the same host process: the same open files
+    /// (one open file description each, shared, as on Linux: offsets,
+    /// epoll sets, eventfd counts), except signalfds, which read the
+    /// signals of the process reading them, so the child gets its own,
+    /// for the process with `inbox`.
+    pub fn fork(&self, inbox: &std::sync::Arc<crate::syscall::Inbox>) -> FdTable {
+        let slots = self
+            .slots()
+            .iter()
+            .map(|slot| {
+                let s = slot.as_ref()?;
+                let FileKind::SignalFd(signalfd) = &s.file.kind else { return Some(s.clone()) };
+                // Without a copy (no kqueue to be had) the child just doesn't
+                // have it.
+                let entry = crate::syscall::signalfd_copy(inbox, signalfd.mask(), nonblocking(&s.file)).ok()?.cloexec(s.cloexec);
+                Some(entry.open())
+            })
+            .collect();
+        FdTable { slots: Mutex::new(slots) }
     }
 
-    /// The inverse of [`FdTable::encode`], taking host fds from `fds`.
-    pub fn decode(d: &mut Decoder, fds: &mut impl Iterator<Item = OwnedFd>) -> Result<Self, Truncated> {
-        let n = d.count(8)?;
-        let mut slots = Vec::with_capacity(n);
-        let mut epolls = Vec::new();
-        for i in 0..n {
-            slots.push(if d.bool()? {
-                let (cloexec, path, pos) = (d.bool()?, d.opt_bytes()?, d.u64()?);
-                let kind = d.u64()?;
-                let host = fds.next().ok_or(Truncated)?;
-                let ns = std::time::Duration::from_nanos;
-                let entry = if kind == 2 {
-                    drop(host);
-                    let (count, semaphore, nonblock) = (d.u64()?, d.bool()?, d.bool()?);
-                    crate::syscall::eventfd_copy(count, semaphore, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
-                } else if kind == 3 {
-                    drop(host);
-                    let (clock, interval) = (d.u64()?, ns(d.u64()?));
-                    let left = (d.bool()?, ns(d.u64()?));
-                    let nonblock = d.bool()?;
-                    let left = left.0.then_some(left.1);
-                    crate::syscall::timerfd_copy(clock, interval, left, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
-                } else if kind == 5 {
-                    drop(host);
-                    let (mask, nonblock) = (d.u64()?, d.bool()?);
-                    crate::syscall::signalfd_copy(mask, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
-                } else if kind == 4 {
-                    drop(host);
-                    let watches = (0..d.count(24)?)
-                        .map(|_| Ok((d.i64()? as i32, d.bytes()?, d.u64()? as u32)))
-                        .collect::<Result<Vec<_>, Truncated>>()?;
-                    let nonblock = d.bool()?;
-                    crate::syscall::inotify_copy(watches, nonblock).map_err(|_| Truncated)?.cloexec(cloexec)
-                } else if kind == 1 {
-                    let watched = (0..d.count(24)?)
-                        .map(|_| Ok((d.i64()? as i32, Interest { events: d.u64()? as u32, data: d.u64()? })))
-                        .collect::<Result<Vec<_>, Truncated>>()?;
-                    epolls.push((i, watched));
-                    drop(host);
-                    crate::syscall::new_epoll().map_err(|_| Truncated)?.cloexec(cloexec)
-                } else {
-                    FdEntry { host, cloexec, path, kind: FileKind::Plain }
-                };
-                let slot = entry.open();
-                slot.file.pos.store(pos, Ordering::Relaxed);
-                Some(slot)
-            } else {
-                None
-            });
-        }
-        let table = FdTable { slots: Mutex::new(slots) };
-        for (i, watched) in epolls {
-            for (fd, interest) in watched {
-                crate::syscall::rewatch(&table, i as u64, fd, interest);
-            }
-        }
-        Ok(table)
-    }
 }
 
 /// Lexically normalise an absolute guest path: collapse `//`, `.` and `..`

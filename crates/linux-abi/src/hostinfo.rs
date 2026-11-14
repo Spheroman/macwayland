@@ -38,6 +38,27 @@ pub fn uptime() -> f64 {
     ((now.tv_sec - boot.tv_sec) as f64 + (now.tv_usec - boot.tv_usec) as f64 / 1e6).max(0.0)
 }
 
+/// Each CPU's time so far, in clock ticks (100 a second): user, system,
+/// idle and nice, from Mach's processor load info.
+pub fn cpu_ticks() -> Vec<[u64; 4]> {
+    unsafe extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_processor_info(host: u32, flavor: i32, count: *mut u32, info: *mut *mut i32, info_count: *mut u32) -> i32;
+        fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+        static mach_task_self_: u32;
+    }
+    const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+    let (mut count, mut info, mut info_count) = (0u32, std::ptr::null_mut::<i32>(), 0u32);
+    if unsafe { host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &mut count, &mut info, &mut info_count) } != 0 || info.is_null() {
+        return vec![[0; 4]; logical_cpus() as usize];
+    }
+    // Mach's ticks are 100 a second too: user, system, idle, nice per CPU.
+    let words = unsafe { std::slice::from_raw_parts(info, info_count as usize) };
+    let out = words.chunks(4).take(count as usize).map(|c| [c[0] as u32 as u64, c[1] as u32 as u64, c[2] as u32 as u64, c[3] as u32 as u64]).collect();
+    unsafe { vm_deallocate(mach_task_self_, info as usize, info_count as usize * 4) };
+    out
+}
+
 pub fn loadavg() -> [f64; 3] {
     let mut loads = [0f64; 3];
     unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
