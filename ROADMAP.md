@@ -371,8 +371,11 @@ from a static Linux binary.
     KosmicKrisp in a helper process. Frames are linear textures over shm,
     offered as LINEAR linux-dmabuf buffers: the shell's zero-copy `wl_shm`
     path. A split driver (KosmicKrisp in the guest, its Metal calls
-    remoted) is the fallback if Venus's overhead shows. First step: Venus
-    over vtest, which needs nothing from the runtime.
+    remoted) is the fallback if Venus's overhead shows. Step 1 done
+    (2026-11-14, `gpu/vtest.sh`): Venus over vtest on the Mac, Linux
+    `vulkaninfo`, `vkcube` and dEQP-VK (1899 of 1900 that run pass) under
+    macwl-run, and GLES through Zink; Zink says only GL 2.1 and GLES 2.0
+    until KosmicKrisp has transform feedback (4.6 and 3.2 by override).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with

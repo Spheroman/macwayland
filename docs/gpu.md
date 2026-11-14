@@ -1,7 +1,8 @@
 # GPU: Vulkan through Venus, GL through Zink
 
-Status: design (2026-11-14). ROADMAP item 11. Nothing built or measured
-yet; costs below are estimates from measured ones (`docs/processes.md`,
+Status: step 1 done (2026-11-14, below): Linux Vulkan and GLES programs
+under macwl-run draw on the Mac's GPU through Venus over vtest. ROADMAP
+item 11. Costs below are still estimates from measured ones (`docs/processes.md`,
 `docs/mn-threads.md`, `docs/d3dmetal-proton.md`). Worked out with a
 second model as design partner, against Mesa main (`c9ce420e`,
 2026-11-14) and upstream virglrenderer (`01637fc`, 2026-11-11).
@@ -166,7 +167,8 @@ Venus and Mesa's DRM WSI use:
 ### `macwl-gpu`: the helper
 
 virglrenderer's render server and its Venus renderer, linked with
-KosmicKrisp (Mesa 26.2+, Vulkan 1.4 conformant, macOS 26+ and Metal 4).
+KosmicKrisp (Mesa 26.2+, Vulkan 1.4 conformant, macOS 26+ and Metal 4;
+geometry shaders only from Mesa main, step 1).
 Upstream virglrenderer already has what macOS needs:
 
 - workers are `posix_spawn`'d per context, never forked (`render_worker.c`:
@@ -307,12 +309,11 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
 
 ## Risks
 
-1. Zink over Venus over KosmicKrisp: which GL version, and how correct.
-   Decides Firefox, GTK 4 and Gazebo.
-2. virglrenderer's macOS support: young; its dmabuf assumptions; the vtest
-   server isn't built without vrend and needs `memfd_create` (port it, or
-   if that's more than a day, skip to the render server and a minimal
-   node).
+1. Zink over Venus over KosmicKrisp: GL 2.1 and GLES 2.0 without
+   transform feedback in KosmicKrisp (step 1); 4.6 and 3.2 by override,
+   correctness beyond gears untested. Decides Firefox, GTK 4 and Gazebo.
+2. virglrenderer's macOS support: young; its dmabuf assumptions (the vtest
+   port was small: step 1).
 3. The memory layout: the image hole, and Metal with many NoCopy buffers.
 4. Linear textures as render targets on a tile-based GPU (no lossless
    compression); a blit to linear may be faster.
@@ -356,6 +357,69 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
    `MTLSharedEvent` ordering.
 5. **Apps**: GTK 4's GL renderer, Firefox with WebRender on GL, Gazebo
    (GL, then `--render-engine-api-backend vulkan`), DXVK.
+
+## Step 1, 2026-11-14
+
+Venus over vtest, no runtime work but a fix. `gpu/vtest.sh SOCKET` builds
+and runs the Mac side; the guest is stock nixpkgs Mesa 26.2.6 for
+aarch64-linux (`VN_DEBUG=vtest`, `VTEST_SOCKET_NAME`, its `virtio` ICD).
+
+- **The port** (`gpu/virglrenderer-macos-vtest.patch`, on virglrenderer
+  `01637fc`): ~40 lines. vtest builds with Venus alone (upstream wants
+  vrend); its shm comes from `os_create_anonymous_file` (a POSIX shm
+  object, sized at creation: macOS sizes one only once); and an eventfd is
+  a FIFO opened read-write and unlinked, one fd that's written, polled and
+  passed to the client as an eventfd is (vtest reports no timelines
+  without one, and Venus refuses a renderer without timelines). Venus and
+  the render server built on macOS as they are.
+- **KosmicKrisp**: nixpkgs' macOS Mesa builds it (26.2.6: Vulkan 1.4,
+  conformance 1.4.3.2 on the M5 Pro), but without geometry shaders; Mesa
+  main (`c9ce420`) has them, built by `gpu/kosmickrisp-main.nix`. Neither
+  has `VK_EXT_transform_feedback` (main fills in its properties but
+  doesn't advertise it).
+- **The runtime**: a Unix socket path the guest gives can grow past
+  macOS's 104 bytes on its way to the host's (Linux allows 108). Such a
+  path now goes through a short alias of its directory, a symlink in
+  `/tmp/macwl-UID/s/` (macOS has no public `bindat`/`connectat`), and
+  reads back as the guest's (test `a_unix_socket_path_longer_than_macos_allows`).
+- **Vulkan**: `vulkaninfo` in the guest sees "Virtio-GPU Venus (Apple M5
+  Pro)", Vulkan 1.4; Venus passes on all KosmicKrisp's device extensions
+  but the host-memory, Metal and fd ones it handles itself. `vkcube`
+  draws right in the headless compositor (through the software WSI path:
+  a copy into `wl_shm`, as expected without the dma-buf extensions).
+- **dEQP-VK** (vulkan-cts 1.4.6.1, 3882 cases: smoke, info, memory
+  allocation, compute, basic synchronization, simple and instanced draws,
+  a slice of the monolithic pipeline tests): 1899 pass, 1 fails, 1982
+  not supported. The failure is `info.device_memory_properties`:
+  virglrenderer's memory-type spoof puts its host-visible type, which
+  isn't DEVICE_LOCAL, in the DEVICE_LOCAL heap; it wants a heap of its
+  own (a fix for virglrenderer). Not supported: D24S8 (no such format on
+  Apple GPUs; 1044), `vertexInputDynamicState` (440), DRM format
+  modifiers (184, the WSI gap), and extensions KosmicKrisp lacks.
+- **GL**: Zink loads on Venus and says **GL 2.1 and GLES 2.0**: GL 3.0 and
+  GLES 3.0 need transform feedback (`max_stream_output_buffers`,
+  `zink_screen.c`), and KosmicKrisp has none. Its GLSL level is 460, and
+  with `MESA_GL_VERSION_OVERRIDE=4.6 MESA_GLES_VERSION_OVERRIDE=3.2` it
+  says GL 4.6 core and GLES 3.2; `es2gears_wayland` draws right through
+  Zink on the compositor. Custom border colours need
+  `MESA_KK_EXPERIMENTAL=custom_border`.
+- **Not measured yet**: the frame rate. In the headless compositor every
+  frame waited ~213 ms for its frame callback: the test compositor (a
+  debug build writing each frame as a 7 MB PPM) set the pace, not the GPU
+  path. Step 3 measures it.
+
+So against step 1's criteria: Vulkan 1.4 (pass); the dEQP-VK subset 99.9%
+of what runs (pass); Zink GL 3.3 core and GLES 3.0 (fail without an
+override: transform feedback); a GLES client's pixels (pass); an image
+bound to type 1 (not reached by these cases).
+
+**Transform feedback is the gap that matters.** Firefox (WebRender: GL 3.1
+or GLES 3.0), GTK 4 (GL 3.2 or GLES 3.0) and Ogre2 (GL 3.3) need the
+version but don't use transform feedback, so the override gets them
+going; a real fix is `VK_EXT_transform_feedback` in KosmicKrisp, which
+already runs geometry shaders as compute (Honeykrisp, Asahi's Vulkan
+driver whose geometry code KosmicKrisp shares, does transform feedback
+the same way). Upstream work, and the next thing worth doing for GL.
 
 ## Sources
 
