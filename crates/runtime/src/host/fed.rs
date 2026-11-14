@@ -95,12 +95,17 @@ const ASK_WITHIN: Duration = Duration::from_secs(2);
 /// sessions) that have members there or beyond, the pids (ranges,
 /// `[start, end)`) that are processes and threads there or beyond, and
 /// the terminals whose job control is there or beyond: each pty's
-/// session and foreground group (-1 for none).
+/// session and foreground group (-1 for none); and for orphaned groups,
+/// the groups that have a member there or beyond whose parent is in
+/// another group of its session (`linked`), and those with a member
+/// stopped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Reach {
     pub groups: BTreeSet<(i64, i64)>,
     pub pids: BTreeSet<(i64, i64)>,
     pub ttys: BTreeMap<u32, (i64, i64)>,
+    pub linked: BTreeSet<i64>,
+    pub stopped: BTreeSet<i64>,
 }
 
 impl Reach {
@@ -115,6 +120,12 @@ impl Reach {
         for (&n, &(sid, pgrp)) in &self.ttys {
             e.u64(n as u64).i64(sid).i64(pgrp);
         }
+        for set in [&self.linked, &self.stopped] {
+            e.u64(set.len() as u64);
+            for &g in set {
+                e.i64(g);
+            }
+        }
     }
 
     fn decode(d: &mut Decoder) -> Result<Reach, Truncated> {
@@ -126,6 +137,11 @@ impl Reach {
         }
         for _ in 0..d.count(24)? {
             r.ttys.insert(d.u64()? as u32, (d.i64()?, d.i64()?));
+        }
+        for set in [&mut r.linked, &mut r.stopped] {
+            for _ in 0..d.count(8)? {
+                set.insert(d.i64()?);
+            }
         }
         Ok(r)
     }
@@ -140,6 +156,8 @@ impl Reach {
         for (&n, &t) in &other.ttys {
             self.ttys.entry(n).or_insert(t);
         }
+        self.linked.extend(other.linked.iter().copied());
+        self.stopped.extend(other.stopped.iter().copied());
     }
 }
 
@@ -438,6 +456,17 @@ impl Table {
         self.peers().iter().any(|p| p.reaches_group_in(pgid, sid))
     }
 
+    /// Whether group `pgid` is orphaned (with `s` this host's table, held),
+    /// not counting process `ignore`: here, and in every linked host.
+    pub(super) fn orphaned(&self, s: &super::State, pgid: i64, ignore: i64) -> bool {
+        super::orphaned(s, pgid, ignore) && !self.peers().iter().any(|p| p.reach.lock().unwrap_or_else(|e| e.into_inner()).linked.contains(&pgid))
+    }
+
+    /// Whether a member of group `pgid` in a linked host is stopped.
+    pub(super) fn stopped_elsewhere(&self, pgid: i64) -> bool {
+        self.peers().iter().any(|p| p.reach.lock().unwrap_or_else(|e| e.into_inner()).stopped.contains(&pgid))
+    }
+
     /// Whether this host is linked to one but `except`.
     pub(super) fn has_peers(&self, except: Option<&Arc<Peer>>) -> bool {
         self.peers().iter().any(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)))
@@ -548,10 +577,21 @@ impl Table {
     /// What this host reaches itself: the groups of its processes, and its
     /// pid ranges and the pids it has from elsewhere (its moved first
     /// process). Moved processes' stand-ins don't count: their hosts say.
-    fn own_reach(&self) -> Reach {
+    fn own_reach(&self, for_parent_host: bool) -> Reach {
         let mut r = Reach::default();
         r.pids.extend(self.pids.ranges());
         let s = self.state();
+        // A group linked by a moved process's parent in the host it came
+        // from isn't that host's to hear of from here: it's its own.
+        let groups: BTreeSet<i64> = s.procs.values().map(|e| e.pgid).collect();
+        for g in groups {
+            if super::linked(&s, g, 0, !for_parent_host) {
+                r.linked.insert(g);
+            }
+            if super::has_stopped(&s, g) {
+                r.stopped.insert(g);
+            }
+        }
         for (&n, t) in &s.ttys {
             if let Some(sid) = t.sid {
                 r.ttys.insert(n, (sid, t.pgrp.unwrap_or(-1)));
@@ -577,9 +617,11 @@ impl Table {
         if peers.is_empty() {
             return;
         }
-        let own = self.own_reach();
+        let parent = self.parent_peer.get();
+        let (own, own_for_parent) = (self.own_reach(false), parent.map(|_| self.own_reach(true)));
         for p in &peers {
-            let mut r = own.clone();
+            let is_parent = parent.is_some_and(|x| Arc::ptr_eq(x, p));
+            let mut r = if is_parent { own_for_parent.clone().unwrap_or_default() } else { own.clone() };
             for q in peers.iter().filter(|q| !Arc::ptr_eq(q, p)) {
                 r.extend(&q.reach.lock().unwrap_or_else(|e| e.into_inner()));
             }
@@ -889,6 +931,8 @@ fn from_parent_host(table: Weak<Table>, peer: Arc<Peer>, sock: UnixStream) {
                 {
                     e.ppid = ppid;
                 }
+                // Its group may have lost its link.
+                table.advertise();
             }
             _ => {}
         }

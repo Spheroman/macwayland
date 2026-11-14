@@ -726,7 +726,7 @@ impl Table {
         if sig != SIGSTOP {
             let s = self.state();
             if let Some(e) = s.procs.get(&proc.abi.pid)
-                && orphaned(&s, e.pgid, 0)
+                && self.orphaned(&s, e.pgid, 0)
             {
                 return;
             }
@@ -746,6 +746,8 @@ impl Table {
         }
         // So does the shell of a client standing in for it.
         self.tell_client(proc.abi.pid, || serve::Event::Stopped(proc.abi.pid, sig));
+        // Linked hosts hear of a stopped member of its group.
+        self.advertise();
     }
 
     /// Tell the client standing in for `pid`, if one does, of what
@@ -770,6 +772,7 @@ impl Table {
             self.child_changed(proc.abi.pid, CONTINUED, CLD_CONTINUED, SIGCONT as i32);
         }
         self.tell_client(proc.abi.pid, || serve::Event::Continued(proc.abi.pid));
+        self.advertise();
     }
 
     /// Child `pid` stopped or continued: `wait` can report `status`, and its
@@ -1171,6 +1174,7 @@ impl Table {
                     relay.first_stopped();
                 }
                 self.tell_client(pid, || serve::Event::Stopped(pid, sig));
+                self.advertise();
             }
             Change::Continued => {
                 {
@@ -1182,6 +1186,7 @@ impl Table {
                 }
                 self.child_changed(pid, CONTINUED, CLD_CONTINUED, SIGCONT as i32);
                 self.tell_client(pid, || serve::Event::Continued(pid));
+                self.advertise();
             }
             Change::Ended { status, user_ns, sys_ns } => {
                 let (cpu, comm) = {
@@ -1391,17 +1396,28 @@ impl Table {
     }
 }
 
-/// Whether process group `pgid` is orphaned, not counting process `ignore`
-/// (Linux's `will_become_orphaned_pgrp`): none of its members that are
-/// running has a parent in another group of the same session, who could
-/// continue it if it stopped. Init isn't such a parent; the Mac shell a
-/// relayed first process stands in for is.
+/// Whether process group `pgid` is orphaned here, not counting process
+/// `ignore` (Linux's `will_become_orphaned_pgrp`): none of its members
+/// that are running has a parent in another group of the same session,
+/// who could continue it if it stopped. Init isn't such a parent; the Mac
+/// shell a relayed first process stands in for is, and so is a moved
+/// process's parent in the host it came from. (Linked hosts' members:
+/// [`Table::orphaned`].)
 fn orphaned(s: &State, pgid: i64, ignore: i64) -> bool {
-    !s.procs.iter().any(|(&pid, e)| {
+    !linked(s, pgid, ignore, true)
+}
+
+/// Whether a running member of group `pgid` here (but `ignore`) has a
+/// parent in another group of its session: here, the Mac shell of a
+/// relayed process, or (`via_parent_host`) in the host it moved from.
+fn linked(s: &State, pgid: i64, ignore: i64, via_parent_host: bool) -> bool {
+    s.procs.iter().any(|(&pid, e)| {
         e.pgid == pgid
             && pid != ignore
             && matches!(e.kind, Kind::Local(_) | Kind::StandIn { .. })
-            && (e.mac_parent || e.remote_parent || (e.ppid != 1 && s.procs.get(&e.ppid).is_some_and(|parent| parent.pgid != pgid && parent.sid == e.sid)))
+            && (e.mac_parent
+                || (via_parent_host && e.remote_parent && e.ppid != 1)
+                || (e.ppid != 1 && s.procs.get(&e.ppid).is_some_and(|parent| parent.pgid != pgid && parent.sid == e.sid)))
     })
 }
 
@@ -1733,7 +1749,7 @@ impl Kernel for TableKernel {
         }
         let sig = if op == TtyOp::Read { linux_abi::syscall::tty::SIGTTIN } else { linux_abi::syscall::tty::SIGTTOU };
         let ignored = p.blocks_or_ignores(t, sig);
-        let orphaned = orphaned(&table.state(), pgid, 0);
+        let orphaned = table.orphaned(&table.state(), pgid, 0);
         match linux_abi::syscall::tty::background(op, tostop, ignored, orphaned)? {
             None => Ok(true),
             // Its whole group stops; the call is made again once it's
@@ -2279,7 +2295,7 @@ impl Table {
         groups.sort_unstable();
         groups.dedup();
         for g in groups {
-            if orphaned(&s, g, pid) && has_stopped(&s, g) {
+            if table.orphaned(&s, g, pid) && (has_stopped(&s, g) || table.stopped_elsewhere(g)) {
                 hangups.extend([(g, SIGHUP), (g, SIGCONT)]);
             }
         }
