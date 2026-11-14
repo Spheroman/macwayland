@@ -316,6 +316,24 @@ fn guest_shares_a_buffer_with_a_host_compositor() {
     assert_eq!(exit, Exit::Code(0));
 }
 
+/// A Unix socket at a path too long for macOS's `sun_path` (104 bytes) but
+/// within Linux's (108): bound, connected and named as the guest gave it
+/// (guest/longsock.c), through a short alias of its directory.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn a_unix_socket_path_longer_than_macos_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    // A directory of 90 bytes: the socket's path is 106.
+    let pad = 90 - dir.as_os_str().len() - 1;
+    let deep = dir.join("d".repeat(pad));
+    std::fs::create_dir(&deep).unwrap();
+    assert_eq!(deep.as_os_str().len(), 90);
+    let (exit, out) = run_args(&guest("longsock"), &[b"longsock", deep.as_os_str().as_encoded_bytes()]);
+    assert_eq!(String::from_utf8_lossy(&out), "longsock ok\n");
+    assert_eq!(exit, Exit::Code(0));
+}
+
 /// B2: the unmodified Rust Wayland client, built for Linux, opens a window on
 /// macwl-compositor (running here on a thread) and its frames arrive intact.
 #[test]
