@@ -1799,6 +1799,28 @@ fn job_control_across_hosts() {
     assert!(st.success(), "{st:?}: {}", String::from_utf8_lossy(&seen));
 }
 
+/// What a process takes along as it moves to a host of its own (see
+/// guest/moved.c): its pending signals, its thread's and its process's;
+/// and its eventfd, timerfd, epoll set, signalfd and inotify instance,
+/// made again in the new host in their state (and the same without moving,
+/// where a signalfd reads a signal `raise` sent its thread); and
+/// `getpgid`/`getsid` of its parent, in the host it came from.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn a_move_keeps_pending_signals_and_kqueue_fds() {
+    let path = format!("{}/../../target/guest/moved", env!("CARGO_MANIFEST_DIR"));
+    let path = std::fs::canonicalize(path).expect("run scripts/build-guest.sh first");
+    for (test, stay) in [("pending", false), ("fds", false), ("fds", true), ("ids", false)] {
+        let mut cmd = macwl_run();
+        if stay {
+            cmd.env("MACWL_ENV_MOVED_STAY", "1");
+        }
+        let out = cmd.arg(&path).arg(test).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("moved {test} ok\n"), "{test} (stay {stay}): stderr {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success());
+    }
+}
+
 /// A moved process's host dying ends it in its parent's eyes as killed by
 /// SIGKILL (docs/processes.md, step 9, "A host's failure").
 #[test]
@@ -1807,7 +1829,10 @@ fn a_moved_hosts_death_is_a_sigkill() {
     use std::io::Read;
     let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
     let cu = std::path::Path::new(&linux_package("coreutils")).join("bin");
-    let script = format!("MACWL_NEW_HOST=1 {}/sleep 30; echo died $?", cu.display());
+    // A command line of this run's alone: other tests' moved processes are
+    // in the listing too.
+    let sleep = format!("sleep 30.{}", std::process::id());
+    let script = format!("MACWL_NEW_HOST=1 {}/{sleep}; echo died $?", cu.display());
     let mut child = macwl_run().arg(&bash).arg("-c").arg(&script).stdout(std::process::Stdio::piped()).spawn().unwrap();
     // The moved process's host, from the listing: the stand-in's mark.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1816,7 +1841,7 @@ fn a_moved_hosts_death_is_a_sigkill() {
         let listing = String::from_utf8_lossy(&out.stdout).into_owned();
         let found = listing
             .lines()
-            .filter(|l| l.ends_with("sleep 30"))
+            .filter(|l| l.ends_with(&sleep))
             .find_map(|l| l.split_whitespace().nth(8)?.strip_suffix('@')?.parse().ok());
         if let Some(pid) = found {
             break pid;
