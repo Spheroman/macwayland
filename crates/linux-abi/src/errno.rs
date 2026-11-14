@@ -77,6 +77,10 @@ pub const ECANCELED: i64 = 125;
 /// such values, ERESTARTSYS and friends.)
 pub const PARK: i64 = 600;
 pub const OFFLOAD: i64 = 601;
+/// The core's own result, never the guest's: a worker moved the process to
+/// a host of its own as it exec'd (docs/processes.md, step 9), and its
+/// tasks are to end here.
+pub const MOVED: i64 = 602;
 
 /// Translate a Darwin errno (as from `io::Error::raw_os_error`) to Linux.
 pub fn from_darwin(e: i32) -> i64 {

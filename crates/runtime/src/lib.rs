@@ -625,6 +625,8 @@ fn run_task<'scope, 'env>(
     };
     // Back from a call a worker made: it returns, as a call on the CPU does.
     let mut first = match after {
+        // A worker moved the process to another host (its execve).
+        Some((_, _, ret)) if ret == -linux_abi::errno::MOVED => Some(Next::StandIn),
         Some((nr, arg0, ret)) => finish_call(vcpu, &space, process, thread, nr, arg0, ret)?,
         None => None,
     };
@@ -718,11 +720,11 @@ fn run_task<'scope, 'env>(
 /// mappings, and signals delivered (a handler with SA_RESTART restarts an
 /// interrupted call). Some if that ends the process.
 fn finish_call(vcpu: &mut Vcpu, space: &Space, process: &Process, thread: &mut Thread, nr: u64, arg0: u64, ret: i64) -> Result<Option<Next>, Error> {
-    // The core's own codes (PARK, OFFLOAD) never reach the guest: one that
+    // The core's own codes (PARK, OFFLOAD, MOVED) never reach the guest: one that
     // got this far is a runtime bug. Say so, and give the guest an EINTR it
     // can retry, not an errno no C library expects (glibc aborts on one
     // from a futex wait).
-    let ret = if ret == -linux_abi::errno::PARK || ret == -linux_abi::errno::OFFLOAD {
+    let ret = if ret == -linux_abi::errno::PARK || ret == -linux_abi::errno::OFFLOAD || ret == -linux_abi::errno::MOVED {
         eprintln!("macwl-run: internal result {} from {} (pid {}, tid {}) reached the guest; EINTR instead", -ret, linux_abi::nr::name(nr), process.pid, thread.tid);
         -linux_abi::errno::EINTR
     } else {
@@ -776,6 +778,13 @@ fn run_worker<'scope, 'env>(sh: &'scope Host<'env>, scope: &'scope Scope<'scope,
             };
             let ret = match action {
                 Action::Return(ret) => ret,
+                // An execve that moves the process to a host of its own,
+                // made here rather than hold a CPU (see system_call): back
+                // on one, its tasks end.
+                Action::Exec(exec) if sh.table.moves(&exec) => match sh.table.move_to_host(&proc, thread, &exec) {
+                    Ok(()) => -linux_abi::errno::MOVED,
+                    Err(e) => -e,
+                },
                 // Only calls that return come here (see may_block).
                 other => {
                     eprintln!("macwl-run: worker: {} gave {other:?}", linux_abi::nr::name(nr));
@@ -1327,10 +1336,17 @@ fn system_call<'scope, 'env>(
             // A program set to have a host of its own: this process moves
             // there, and stands in for itself here (docs/processes.md,
             // step 9); if it can't, execve says why.
-            Action::Exec(exec) if sh.table.moves(&exec) => match sh.table.move_to_host(proc, thread, &exec) {
-                Ok(()) => return Ok(Some(Next::StandIn)),
-                Err(e) => -e,
-            },
+            Action::Exec(exec) if sh.table.moves(&exec) => {
+                // The hand-off waits for the new host to start (~4 ms):
+                // with others waiting for this CPU, a worker makes it.
+                if sh.sched.others_waiting() {
+                    return Ok(Some(Next::Blocked(nr, args)));
+                }
+                match sh.table.move_to_host(proc, thread, &exec) {
+                    Ok(()) => return Ok(Some(Next::StandIn)),
+                    Err(e) => -e,
+                }
+            }
             Action::Exec(exec) => {
                 profile::mark("exec: loading");
                 let argv: Vec<&[u8]> = exec.argv.iter().map(Vec::as_slice).collect();
