@@ -245,7 +245,7 @@ fn addr_to_host<M: GuestMemory + ?Sized>(p: &Process, mem: &M, addr: u64, len: u
                 // bind creates the last component, connect follows it.
                 match p.fs.resolve(&p.fds, crate::abi::at::FDCWD as u64, &path[..end], true)?.target {
                     Target::Host(h) => h.into_bytes(),
-                    Target::Proc(_) | Target::Shm(_) => return Err(errno::ECONNREFUSED),
+                    Target::Proc(_) | Target::Shm(_) | Target::Dev(_) => return Err(errno::ECONNREFUSED),
                 }
             };
             // Darwin's sun_path holds 104 bytes, NUL included.

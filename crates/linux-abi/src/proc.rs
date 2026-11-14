@@ -252,7 +252,7 @@ fn fd_link(p: &Process, fd: u64) -> Result<Vec<u8>, i64> {
 fn host_of(p: &Process, guest: &[u8]) -> Result<std::ffi::CString, i64> {
     match p.fs.resolve(&p.fds, crate::abi::at::FDCWD as u64, guest, true)?.target {
         Target::Host(h) => Ok(h),
-        Target::Proc(_) | Target::Shm(_) => Err(errno::ELOOP),
+        Target::Proc(_) | Target::Shm(_) | Target::Dev(_) => Err(errno::ELOOP),
     }
 }
 

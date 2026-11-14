@@ -125,6 +125,8 @@ pub enum FileKind {
     /// A pidfd for this pid: its host fd reads as ready once the process
     /// has ended (see `syscall::pidfd`).
     PidFd(i64),
+    /// The GPU's render node (see `crate::drm`).
+    Drm(std::sync::Arc<crate::drm::node::Node>),
 }
 
 /// One fd an epoll instance watches.
@@ -419,6 +421,9 @@ pub enum Target {
     Proc(Vec<u8>),
     /// `/dev/shm/<name>`: a shared memory object ([`crate::shm`]), by name.
     Shm(Vec<u8>),
+    /// The render node and its sysfs ([`crate::drm::vfs`]), by its path in
+    /// that tree (links followed as asked).
+    Dev(Vec<u8>),
 }
 
 /// A resolved guest path: the guest's view (absolute, symlinks followed as
@@ -673,7 +678,7 @@ impl Filesystem {
             joined.extend_from_slice(path);
             let guest = normalize(&joined);
             let special = |prefix: &[u8]| guest == prefix || guest.strip_prefix(prefix).is_some_and(|r| r.starts_with(b"/"));
-            if !special(b"/proc") && !special(b"/dev") {
+            if !special(b"/proc") && !special(b"/dev") && !(crate::drm::enabled() && special(b"/sys")) {
                 return Ok(Resolved { target: Target::Host(cstring(joined)?), guest });
             }
         }
@@ -689,7 +694,7 @@ impl Filesystem {
                 }
                 _ => done.push(c),
             }
-            if let Some(special) = self.special(&done, &todo)? {
+            if let Some(special) = self.special(&done, &todo, follow)? {
                 return Ok(special);
             }
             // `/dev` is the host's whatever the root holds; the next
@@ -733,7 +738,7 @@ impl Filesystem {
     }
 
     /// `/proc` and `/dev` handling, checked as each component is resolved.
-    fn special(&self, done: &[Vec<u8>], todo: &VecDeque<Vec<u8>>) -> Result<Option<Resolved>, i64> {
+    fn special(&self, done: &[Vec<u8>], todo: &VecDeque<Vec<u8>>, follow: bool) -> Result<Option<Resolved>, i64> {
         // The rest of the path, taken lexically (nothing below is a guest symlink).
         let rest = || {
             let mut parts: Vec<Vec<u8>> = Vec::new();
@@ -749,6 +754,14 @@ impl Filesystem {
             parts
         };
         let resolved = |guest: Vec<Vec<u8>>, target| Ok(Some(Resolved { guest: join(&guest), target }));
+        // The GPU's render node and sysfs, while it's on.
+        let in_tree = matches!(done, [s] if s == b"sys") || matches!(done, [d, r] if d == b"dev" && r == b"dri");
+        if in_tree && crate::drm::enabled() {
+            let mut guest = done.to_vec();
+            guest.extend(rest());
+            let path = join(&guest);
+            return resolved(guest, Target::Dev(crate::drm::vfs::resolve(&path, follow)?));
+        }
         match done {
             [d] if d == b"dev" && todo.is_empty() => resolved(done.to_vec(), Target::Host(cstring(b"/dev".to_vec())?)),
             [p] if p == b"proc" => {

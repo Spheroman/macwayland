@@ -7,6 +7,7 @@
 //! `ppoll`, and sockets with fd passing — see ROADMAP.md for what's missing.
 
 pub mod abi;
+pub mod drm;
 pub mod errno;
 pub mod fs;
 pub mod host_threads;
