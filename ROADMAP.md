@@ -12,7 +12,7 @@ native Mac app, measured.
    │  Linux system calls
    ▼
  Track B runtime: Hypervisor.framework, no guest kernel      ← static apps work
-   │  Wayland over a host unix socket; buffers as IOSurfaces
+   │  Wayland over a host unix socket; buffers in shared memory
    ▼
  macwl-compositor (Smithay, wayland_frontend only)           ← working
    │  committed buffers
@@ -364,9 +364,15 @@ from a static Linux binary.
    `SCM_CREDENTIALS`, `sendmmsg`/`recvmmsg`, autobind, host socket paths over
    103 bytes (Darwin's `sun_path` limit).
 10. **B2 milestone.** Done (see Done).
-11. **GPU.** Split Vulkan driver (state tracking and shader translation in the
-    guest, Metal calls on the host) over a shared-memory command ring, plus
-    IOSurface swapchains.
+11. **GPU.** Design (2026-11-14, `docs/gpu.md`): stock Mesa in the guest
+    (Venus for Vulkan, Zink on it for GL and GLES), the runtime as a
+    virtio-gpu kernel driver (`/dev/dri/renderD128`: blobs as shm objects,
+    timeline syncobjs, sync_files), and virglrenderer's Venus renderer on
+    KosmicKrisp in a helper process. Frames are linear textures over shm,
+    offered as LINEAR linux-dmabuf buffers: the shell's zero-copy `wl_shm`
+    path. A split driver (KosmicKrisp in the guest, its Metal calls
+    remoted) is the fallback if Venus's overhead shows. First step: Venus
+    over vtest, which needs nothing from the runtime.
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with
