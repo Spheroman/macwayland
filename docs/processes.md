@@ -1736,18 +1736,43 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
      `jobs`, `fg`, Ctrl-C; a moved background job that `ps -ef` in foot's
      host lists; `kill %1` (143).
 
-   Step 9 done (2026-11-10). Not done, left for when something needs it:
-   orphaned groups counted across hosts (a group whose only link to its
-   session is in another host is taken as orphaned there, as
-   `remote_parent` keeps it from being for the moved process itself);
-   `getpgid`/`getsid` of another host's process; another host's process's
-   memory in `/proc`; pending signals across the move (dropped, as an
-   exec would keep them); epoll sets, eventfds, timerfds, signalfds,
-   inotify instances and pidfds across the move (not passed); a
-   `tcsetpgrp` that arrives at the terminal's host by two links (the
-   first answers). The hand-off blocks the exec'ing thread's CPU for the
-   ~4 ms the new host takes to start. Runtime 39 unit + 63 integration,
-   linux-abi 73.
+   Step 9 done (2026-11-10). What it left, done since (2026-11-14):
+   - **Orphaned groups across hosts.** `Reach` also carries the groups
+     with a member whose parent is in another group of its session
+     (`linked`) and those with a stopped member. A moved process's link to
+     its parent isn't told back to its parent's host (split horizon: it's
+     that host's own, and the two would otherwise vouch for each other
+     after the parent went). The job-control stop, the terminal's
+     background check and `kill_orphaned_pgrp` count them. Test
+     `orphaned_groups_across_hosts`: a moved bash's child, with no link in
+     its host, reading the terminal from a background job linked in
+     bash's: the job stops (SIGTTIN), where before the read got EIO.
+   - **`getpgid`/`getsid`** of another host's process ask its host.
+   - **`/proc` of another host's process's state and memory**
+     (`proc::RemoteView`: `exe`, `cwd`, `task/`, `fd/` and its links,
+     `environ`, `maps`, `mounts`, made there, `ASK_VIEW`). Test
+     `proc_of_another_hosts_process`.
+   - **Pending signals across the move**, the process's and the exec'ing
+     thread's, as an exec keeps them; **epoll sets, eventfds, timerfds,
+     signalfds and inotify instances** made again in the new host in their
+     state (an epoll set's interests, an eventfd's count, a timer's time
+     left, a signalfd's mask, inotify's watches; not events unread). Found
+     on the way: a signalfd didn't read a signal for the reading thread (a
+     `raise` of a blocked signal), only the process's; it reads the
+     thread's, then the process's, as Linux. Test
+     `a_move_keeps_pending_signals_and_kqueue_fds` (`guest/moved.c`).
+   - **The hand-off off the CPU**: with others waiting for the CPU, a
+     moving `execve` goes to a worker, which makes the move (`MOVED`, the
+     core's own result). Test `a_move_under_load_is_a_workers`.
+   - Not a step 9 matter, found on the way: a guest reading a named FIFO
+     never saw its last writer go (on macOS neither kqueue nor `poll` says
+     so); such a read blocks in the host now, which does. Test
+     `a_fifos_end_ends_a_read`.
+
+   Still not: pidfds across the move (a pidfd here is the table's, for a
+   pid that's usually the old host's); a `tcsetpgrp` that arrives at the
+   terminal's host by two links (in a tree, only one leads there, unless
+   a reach is stale). Runtime 39 unit + 68 integration, linux-abi 73.
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's
