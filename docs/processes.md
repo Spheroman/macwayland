@@ -1769,10 +1769,26 @@ Each ships with all tests passing; 1:1 mode was the default until step 6.
      so); such a read blocks in the host now, which does. Test
      `a_fifos_end_ends_a_read`.
 
-   Still not: pidfds across the move (a pidfd here is the table's, for a
-   pid that's usually the old host's); a `tcsetpgrp` that arrives at the
-   terminal's host by two links (in a tree, only one leads there, unless
-   a reach is stale). Runtime 39 unit + 68 integration, linux-abi 73.
+   - **pidfds across hosts** (2026-11-14). A pidfd is the near end of a
+     socket pair whose far end the process's entry holds, closed as it
+     ends. `pidfd_open` of another host's process hands the far end to
+     the link that reaches its pid (`ASK_PIDFD`, the fd passed with it,
+     asked on along the tree), whose entry holds it; and a moving
+     process's pidfds go with its fds, tagged with their pids, so they
+     still read as ready when their processes end wherever they are.
+     `pidfd_send_signal` is a `kill`, routed as any. Not `waitid(P_PIDFD)`
+     of a child left in the old host (a moved process has no children in
+     its new one: ECHILD, as `wait`), nor `pidfd_getfd` of another host's
+     process (ESRCH). Test `a_move_keeps_pending_signals_and_kqueue_fds`
+     (`moved pidfd`: a sibling's pidfd taken along, a signal through it,
+     ready once it ends; `pidfd_open` of the parent in the old host).
+   - **`tcsetpgrp` more than one link from the terminal's host.** A host
+     asked to change another host's terminal answered ENOTTY rather than
+     asking on, so a bash two hosts from its terminal couldn't do job
+     control. It asks the link that reaches the terminal, never the one
+     the request came on (in a tree, only one leads there). Test
+     `job_control_across_hosts`, now with an interactive bash moved on
+     to a third host: Ctrl-Z, `fg`, Ctrl-C.
 
 **1:1 as a fallback**: yes during the transition (the flag, steps 3–6), not
 permanently: isolation is a host of its own, which needs none of 1:1's

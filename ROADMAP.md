@@ -525,21 +525,13 @@ from a static Linux binary.
     which the runtime owns, so the kernel would need them mirrored.
     Subsystems that stand alone (a filesystem driver, a network stack)
     fit best. An idea, not started (2026-10-26).
-15. **Per-process `/proc`.** `ps`, `top`, `htop`, `pgrep`, `kill -l` by name
-    and the like list `/proc` and read `/proc/<pid>/{stat,status,cmdline,
-    comm,environ}`, plus the system-wide `/proc/stat` (CPU time) for
-    percentages. Today only the process's own `/proc/self` (or its own pid)
-    exists. Guest pids are host pids, so the macOS process list
-    (`proc_listpids`, `proc_pidinfo`, `KERN_PROCARGS2`) can supply them:
-    state, parent, process group, session, tty, CPU times, memory sizes,
-    start time, and argv/environment where macOS allows reading them (only
-    for our own user's processes). Open questions: whether to list only
-    guest processes (macwl-run ones, with their Linux names and argv rather
-    than `macwl-run --fork-child`) or every Mac process too; and keeping
-    `readdir` on `/proc` cheap enough for `top` refreshing every second.
-    With many processes in one VM (`docs/processes.md`, "Visibility") the
-    host's process table becomes the source instead, macOS's list only
-    filling in for Mac programs: the open questions go with it.
+15. **Per-process `/proc`.** Done (`docs/processes.md` steps 3 and 9f): the
+    host's process table is the source, so `/proc/<pid>` exists for every
+    process of the session, its own host's and (asked along the links)
+    other hosts', with `stat`, `status`, `cmdline`, `comm`, `environ`,
+    `maps`, `fd/`, `task/` and the system-wide `/proc/stat`. procps `ps`,
+    `top`, `pgrep` and `pidof` work; Mac programs show as their stand-ins.
+    `macwl-run --ps` (`--all`: every host) lists them from the Mac side.
 
 ## Compositor and shell: remaining work
 
@@ -569,9 +561,11 @@ Needed whichever way Linux apps end up running.
   hotspot. Off every window, the arrow. `MACWL_CURSOR_SHAPE=0` leaves
   cursor-shape-v1 out, so clients draw their own (to test that path).
   Not yet: animated cursors (a cursor surface's frame callbacks).
-- What's drawn: a window and its popups, as layers the host composites
-  (the window copied in, popups blended over it). Subsurfaces aren't drawn
-  yet (GTK 4's GL renderer, video players use them).
+- What's drawn: a window, its subsurfaces and its popups, as layers the
+  host composites (the window copied in, the rest blended over it).
+  Subsurface trees are composited with Smithay's rules: synchronized ones
+  apply with their parent's commit, stacked above or below it
+  (`crates/compositor/tests/subsurfaces.rs`; Firefox draws into one).
 - Buffers drawn where they are (2026-11-01): the shell maps each client's
   `wl_shm` pool itself, wraps it as an `MTLBuffer`
   (`newBufferWithBytesNoCopy`) and draws from a linear texture over the
