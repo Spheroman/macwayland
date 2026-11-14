@@ -1,0 +1,1309 @@
+From 1602fafc350e670fa432cb7bbcf2edc9e53d0a52 Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 14:14:00 -0800
+Subject: [PATCH] kk: Implement VK_EXT_transform_feedback
+
+Metal has no transform feedback, so KosmicKrisp captures it the way
+Honeykrisp does, on top of the poly geometry shader emulation: the GS
+rasterization VS writes the captured outputs to the buffers, after the GS
+count pass, its prefix sum and the pre-GS program place each primitive and
+advance the buffer offsets and stream queries.
+
+A pipeline capturing transform feedback from its VS or TES gets a
+passthrough GS (poly_nir_passthrough_gs) built for its topology class at
+pipeline creation; its VS owns it and binds it. Adjacency draws through it
+are unrolled to lists first.
+
+The rasterized outputs of a GS that captures are trimmed to the components
+the FS reads, since Metal wants their types to match and linking keeps the
+captured components. A stage feeding a GS no longer lowers its clip and cull
+distances for Metal, the GS rasterization VS does.
+
+Exposes transformFeedback, geometryStreams, queries
+(VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) and
+vkCmdDrawIndirectByteCountEXT, with the limits the physical device already
+reported. transformFeedbackStreamsLinesTriangles stays false.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/libkk/kk_geometry.cl          |  16 +-
+ src/kosmickrisp/libkk/kk_query.cl             |  24 ++
+ src/kosmickrisp/libkk/kk_query.h              |   6 +
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  23 ++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 224 +++++++++-
+ src/kosmickrisp/vulkan/kk_device.c            |  13 +
+ src/kosmickrisp/vulkan/kk_device.h            |   9 +
+ .../vulkan/kk_nir_lower_descriptors.c         |  10 +
+ src/kosmickrisp/vulkan/kk_physical_device.c   |   5 +
+ src/kosmickrisp/vulkan/kk_private.h           |   2 +
+ src/kosmickrisp/vulkan/kk_query_pool.c        |  66 ++-
+ src/kosmickrisp/vulkan/kk_shader.c            | 381 +++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |  16 +
+ 13 files changed, 753 insertions(+), 42 deletions(-)
+
+diff --git a/src/kosmickrisp/libkk/kk_geometry.cl b/src/kosmickrisp/libkk/kk_geometry.cl
+index dd102f9dacc..65c37306908 100644
+--- a/src/kosmickrisp/libkk/kk_geometry.cl
++++ b/src/kosmickrisp/libkk/kk_geometry.cl
+@@ -49,11 +49,21 @@ libkk_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
+                         global struct poly_geometry_params *p,
+                         global struct poly_heap *heap, uint64_t vs_outputs,
+                         uint32_t index_size_B, uint32_t index_buffer_range_el,
+-                        uint32_t prim, uint32_t max_indices,
+-                        enum poly_gs_shape shape)
++                        uint32_t prim, uint32_t is_prefix_summing,
++                        uint32_t max_indices, enum poly_gs_shape shape)
+ {
+    /* Prefix summing only serves transform feedback */
+    poly_gs_setup_indirect(index_buffer, draw, vp, p, heap, vs_outputs,
+                           index_size_B, index_buffer_range_el, prim,
+-                          false /* is_prefix_summing */, max_indices, shape);
++                          is_prefix_summing, max_indices, shape);
++}
++
++/* Prefix sums the GS count buffer, one workgroup per count word, so the GS
++ * knows where each input primitive's transform feedback output goes */
++KERNEL(1024)
++libkk_prefix_sum_geom(constant struct poly_geometry_params *p)
++{
++   local uint scratch[32];
++   poly_prefix_sum(scratch, p->count_buffer, p->input_primitives,
++                   p->count_buffer_stride / 4, cl_group_id.x, 1024);
+ }
+diff --git a/src/kosmickrisp/libkk/kk_query.cl b/src/kosmickrisp/libkk/kk_query.cl
+index 3c2e5f056ec..7295c75cd67 100644
+--- a/src/kosmickrisp/libkk/kk_query.cl
++++ b/src/kosmickrisp/libkk/kk_query.cl
+@@ -94,3 +94,27 @@ libkk_copy_queries(global uint32_t *availability, global uint64_t *results,
+       vk_write_query(dst, reports_per_query, flags, available);
+    }
+ }
++
++KERNEL(4)
++libkk_copy_xfb_counters(constant struct libkk_xfb_counter_copy *push)
++{
++   unsigned i = cl_local_id.x;
++
++   *(push->dest[i]) = push->src[i] ? *(push->src[i]) : 0;
++}
++
++/* vkCmdDrawIndirectByteCountEXT: the vertex count is the bytes captured past
++ * counter_offset over the vertex stride */
++KERNEL(1)
++libkk_draw_from_byte_count(global uint32_t *out_draw,
++                           constant uint32_t *byte_count, uint32_t counter_offset,
++                           uint32_t vertex_stride, uint32_t instance_count,
++                           uint32_t first_instance)
++{
++   int32_t bytes = (int32_t)(*byte_count) - (int32_t)counter_offset;
++
++   out_draw[0] = max(bytes, 0) / vertex_stride; /* vertexCount */
++   out_draw[1] = instance_count;
++   out_draw[2] = 0;                           /* firstVertex */
++   out_draw[3] = first_instance;
++}
+diff --git a/src/kosmickrisp/libkk/kk_query.h b/src/kosmickrisp/libkk/kk_query.h
+index 56887401c5b..039d4645a1f 100644
+--- a/src/kosmickrisp/libkk/kk_query.h
++++ b/src/kosmickrisp/libkk/kk_query.h
+@@ -16,6 +16,12 @@ struct libkk_imm_write {
+    uint32_t value;
+ };
+ 
++/* Transform feedback counters: dest[i] = src[i] ? *src[i] : 0 */
++struct libkk_xfb_counter_copy {
++   DEVICE(uint32_t) dest[4];
++   DEVICE(uint32_t) src[4];
++};
++
+ #define LIBKK_QUERY_UNAVAILABLE (uint64_t)((int64_t)-1)
+ 
+ #endif /* KK_QUERY_H */
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 20e585458b8..d022e2303d7 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -93,6 +93,13 @@ struct kk_per_draw_data {
+ 
+    /* Whether the last vertex of a primitive is its provoking vertex */
+    uint32_t provoking_last;
++
++   /* Vertex stream rasterized when a GS writes several */
++   uint32_t rasterization_stream;
++
++   /* Scratch the GS transform feedback and query program writes statistics
++    * KK does not expose to */
++   uint64_t scratch_addr;
+ };
+ 
+ struct kk_attachment {
+@@ -192,8 +199,24 @@ struct kk_graphics_state {
+       struct kk_addr_range index;
+       uint32_t index_count;
+       uint32_t instance_count;
++      /* Primitive the GS reads: the draw's after any unrolling, or the
++       * tessellator's */
++      enum mesa_prim in_prim;
+    } gs;
+ 
++   /* Transform feedback, captured by the GS (or a passthrough GS standing in
++    * for one) */
++   struct {
++      struct kk_addr_range buffers[KK_MAX_XFB_BUFFERS];
++      /* Byte offsets into each buffer, a pool allocation of 4 uint32_t
++       * reserved at the first vkCmdBeginTransformFeedbackEXT */
++      uint64_t offsets;
++      bool active;
++      /* Report of the active VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT
++       * query of each stream, or 0 */
++      uint64_t query[KK_MAX_XFB_STREAMS];
++   } xfb;
++
+    /* Needed by vk_command_buffer::dynamic_graphics_state */
+    struct vk_vertex_input_state _dynamic_vi;
+    struct vk_sample_locations_state _dynamic_sl;
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 126f94bc100..8f65cbe6bb3 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1267,14 +1267,11 @@ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
+    memcpy(out, &args, sizeof(args));
+ }
+ 
++/* Set by kk_draw before the per-draw data is uploaded */
+ static enum mesa_prim
+ kk_gs_in_prim(struct kk_cmd_buffer *cmd)
+ {
+-   if (cmd->state.shaders[MESA_SHADER_TESS_EVAL])
+-      return cmd->state.gfx.tess.prim;
+-
+-   return vk_topology_to_mesa(
+-      cmd->vk.dynamic_graphics_state.ia.primitive_topology);
++   return cmd->state.gfx.gs.in_prim;
+ }
+ 
+ static uint64_t
+@@ -1298,6 +1295,39 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+    struct poly_geometry_params params;
+    poly_geometry_params_init(&params, mode, wg_size);
+ 
++   /* Transform feedback writes the bound buffers while active. Otherwise its
++    * offsets read zeroes, so no output fits, and its counters go to
++    * scratch. */
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   uint64_t zeroes = dev->xfb_scratch->gpu;
++   uint64_t scratch = zeroes + KK_XFB_ZERO_SIZE;
++   for (uint32_t i = 0; i < KK_MAX_XFB_BUFFERS; ++i) {
++      if (gfx->xfb.active) {
++         params.xfb_base_original[i] = gfx->xfb.buffers[i].addr;
++         params.xfb_size[i] = gfx->xfb.buffers[i].range;
++         params.xfb_offs_ptrs[i] = gfx->xfb.offsets + i * sizeof(uint32_t);
++      } else {
++         params.xfb_base_original[i] = zeroes;
++         params.xfb_size[i] = 0u;
++         params.xfb_offs_ptrs[i] = zeroes;
++      }
++   }
++
++   /* A VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT query counts primitives
++    * written then primitives needed */
++   for (uint32_t i = 0; i < KK_MAX_XFB_STREAMS; ++i) {
++      uint64_t q = gfx->xfb.query[i];
++      params.xfb_prims_generated_counter[i] = q ? q : scratch;
++      params.prims_generated_counter[i] = q ? q + sizeof(uint64_t) : scratch;
++      params.xfb_overflow[i] = scratch;
++   }
++   params.xfb_any_overflow = scratch;
++
++   /* The GS count pass writes each input primitive's counts, prefix summed
++    * for transform feedback */
++   params.count_buffer_stride = gs->info.gs.count_words * sizeof(uint32_t);
++   bool prefix_sum = gs->info.gs.prefix_sum;
++
+    if (indirect) {
+       /* The indirect setup kernel writes the draw and allocates from the
+        * heap, including the index buffer */
+@@ -1307,6 +1337,11 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+       poly_geometry_params_set_draw(&params, mode, shape, max_indices,
+                                     draw->grid.size.x, draw->grid.size.y);
+ 
++      uint32_t count_size_B =
++         params.input_primitives * params.count_buffer_stride;
++      if (prefix_sum && count_size_B)
++         params.count_buffer = kk_pool_alloc(cmd, count_size_B, 4).gpu;
++
+       gfx->gs.index_count = params.draw.index_count;
+       gfx->gs.instance_count = params.draw.instance_count;
+ 
+@@ -2060,6 +2095,9 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
+          &cmd->vk.dynamic_graphics_state;
+       gfx->per_draw_data.provoking_last =
+          dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
++      gfx->per_draw_data.rasterization_stream = dyn->rs.rasterization_stream;
++      gfx->per_draw_data.scratch_addr =
++         kk_cmd_buffer_device(cmd)->xfb_scratch->gpu + KK_XFB_ZERO_SIZE;
+    }
+ 
+    struct kk_ptr shader_data_gpu =
+@@ -2236,6 +2274,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+          .heap = kk_heap(cmd),
+          .vs_outputs = (tes ? tes : vs)->info.outputs_written,
+          .prim = mode,
++         .is_prefix_summing = gs->info.gs.prefix_sum,
+          .max_indices = gs->info.gs.max_indices,
+          .shape = shape,
+       };
+@@ -2277,6 +2316,31 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+       enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
+    kk_dispatch_compute(enc, grid_vs, local_size);
+ 
++   /* Transform feedback places each primitive's output from the GS's counts
++    * and the buffers' offsets, which the pre-GS program advances past the
++    * draw's output, counting queries, before the GS runs. */
++   if (gs->info.gs.xfb) {
++      if (gs->info.gs.count_words) {
++         mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
++                                          MTL_STAGE_DISPATCH);
++         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_count);
++         kk_dispatch_compute(enc, grid_gs, local_size);
++      }
++
++      if (gs->info.gs.prefix_sum) {
++         libkk_prefix_sum_geom(
++            cmd, kk_grid_1d(1024u * gs->info.gs.count_words), true,
++            geometry_params);
++         enc = cs_get_compute(cmd);
++      }
++
++      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
++                                       MTL_STAGE_DISPATCH);
++      mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.pre_gs);
++      mtl_dispatch_threads(enc, (struct mtl_size){1, 1, 1},
++                           (struct mtl_size){1, 1, 1});
++   }
++
+    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+    mtl_compute_set_pipeline_state(
+@@ -2368,10 +2432,15 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
+       return;
+ 
+-   if (!geom && mesa_prim_has_adjacency(data->prim) &&
+-       !kk_unroll_adjacency(cmd, data))
++   /* A passthrough GS reads the topology its pipeline was built for, which
++    * has no adjacency */
++   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
++   if ((!geom || gs->is_passthrough) && !tess &&
++       mesa_prim_has_adjacency(data->prim) && !kk_unroll_adjacency(cmd, data))
+       return;
+ 
++   cmd->state.gfx.gs.in_prim = tess ? cmd->state.gfx.tess.prim : data->prim;
++
+    /* Patch lists do not restart, so only a GS fed by the input assembly needs
+     * its restarts unrolled. The unroll kernel reads an indirect draw. */
+    bool gs_restart = geom && !tess && data->restart && data->indexed;
+@@ -2710,3 +2779,144 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
+ 
+    kk_draw(cmd, &data);
+ }
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
++                               uint32_t instanceCount, uint32_t firstInstance,
++                               VkBuffer counterBuffer,
++                               VkDeviceSize counterBufferOffset,
++                               uint32_t counterOffset, uint32_t vertexStride)
++{
++   if (instanceCount == 0)
++      return;
++
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   VK_FROM_HANDLE(kk_buffer, counter, counterBuffer);
++
++   const struct vk_dynamic_graphics_state *dyn =
++      &cmd->vk.dynamic_graphics_state;
++
++   /* The GPU turns the byte count into an indirect draw */
++   struct kk_ptr draw = kk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4u);
++   if (unlikely(!draw.gpu))
++      return;
++
++   libkk_draw_from_byte_count(
++      cmd, kk_grid_1d(1), true, draw.gpu,
++      vk_buffer_address(&counter->vk, counterBufferOffset), counterOffset,
++      vertexStride, instanceCount, firstInstance);
++
++   struct kk_draw_command data = {
++      .prim = vk_topology_to_mesa(dyn->ia.primitive_topology),
++      .upload_mask = build_per_draw_upload_mask(cmd),
++      .indirect = true,
++      .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
++      .predicate_op[0] = cmd->state.cond_render.inverted
++                            ? KK_PREDICATE_EQ_ZERO
++                            : KK_PREDICATE_NEQ_ZERO,
++      .draw_count = 1,
++      .predicate_addr[0] = cmd->state.cond_render.address,
++      .indirect_command.addr = draw.gpu,
++      .indirect_command.stride = sizeof(VkDrawIndirectCommand),
++   };
++
++   kk_draw(cmd, &data);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
++                                      uint32_t firstBinding,
++                                      uint32_t bindingCount,
++                                      const VkBuffer *pBuffers,
++                                      const VkDeviceSize *pOffsets,
++                                      const VkDeviceSize *pSizes)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++
++   for (uint32_t i = 0; i < bindingCount; i++) {
++      VK_FROM_HANDLE(kk_buffer, buffer, pBuffers[i]);
++      uint64_t size = pSizes ? pSizes[i] : VK_WHOLE_SIZE;
++
++      gfx->xfb.buffers[firstBinding + i] =
++         kk_buffer_addr_range(buffer, pOffsets[i], size);
++   }
++}
++
++/* Begin loads the offsets in bytes into each buffer from the counter buffers
++ * given, zero otherwise; end stores them to the counter buffers given */
++static void
++kk_begin_end_xfb(struct kk_cmd_buffer *cmd, uint32_t firstCounterBuffer,
++                 uint32_t counterBufferCount, const VkBuffer *pCounterBuffers,
++                 const VkDeviceSize *pCounterBufferOffsets, bool begin)
++{
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++
++   gfx->xfb.active = begin;
++
++   if (!gfx->xfb.offsets) {
++      gfx->xfb.offsets =
++         kk_pool_alloc(cmd, KK_MAX_XFB_BUFFERS * sizeof(uint32_t), 4).gpu;
++      if (!gfx->xfb.offsets)
++         return;
++   }
++
++   struct libkk_xfb_counter_copy params = {};
++   uint32_t copies = 0;
++
++   if (begin) {
++      for (copies = 0; copies < KK_MAX_XFB_BUFFERS; ++copies)
++         params.dest[copies] = gfx->xfb.offsets + copies * sizeof(uint32_t);
++   }
++
++   if (pCounterBuffers == NULL)
++      counterBufferCount = 0;
++
++   for (uint32_t i = 0; i < counterBufferCount; ++i) {
++      if (pCounterBuffers[i] == VK_NULL_HANDLE)
++         continue;
++
++      VK_FROM_HANDLE(kk_buffer, buffer, pCounterBuffers[i]);
++      uint64_t offset = pCounterBufferOffsets ? pCounterBufferOffsets[i] : 0;
++      uint64_t addr = vk_buffer_address(&buffer->vk, offset);
++      uint32_t idx = firstCounterBuffer + i;
++
++      if (begin) {
++         params.src[idx] = addr;
++      } else {
++         params.dest[copies] = addr;
++         params.src[copies] = gfx->xfb.offsets + idx * sizeof(uint32_t);
++         ++copies;
++      }
++   }
++
++   if (copies > 0) {
++      uint64_t push = kk_pool_upload(cmd, &params, sizeof(params), 8).gpu;
++      if (push)
++         libkk_copy_xfb_counters(cmd, kk_grid_1d(copies), true, push);
++   }
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
++                                uint32_t firstCounterBuffer,
++                                uint32_t counterBufferCount,
++                                const VkBuffer *pCounterBuffers,
++                                const VkDeviceSize *pCounterBufferOffsets)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   kk_begin_end_xfb(cmd, firstCounterBuffer, counterBufferCount,
++                    pCounterBuffers, pCounterBufferOffsets, true);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
++                              uint32_t firstCounterBuffer,
++                              uint32_t counterBufferCount,
++                              const VkBuffer *pCounterBuffers,
++                              const VkDeviceSize *pCounterBufferOffsets)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   kk_begin_end_xfb(cmd, firstCounterBuffer, counterBufferCount,
++                    pCounterBuffers, pCounterBufferOffsets, false);
++}
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 17e9f10e6fa..972b9380efe 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -331,6 +331,14 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   /* Transform feedback points unbound buffers' offsets at the zeroed start
++    * and counters nothing reads at the rest */
++   result = kk_alloc_bo(dev, &dev->vk.base, KK_XFB_SCRATCH_SIZE, 16,
++                        &dev->xfb_scratch);
++   if (result != VK_SUCCESS)
++      goto fail_lib;
++   memset(dev->xfb_scratch->cpu, 0, KK_XFB_SCRATCH_SIZE);
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -340,6 +348,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    return VK_SUCCESS;
+ 
++fail_lib:
++   kk_device_finish_lib(dev);
+ fail_sampler_heap:
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ fail_query_table:
+@@ -387,6 +397,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    if (dev->heap)
+       kk_destroy_bo(dev, dev->heap);
+ 
++   if (dev->xfb_scratch)
++      kk_destroy_bo(dev, dev->xfb_scratch);
++
+    if (dev->has_queue) {
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 5c964f96643..c2413b29db2 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -105,9 +105,18 @@ struct kk_device {
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
+ 
++   /* Zeroes, then scratch, for transform feedback, see KK_XFB_ZERO_SIZE */
++   struct kk_bo *xfb_scratch;
++
+    bool gpu_capture_active;
+ };
+ 
++/* kk_device::xfb_scratch holds KK_XFB_ZERO_SIZE bytes that stay zero, the
++ * offsets of unbound transform feedback buffers, then scratch for counters
++ * nothing reads */
++#define KK_XFB_ZERO_SIZE    64u
++#define KK_XFB_SCRATCH_SIZE 4096u
++
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ 
+ static inline struct kk_physical_device *
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 3b54ffddd8e..d6e9ac07638 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -825,6 +825,16 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+       return lower_sysval_to_per_draw(b, intrin, geometry_params);
+    case nir_intrinsic_load_provoking_last:
+       return lower_sysval_to_per_draw(b, intrin, provoking_last);
++   case nir_intrinsic_load_rasterization_stream:
++      return lower_sysval_to_per_draw(b, intrin, rasterization_stream);
++   case nir_intrinsic_load_stat_query_address_poly:
++      /* KK exposes no pipeline statistics, the pre-GS program writes them to
++       * scratch */
++      return lower_sysval_to_per_draw(b, intrin, scratch_addr);
++   case nir_intrinsic_ro_to_rw_poly:
++      b->cursor = nir_instr_remove(&intrin->instr);
++      nir_def_rewrite_uses(&intrin->def, intrin->src[0].ssa);
++      return true;
+    case nir_intrinsic_load_index_size_poly:
+       return lower_sysval_to_per_draw(b, intrin, index_size);
+    case nir_intrinsic_load_first_vertex:
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index a0b882cb973..8c1036b4625 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -202,6 +202,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_shader_replicated_composites = true,
+       .EXT_shader_subgroup_ballot = true,
+       .EXT_shader_subgroup_vote = true,
++      .EXT_transform_feedback = true,
+ #ifdef KK_USE_WSI_PLATFORM
+       .EXT_swapchain_maintenance1 = true,
+ #endif
+@@ -236,6 +237,7 @@ kk_get_device_features(
+       .fragmentStoresAndAtomics = true,
+       .fullDrawIndexUint32 = true,
+       .geometryShader = true,
++      .geometryStreams = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+       .inheritedQueries = true,
+@@ -513,6 +515,9 @@ kk_get_device_features(
+       .shaderSharedFloat32AtomicAdd =
+          info->msl_version >= MTL_LANGUAGE_VERSION_4_1,
+ 
++      /* VK_EXT_transform_feedback */
++      .transformFeedback = true,
++
+       /* VK_EXT_vertex_attribute_robustness */
+       .vertexAttributeRobustness = true,
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_private.h b/src/kosmickrisp/vulkan/kk_private.h
+index b58bd219e20..0c6db6bab95 100644
+--- a/src/kosmickrisp/vulkan/kk_private.h
++++ b/src/kosmickrisp/vulkan/kk_private.h
+@@ -33,6 +33,8 @@
+    (KK_MAX_PUSH_DESCRIPTORS * KK_MAX_DESCRIPTOR_SIZE)
+ #define KK_SSBO_BOUNDS_CHECK_ALIGNMENT 4
+ #define KK_MAX_MULTIVIEW_VIEW_COUNT    32
++#define KK_MAX_XFB_BUFFERS             4
++#define KK_MAX_XFB_STREAMS             4
+ #define KK_TEXTURE_BUFFER_WIDTH        (1u << 14)
+ #define KK_MAX_OCCLUSION_QUERIES       (32768)
+ #define KK_MIN_SAMPLE_LOCATION         (0.0f)
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index 104d73d7279..83549b36403 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -38,6 +38,9 @@ kk_reports_per_query(struct kk_query_pool *pool)
+    case VK_QUERY_TYPE_OCCLUSION:
+    case VK_QUERY_TYPE_TIMESTAMP:
+       return 1;
++   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++      /* Primitives written, primitives needed */
++      return 2;
+    default:
+       UNREACHABLE("Unsupported query type");
+    }
+@@ -69,6 +72,13 @@ kk_pool_is_ts(struct kk_query_pool *pool)
+    return pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
+ }
+ 
++/* Only occlusion queries remap their index, into the device's heap */
++static inline uint32_t
++kk_query_report_index(struct kk_query_pool *pool, uint32_t query)
++{
++   return kk_pool_is_oq(pool) ? kk_pool_index_ptr(pool)[query] : query;
++}
++
+ static uint64_t
+ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
+                      uint32_t query)
+@@ -76,9 +86,8 @@ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
+    struct kk_bo *bo =
+       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+ 
+-   uint32_t index =
+-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
+-   return bo->gpu + pool->query_start + (index * sizeof(uint64_t));
++   uint32_t index = kk_query_report_index(pool, query);
++   return bo->gpu + pool->query_start + (index * pool->query_stride);
+ }
+ 
+ static uint64_t
+@@ -95,11 +104,10 @@ kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
+    struct kk_bo *bo =
+       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+ 
+-   uint64_t *queries = (uint64_t *)(bo->cpu + pool->query_start);
+-   uint32_t index =
+-      kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
++   uint32_t index = kk_query_report_index(pool, query);
+ 
+-   return (struct kk_query_report *)&queries[index];
++   return (struct kk_query_report *)(bo->cpu + pool->query_start +
++                                     index * pool->query_stride);
+ }
+ 
+ static void
+@@ -268,7 +276,7 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
+    struct libkk_reset_query_args info = {
+       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
+       .results = results_bo->gpu + pool->query_start,
+-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
++      .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
+ 
+       .first_query = first_index,
+       .reports_per_query = kk_reports_per_query(pool),
+@@ -433,11 +441,20 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+-kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+-                 uint32_t query, VkQueryControlFlags flags)
++kk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
++                           uint32_t query, VkQueryControlFlags flags,
++                           uint32_t index)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
++
++   /* The GS's pre-GS program adds to the report of the stream's query */
++   if (pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      cmd->state.gfx.xfb.query[index] =
++         kk_query_report_addr(kk_cmd_buffer_device(cmd), pool, query);
++      return;
++   }
++
+    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
+                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
+                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
+@@ -447,13 +464,25 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+-kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+-               uint32_t query)
++kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
++                 uint32_t query, VkQueryControlFlags flags)
++{
++   kk_CmdBeginQueryIndexedEXT(commandBuffer, queryPool, query, flags, 0);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
++                         uint32_t query, uint32_t index)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+-   cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
+-   cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
++
++   if (pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
++      cmd->state.gfx.xfb.query[index] = 0;
++   } else {
++      cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
++      cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
++   }
+ 
+    /* Make the query available. The Vulkan spec states:
+     * If queries are used while executing a render pass instance that has
+@@ -474,6 +503,13 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+    }
+ }
+ 
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
++               uint32_t query)
++{
++   kk_CmdEndQueryIndexedEXT(commandBuffer, queryPool, query, 0);
++}
++
+ static bool
+ kk_query_is_available(struct kk_device *dev, struct kk_query_pool *pool,
+                       uint32_t query)
+@@ -599,7 +635,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
+    struct libkk_copy_queries_args args = {
+       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
+       .results = results_bo->gpu + pool->query_start,
+-      .oq_index = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu + pool->index_start,
++      .oq_index = kk_pool_is_oq(pool) ? pool->bo->gpu + pool->index_start : 0u,
+       .dst_addr = pDstRange->address,
+       .dst_stride = pDstRange->stride,
+       .first_query = firstQuery,
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 23343420006..c70589cca0d 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -857,6 +857,17 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+       pipe->gfx.render = NULL;
+       pipe->gfx.ds_handle = NULL;
+ 
++      if (pipe->gfx.gs_count)
++         mtl_release(pipe->gfx.gs_count);
++      if (pipe->gfx.pre_gs)
++         mtl_release(pipe->gfx.pre_gs);
++      pipe->gfx.gs_count = NULL;
++      pipe->gfx.pre_gs = NULL;
++
++      if (shader->xfb_gs)
++         kk_shader_destroy(vk_dev, shader->xfb_gs, pAllocator);
++      shader->xfb_gs = NULL;
++
+       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i)
+          mtl_release(pipe->gfx.pre_render[i]);
+ 
+@@ -874,6 +885,10 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+ 
+    ralloc_free((void *)shader->gs_main.entrypoint_name);
+    ralloc_free((void *)shader->gs_main.code);
++   ralloc_free((void *)shader->gs_count.entrypoint_name);
++   ralloc_free((void *)shader->gs_count.code);
++   ralloc_free((void *)shader->pre_gs.entrypoint_name);
++   ralloc_free((void *)shader->pre_gs.code);
+ 
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+@@ -1045,11 +1060,85 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+    ralloc_free(nir);
+ }
+ 
++/* Components of each varying slot the FS reads */
++struct kk_fs_inputs {
++   uint8_t comps[NUM_TOTAL_VARYING_SLOTS];
++};
++
++static bool
++gather_fs_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   struct kk_fs_inputs *in = data;
++   if (intr->intrinsic != nir_intrinsic_load_input &&
++       intr->intrinsic != nir_intrinsic_load_interpolated_input)
++      return false;
++
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   nir_src *offset = nir_get_io_offset_src(intr);
++   unsigned first = sem.location, last = sem.location + sem.num_slots;
++   if (nir_src_is_const(*offset)) {
++      first += nir_src_as_uint(*offset);
++      last = first + 1;
++   }
++
++   unsigned comps = nir_intrinsic_component(intr) + intr->def.num_components;
++   for (unsigned loc = first; loc < MIN2(last, NUM_TOTAL_VARYING_SLOTS); loc++)
++      in->comps[loc] = MAX2(in->comps[loc], comps);
++   return false;
++}
++
++static bool
++trim_rast_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   const struct kk_fs_inputs *in = data;
++   if (intr->intrinsic != nir_intrinsic_store_output)
++      return false;
++
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   if (sem.location < VARYING_SLOT_VAR0 || !nir_src_is_const(intr->src[1]))
++      return false;
++
++   unsigned loc = sem.location + nir_src_as_uint(intr->src[1]);
++   unsigned comps = loc < NUM_TOTAL_VARYING_SLOTS ? in->comps[loc] : 0;
++   unsigned component = nir_intrinsic_component(intr);
++   nir_def *value = intr->src[0].ssa;
++   if (comps == 0 || component + value->num_components <= comps)
++      return false;
++
++   if (component >= comps) {
++      nir_instr_remove(&intr->instr);
++      return true;
++   }
++
++   b->cursor = nir_before_instr(&intr->instr);
++   unsigned keep = comps - component;
++   nir_src_rewrite(&intr->src[0], nir_trim_vector(b, value, keep));
++   intr->num_components = keep;
++   nir_intrinsic_set_write_mask(intr,
++                                nir_intrinsic_write_mask(intr) &
++                                   BITFIELD_MASK(keep));
++   return true;
++}
++
++/* Metal wants the rasterized vertex's outputs typed as the FS reads them.
++ * Linking trims them, but not those transform feedback captures, which a GS
++ * captures before rasterizing. */
++static void
++kk_trim_rast_outputs(nir_shader *rast, const struct kk_fs_inputs *fs_inputs)
++{
++   if (fs_inputs == NULL)
++      return;
++
++   nir_shader_intrinsics_pass(rast, trim_rast_output,
++                              nir_metadata_control_flow, (void *)fs_inputs);
++}
++
+ static VkResult
+ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+                   struct kk_shader *prev_stage,
+                   const struct vk_pipeline_robustness_state *robustness,
+                   const struct vk_graphics_pipeline_state *state,
++                  const struct kk_fs_inputs *fs_inputs,
+                   const VkAllocationCallbacks *pAllocator,
+                   struct kk_shader **shader_out, bool apply_wa19)
+ {
+@@ -1073,8 +1162,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    unsigned num_cull_distances =
+       prev_stage ? prev_stage->info.num_cull_distances : 0;
+    /* A GS lowers clip and cull distances on its rasterization VS instead; the
+-    * stage feeding it has none after linking */
+-   if (stage != MESA_SHADER_GEOMETRY)
++    * stage feeding it passes them in memory as they are */
++   if (stage != MESA_SHADER_GEOMETRY && next_stage != MESA_SHADER_GEOMETRY)
+       msl_nir_lower_clip_cull_distance(nir, num_cull_distances);
+ 
+    /* When using poly to emulate tessellation or GS, the VS and TCS are turned
+@@ -1155,9 +1244,24 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+                &shader->info.gs);
+ 
+       /* Only transform feedback and pipeline statistics need these, and KK
+-       * exposes neither */
+-      ralloc_free(count);
+-      ralloc_free(pre_gs);
++       * exposes no pipeline statistics */
++      if (shader->info.gs.xfb) {
++         /* Counts the GS output of each input primitive, when the GS's counts
++          * are not static, to place it in the buffers */
++         if (count) {
++            count->info.stage = MESA_SHADER_COMPUTE;
++            memset(&count->info.cs, 0, sizeof(count->info.cs));
++            count->xfb_info = NULL;
++            kk_compile_msl(pdev, count, state, &shader->gs_count, apply_wa19);
++         }
++
++         /* Updates the buffer offsets and counts queries before the GS */
++         msl_preprocess_nir(pre_gs);
++         kk_compile_msl(pdev, pre_gs, state, &shader->pre_gs, false);
++      } else {
++         ralloc_free(count);
++         ralloc_free(pre_gs);
++      }
+ 
+       nir->info.stage = MESA_SHADER_COMPUTE;
+       memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+@@ -1171,6 +1275,9 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+        * localize them so msl_optimize_nir turns them into SSA */
+       NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+ 
++      if (shader->info.gs.xfb)
++         kk_trim_rast_outputs(nir, fs_inputs);
++
+       kk_lower_hw_vs(nir, state, shader->info.gs.mode == MESA_PRIM_POINTS);
+       msl_nir_lower_clip_cull_distance(nir, 0);
+       /* Descriptors were lowered with the GS, this lowers the system values
+@@ -1209,7 +1316,8 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+    struct kk_shader *shader = NULL;
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    VkResult result =
+-      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, alloc, &shader, false);
++      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, NULL, alloc, &shader,
++                        false);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -1482,6 +1590,10 @@ gather_graphics_pipeline_create_info(
+ 
+       if (s->info.stage == MESA_SHADER_GEOMETRY) {
+          kk_msl_copy(&vs->gs_main, &s->gs_main);
++         if (s->gs_count.code)
++            kk_msl_copy(&vs->gs_count, &s->gs_count);
++         if (s->pre_gs.code)
++            kk_msl_copy(&vs->pre_gs, &s->pre_gs);
+          gs = s;
+       }
+    }
+@@ -1557,6 +1669,21 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+          &pipe->gfx.pre_render[pipe->gfx.pre_render_count++]);
+       if (result != VK_SUCCESS)
+          return VK_ERROR_INVALID_SHADER_NV;
++
++      if (vs->gs_count.code) {
++         result = kk_compile_compute_pipeline(device, &vs->gs_count,
++                                              KK_POLY_WG_SIZE,
++                                              &pipe->gfx.gs_count);
++         if (result != VK_SUCCESS)
++            return VK_ERROR_INVALID_SHADER_NV;
++      }
++
++      if (vs->pre_gs.code) {
++         result = kk_compile_compute_pipeline(device, &vs->pre_gs, 1u,
++                                              &pipe->gfx.pre_gs);
++         if (result != VK_SUCCESS)
++            return VK_ERROR_INVALID_SHADER_NV;
++      }
+    }
+ 
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+@@ -1692,6 +1819,88 @@ kk_forward_gs_primitive_id(nir_shader *gs, nir_shader *fs)
+    gs->info.outputs_written |= BITFIELD64_BIT(slot);
+ }
+ 
++static bool
++gather_output_layout(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   struct poly_passthrough_gs_key *key = data;
++   if (intr->intrinsic != nir_intrinsic_store_output)
++      return false;
++
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   unsigned loc = sem.location;
++   if (nir_src_is_const(intr->src[1]))
++      loc += nir_src_as_uint(intr->src[1]);
++   if (loc >= NUM_TOTAL_VARYING_SLOTS)
++      return false;
++
++   unsigned comps = nir_intrinsic_component(intr) +
++                    util_last_bit(nir_intrinsic_write_mask(intr));
++   key->output_components[loc] = MAX2(key->output_components[loc], comps);
++   if (key->output_types[loc] == nir_type_invalid)
++      key->output_types[loc] = nir_intrinsic_src_type(intr);
++   return false;
++}
++
++/* Metal has no transform feedback, a GS captures it. When a pipeline captures
++ * it from its VS or TES, a GS that passes their output through stands in. The
++ * shader feeding it is linked to the FS and its IO lowered. */
++static nir_shader *
++kk_build_xfb_passthrough_gs(nir_shader *last, nir_shader *tcs,
++                            const struct vk_graphics_pipeline_state *state)
++{
++   const nir_xfb_info *xfb = last->xfb_info;
++   size_t key_size = poly_passthrough_gs_key_size(xfb->output_count);
++   struct poly_passthrough_gs_key *key = calloc(1, key_size);
++   if (key == NULL)
++      return NULL;
++
++   if (last->info.stage == MESA_SHADER_TESS_EVAL) {
++      bool points = last->info.tess.point_mode ||
++                    (tcs != NULL && tcs->info.tess.point_mode);
++      enum tess_primitive_mode mode = last->info.tess._primitive_mode;
++      if (mode == TESS_PRIMITIVE_UNSPECIFIED && tcs != NULL)
++         mode = tcs->info.tess._primitive_mode;
++
++      key->prim = points                           ? MESA_PRIM_POINTS
++                  : mode == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
++                                                    : MESA_PRIM_TRIANGLES;
++   } else {
++      /* The pipeline's topology names the class, which is all a dynamic one
++       * may change; adjacency draws are unrolled to lists for it */
++      key->prim = u_reduced_prim(
++         vk_topology_to_mesa(state->ia->primitive_topology));
++   }
++
++   key->outputs = last->info.outputs_written;
++   key->clip_distance_array_size = last->info.clip_distance_array_size;
++   key->cull_distance_array_size = last->info.cull_distance_array_size;
++
++   nir_shader_intrinsics_pass(last, gather_output_layout, nir_metadata_all,
++                              key);
++   for (unsigned i = 0; i < NUM_TOTAL_VARYING_SLOTS; i++) {
++      if (key->output_components[i] == 0)
++         key->output_components[i] = 4;
++      if (key->output_types[i] == nir_type_invalid)
++         key->output_types[i] = nir_type_uint32;
++   }
++
++   typed_memcpy(key->xfb_stride, last->info.xfb_stride,
++                ARRAY_SIZE(key->xfb_stride));
++   memcpy(&key->xfb_info, xfb, nir_xfb_info_size(xfb->output_count));
++
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_GEOMETRY, &kk_nir_options, "kk-xfb-passthrough-gs");
++   poly_nir_passthrough_gs(&b, key);
++   free(key);
++
++   nir_shader *gs = b.shader;
++   gs->info.io_lowered = true;
++   gs->info.prev_stage = last->info.stage;
++   gs->info.next_stage = MESA_SHADER_FRAGMENT;
++   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
++   return gs;
++}
++
+ static VkResult
+ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                    struct vk_shader_compile_info *infos,
+@@ -1707,9 +1916,17 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    enum kk_feature_key features = kk_make_feature_key(enabled_features, pdev);
+ 
+    /* Vulkan doesn't enforce a fragment shader to build pipelines. We may need
+-    * to create one. */
+-   nir_shader *nir_shaders[shader_count + 1u];
+-   struct kk_shader *shaders[shader_count + 1u];
++    * to create one, and a passthrough GS for transform feedback. */
++   nir_shader *nir_shaders[shader_count + 2u];
++   struct kk_shader *shaders[shader_count + 2u];
++
++   bool has_gs = false;
++   for (uint32_t i = 0u; i < shader_count; ++i)
++      has_gs |= infos[i].stage == MESA_SHADER_GEOMETRY;
++
++   /* Index of the VS or TES whose transform feedback a passthrough GS
++    * captures, if any */
++   uint32_t xfb_index = UINT32_MAX;
+ 
+    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
+     * optimization. */
+@@ -1723,10 +1940,25 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+          info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                   VK_SHADER_STAGE_GEOMETRY_BIT);
+ 
++      /* And so does the last one before rasterization when it captures
++       * transform feedback, which a GS does for it */
++      if (state && !has_gs && !emulated_stage && nir->xfb_info != NULL &&
++          (nir->info.stage == MESA_SHADER_VERTEX ||
++           nir->info.stage == MESA_SHADER_TESS_EVAL)) {
++         emulated_stage = true;
++         xfb_index = i;
++      }
++
+       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+                    info->set_layout_count, info->set_layouts, state, features);
+ 
++      /* Linking must keep the outputs transform feedback captures */
++      if (nir->xfb_info != NULL) {
++         NIR_PASS(_, nir, nir_opt_constant_folding);
++         NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
++      }
++
+       if (nir->info.stage == MESA_SHADER_VERTEX)
+          vertex_robustness = info->robustness;
+ 
+@@ -1737,10 +1969,12 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+     * require both vertex and fragment, we may need to provide a pass-through
+     * fragment. */
+    uint32_t total_shaders = shader_count;
++   bool generated_fs = false;
+    if (state && infos[shader_count - 1u].stage != MESA_SHADER_FRAGMENT) {
+       nir_shaders[shader_count] =
+          get_empty_nir(dev, MESA_SHADER_FRAGMENT, state, features);
+       total_shaders += 1u;
++      generated_fs = true;
+    }
+ 
+    /* KK_WORKAROUND_19 */
+@@ -1763,11 +1997,46 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
+                          UINT32_MAX, nir_opts, NULL);
+ 
++   /* The passthrough GS goes right after the stage it captures, which now
++    * feeds it */
++   uint32_t xfb_gs_index = UINT32_MAX;
++   if (xfb_index != UINT32_MAX) {
++      nir_shader *last = nir_shaders[xfb_index];
++      nir_shader *tcs = xfb_index > 0 ? nir_shaders[xfb_index - 1u] : NULL;
++      if (tcs && tcs->info.stage != MESA_SHADER_TESS_CTRL)
++         tcs = NULL;
++
++      nir_shader *gs = kk_build_xfb_passthrough_gs(last, tcs, state);
++      if (gs == NULL) {
++         for (uint32_t j = 0; j < total_shaders; j++)
++            ralloc_free(nir_shaders[j]);
++         memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++
++      last->info.next_stage = MESA_SHADER_GEOMETRY;
++      xfb_gs_index = xfb_index + 1u;
++      memmove(&nir_shaders[xfb_gs_index + 1u], &nir_shaders[xfb_gs_index],
++              (total_shaders - xfb_gs_index) * sizeof(nir_shaders[0]));
++      nir_shaders[xfb_gs_index] = gs;
++      total_shaders += 1u;
++
++      apply_wa19 = !(pdev->settings.disabled_workarounds & BITFIELD64_BIT(19));
++   }
++
++   struct kk_fs_inputs fs_inputs = {0};
++   nir_shader *fs = nir_shaders[total_shaders - 1u];
++   bool have_fs = fs->info.stage == MESA_SHADER_FRAGMENT;
++   if (have_fs)
++      nir_shader_intrinsics_pass(fs, gather_fs_input, nir_metadata_all,
++                                 &fs_inputs);
++
+    for (uint32_t i = 0; i < total_shaders; i++) {
+       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
+-      result =
+-         kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
+-                           state, pAllocator, &shaders[i], apply_wa19);
++      result = kk_compile_shader(dev, nir_shaders[i], prev_stage,
++                                 vertex_robustness, state,
++                                 have_fs ? &fs_inputs : NULL, pAllocator,
++                                 &shaders[i], apply_wa19);
+ 
+       if (result != VK_SUCCESS) {
+          /* Clean up all the shaders before this point */
+@@ -1803,8 +2072,22 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       result = kk_compile_graphics_pipeline(dev, shaders[0]);
+ 
+       /* Free generated fragment shader */
+-      if (shader_count != total_shaders)
+-         kk_shader_destroy(&dev->vk, shaders[shader_count], pAllocator);
++      if (generated_fs) {
++         kk_shader_destroy(&dev->vk, shaders[total_shaders - 1u], pAllocator);
++         total_shaders -= 1u;
++      }
++
++      /* The VS holding the pipeline owns the passthrough GS */
++      if (xfb_gs_index != UINT32_MAX) {
++         struct kk_shader *gs = shaders[xfb_gs_index];
++         gs->is_passthrough = true;
++         shaders[0]->xfb_gs = gs;
++         shaders[0]->info.vs.has_xfb_gs = true;
++         memmove(&shaders[xfb_gs_index], &shaders[xfb_gs_index + 1u],
++                 (total_shaders - xfb_gs_index - 1u) * sizeof(shaders[0]));
++         total_shaders -= 1u;
++      }
++      assert(total_shaders == shader_count);
+    }
+ 
+    if (result != VK_SUCCESS) {
+@@ -1842,6 +2125,17 @@ kk_msl_serialize(const struct msl_compile_data *data, struct blob *blob)
+    blob_write_bytes(blob, data->code, code_length);
+ }
+ 
++/* For the GS count pass and pre-GS program, which only transform feedback
++ * needs */
++static void
++kk_msl_serialize_optional(const struct msl_compile_data *data,
++                          struct blob *blob)
++{
++   blob_write_uint8(blob, data->code != NULL);
++   if (data->code != NULL)
++      kk_msl_serialize(data, blob);
++}
++
+ static bool
+ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+                     struct blob *blob)
+@@ -1855,8 +2149,15 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+          kk_msl_serialize(&shader->msl_data[stage], blob);
+       }
+    }
+-   if (kk_has_gs_main(&shader->info))
++   if (kk_has_gs_main(&shader->info)) {
+       kk_msl_serialize(&shader->gs_main, blob);
++      kk_msl_serialize_optional(&shader->gs_count, blob);
++      kk_msl_serialize_optional(&shader->pre_gs, blob);
++   }
++
++   /* The draw needs the passthrough GS's info, its code is in the VS */
++   if (shader->info.stage == MESA_SHADER_VERTEX && shader->info.vs.has_xfb_gs)
++      blob_write_bytes(blob, &shader->xfb_gs->info, sizeof(shader->info));
+ 
+    return !blob->out_of_memory;
+ }
+@@ -1883,6 +2184,17 @@ kk_msl_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++kk_msl_deserialize_optional(struct blob_reader *blob,
++                            struct msl_compile_data *data)
++{
++   if (!blob_read_uint8(blob))
++      return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
++                           : VK_SUCCESS;
++
++   return kk_msl_deserialize(blob, data);
++}
++
+ static VkResult
+ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+                       uint32_t binary_version,
+@@ -1917,10 +2229,32 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+ 
+    if (kk_has_gs_main(&info)) {
+       result = kk_msl_deserialize(blob, &shader->gs_main);
++      if (result == VK_SUCCESS)
++         result = kk_msl_deserialize_optional(blob, &shader->gs_count);
++      if (result == VK_SUCCESS)
++         result = kk_msl_deserialize_optional(blob, &shader->pre_gs);
+       if (result != VK_SUCCESS)
+          goto fail;
+    }
+ 
++   if (info.stage == MESA_SHADER_VERTEX && info.vs.has_xfb_gs) {
++      struct kk_shader *gs =
++         vk_shader_zalloc(&dev->vk, &kk_shader_ops, MESA_SHADER_GEOMETRY,
++                          pAllocator, sizeof(*gs));
++      if (gs == NULL) {
++         result = VK_ERROR_OUT_OF_HOST_MEMORY;
++         goto fail;
++      }
++
++      blob_copy_bytes(blob, &gs->info, sizeof(gs->info));
++      gs->is_passthrough = true;
++      shader->xfb_gs = gs;
++      if (blob->overrun) {
++         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
++         goto fail;
++      }
++   }
++
+    if (info.stage == MESA_SHADER_COMPUTE) {
+       uint32_t local_size_threads = shader->info.cs.local_size.x *
+                                     shader->info.cs.local_size.y *
+@@ -1988,13 +2322,26 @@ kk_cmd_bind_shaders(struct vk_command_buffer *cmd_buffer, uint32_t stage_count,
+    struct kk_cmd_buffer *cmd =
+       container_of(cmd_buffer, struct kk_cmd_buffer, vk);
+ 
++   bool graphics = false;
+    for (uint32_t i = 0; i < stage_count; i++) {
+       struct kk_shader *shader = container_of(shaders[i], struct kk_shader, vk);
+ 
+-      if (stages[i] == MESA_SHADER_COMPUTE || stages[i] == MESA_SHADER_KERNEL)
++      if (stages[i] == MESA_SHADER_COMPUTE || stages[i] == MESA_SHADER_KERNEL) {
+          kk_cmd_bind_compute_shader(cmd, shader);
+-      else
++      } else {
+          kk_cmd_bind_graphics_shader(cmd, stages[i], shader);
++         graphics = true;
++      }
++   }
++
++   /* A pipeline capturing transform feedback without a GS binds the
++    * passthrough GS its VS owns */
++   if (graphics) {
++      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++      struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
++      struct kk_shader *xfb_gs = vs ? vs->xfb_gs : NULL;
++      if ((gs == NULL || gs->is_passthrough) && gs != xfb_gs)
++         kk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, xfb_gs);
+    }
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index b6039438e5c..134673c85d5 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -86,6 +86,9 @@ struct kk_shader_info {
+             uint8_t write_mask;
+          } stencil_front, stencil_back;
+          uint8_t color_attachment_count;
++         /* The pipeline captures transform feedback without a GS: a
++          * passthrough GS (kk_shader::xfb_gs) does instead */
++         bool has_xfb_gs;
+          bool has_ms;
+          bool has_ds;
+          bool has_depth_write;
+@@ -127,6 +130,9 @@ struct kk_pipeline_handles {
+          mtl_compute_pipeline_state *pre_render[4];
+          mtl_depth_stencil_state *ds_handle;
+          uint32_t pre_render_count;
++         /* GS count pass and pre-GS program, for transform feedback */
++         mtl_compute_pipeline_state *gs_count;
++         mtl_compute_pipeline_state *pre_gs;
+       } gfx;
+       mtl_compute_pipeline_state *cs;
+    };
+@@ -146,6 +152,16 @@ struct kk_shader {
+    /* Compute pass of a GS. Its rasterization VS is in
+     * msl_data[MESA_SHADER_GEOMETRY]. */
+    struct msl_compile_data gs_main;
++   /* With transform feedback, the GS count pass (if the GS's counts are not
++    * static) and the pre-GS program, which places each draw's output in the
++    * buffers and counts queries. */
++   struct msl_compile_data gs_count;
++   struct msl_compile_data pre_gs;
++
++   /* A VS holding a pipeline that captures transform feedback without a GS
++    * owns the passthrough GS that captures it, bound with it */
++   struct kk_shader *xfb_gs;
++   bool is_passthrough;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+-- 
+2.55.0
+

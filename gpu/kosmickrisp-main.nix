@@ -15,7 +15,9 @@ in {
     url = "https://gitlab.freedesktop.org/mesa/mesa/-/archive/${rev}/mesa-${rev}.tar.gz";
     hash = "sha256-MJ2nLRjO8UAAOP/0j/RHw9oG271Itw1q8NcKcSh6XGk=";
   };
-  patches = [];
+  # VK_EXT_transform_feedback for KosmicKrisp (ours; Zink needs it for
+  # GL 3.x and GLES 3).
+  patches = [ ./kosmickrisp-transform-feedback.patch ];
   # Options main no longer has.
   mesonFlags = builtins.filter (f: f != clangFlag)
     (map (f: if lib.hasPrefix "-Dvulkan-layers" f then "-Dvulkan-layers=" else f) o.mesonFlags);

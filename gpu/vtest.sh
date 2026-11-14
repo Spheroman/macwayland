@@ -12,9 +12,8 @@
 #   macwl-run vulkaninfo
 #
 # Zink on top: also MACWL_ENV_MESA_LOADER_DRIVER_OVERRIDE=zink (and
-# GALLIUM_DRIVER=zink for EGL's surfaceless platform). KosmicKrisp has no
-# VK_EXT_transform_feedback, so Zink says GL 2.1 and GLES 2.0 unless
-# MESA_GL_VERSION_OVERRIDE / MESA_GLES_VERSION_OVERRIDE say more.
+# GALLIUM_DRIVER=zink for EGL's surfaceless platform): GL 3.3 and GLES 3.1
+# with gpu/kosmickrisp-transform-feedback.patch.
 set -eu
 socket=${1:?usage: gpu/vtest.sh SOCKET}
 here=$(cd "$(dirname "$0")" && pwd)
