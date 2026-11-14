@@ -309,9 +309,9 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
 
 ## Risks
 
-1. Zink over Venus over KosmicKrisp: GL 2.1 and GLES 2.0 without
-   transform feedback in KosmicKrisp (step 1); 4.6 and 3.2 by override,
-   correctness beyond gears untested. Decides Firefox, GTK 4 and Gazebo.
+1. Zink over Venus over KosmicKrisp: GL 3.3 and GLES 3.1 with our
+   transform feedback patch (below; 2.1 and 2.0 without), correctness
+   beyond gears untested. Decides Firefox, GTK 4 and Gazebo.
 2. virglrenderer's macOS support: young; its dmabuf assumptions (the vtest
    port was small: step 1).
 3. The memory layout: the image hole, and Metal with many NoCopy buffers.
@@ -481,6 +481,36 @@ the checklist held.
   100 stalled polls; signalling them on the socket's end, and testing it
   (killing a worker mid-run), is still to do. Also not checked: Zink and
   EGL through the node (step 1 ran them over vtest), GBM.
+
+## Transform feedback in KosmicKrisp, 2026-11-14
+
+`gpu/kosmickrisp-transform-feedback.patch` (ours, on Mesa `c9ce420`,
+applied by `gpu/kosmickrisp-main.nix`; written by a subagent in its own
+Mesa checkout): `VK_EXT_transform_feedback`, captured the way Honeykrisp
+does on top of the shared geometry shader emulation (`src/poly`): the GS
+rasterization vertex function writes the captured outputs, after the GS
+count pass, its prefix sum and the pre-GS program have placed each
+primitive and advanced the buffer offsets and stream queries. A pipeline
+capturing from its VS or TES gets a passthrough GS. Counters, stream
+queries, `vkCmdDrawIndirectByteCountEXT` and `geometryStreams` work;
+`transformFeedbackStreamsLinesTriangles` doesn't, nor do primitive counts
+for draws that don't capture.
+
+- dEQP-VK `transform_feedback.simple.*` and `primitive_restart`: 4983
+  pass, 0 fail (2912 not supported: mostly more than 4 streams);
+  `fuzz.*`: 830 pass, 0 fail; a smoke set (geometry, draws, clipping,
+  tessellation, queries): as without the patch.
+- **Zink now says GL 3.3 core and GLES 3.1 without an override**,
+  through the render node (was 2.1 and 2.0): enough for GTK 4, WebRender
+  and Ogre2. What holds it below GL 4.0 and GLES 3.2 now is
+  `ARB_texture_buffer_object_rgb32`: RGB32 texel buffers, which
+  KosmicKrisp enables only on Apple GPU family 11 (`kk_format.c`); the M5
+  Pro is family 10.
+- Upstreamable with work: a reviewer would likely want the passthrough GS
+  made at draw time (as Honeykrisp does) rather than at pipeline creation,
+  the output trimming (a Metal linking gap) fixed in `nir_opt_varyings`,
+  and primitive counting for draws that don't capture. Any capturing
+  pipeline takes the compute VS + GS path, even with capture off.
 
 ## Sources
 

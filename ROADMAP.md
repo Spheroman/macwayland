@@ -380,7 +380,9 @@ from a static Linux binary.
     driver, `/dev/dri/renderD128` with its sysfs, timeline syncobjs and
     sync files, virglrenderer `dlopen`ed in proxy mode; Venus runs through
     it as on Linux (`vkcube`, the dEQP-VK subset, fences ~40–70 µs over
-    native a round trip).
+    native a round trip). Transform feedback in KosmicKrisp (our patch,
+    `gpu/kosmickrisp-transform-feedback.patch`): Zink says GL 3.3 and
+    GLES 3.1 without an override.
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with
