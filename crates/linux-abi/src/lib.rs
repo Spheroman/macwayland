@@ -20,4 +20,5 @@ pub mod syscall;
 pub mod wire;
 
 pub use memory::{Fault, GuestMemory, Region, SharedKey};
+pub use proc::RemoteView;
 pub use syscall::{dispatch, Action, Process};

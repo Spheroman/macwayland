@@ -254,6 +254,11 @@ pub trait Kernel: Send + Sync + std::fmt::Debug {
     fn with_process(&self, _p: &Process, _pid: i64, _f: &mut dyn FnMut(&Process, &dyn crate::memory::GuestMemory)) -> Result<(), i64> {
         Err(errno::ESRCH)
     }
+    /// Process `pid` as its host shows it in `/proc`, if it's in another
+    /// host (step 9): ESRCH otherwise.
+    fn remote_view(&self, _p: &Process, _pid: i64) -> Result<crate::proc::RemoteView, i64> {
+        Err(errno::ESRCH)
+    }
     /// Whether a child can share its parent's address space without vfork
     /// (`clone` with CLONE_VM alone): when the processes share a VM.
     fn shares_memory(&self) -> bool {

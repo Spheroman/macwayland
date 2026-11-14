@@ -107,6 +107,62 @@ fn with<T>(p: &Process, mem: &dyn GuestMemory, pid: i64, f: impl FnOnce(&Process
     out.ok_or(errno::ESRCH)
 }
 
+/// What `/proc/<pid>` shows of a process this kernel doesn't run (one in
+/// another host, docs/processes.md step 9), from its host: what would
+/// otherwise be read from its state and memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteView {
+    pub exe: Vec<u8>,
+    pub cwd: Vec<u8>,
+    pub tids: Vec<i64>,
+    /// Its fds, and where each points (`fd/N`'s link).
+    pub fds: Vec<(u64, Vec<u8>)>,
+    pub environ: Vec<u8>,
+    pub maps: Vec<u8>,
+    pub mounts: Vec<u8>,
+    pub mountinfo: Vec<u8>,
+}
+
+impl RemoteView {
+    /// Process `q`'s (with memory `m`), for another host to show.
+    pub fn of(q: &Process, m: &dyn GuestMemory) -> RemoteView {
+        RemoteView {
+            exe: q.exe(),
+            cwd: q.fs.cwd(),
+            tids: q.thread_ids(),
+            fds: q.fds.numbers().into_iter().filter_map(|n| Some((n, fd_link(q, n).ok()?))).collect(),
+            environ: strings(q, m, true),
+            maps: maps(q, m),
+            mounts: mounts(q, false).into_bytes(),
+            mountinfo: mounts(q, true).into_bytes(),
+        }
+    }
+
+    pub fn encode(&self, e: &mut crate::wire::Encoder) {
+        e.bytes(&self.exe).bytes(&self.cwd).u64(self.tids.len() as u64);
+        for &t in &self.tids {
+            e.i64(t);
+        }
+        e.u64(self.fds.len() as u64);
+        for (n, link) in &self.fds {
+            e.u64(*n).bytes(link);
+        }
+        e.bytes(&self.environ).bytes(&self.maps).bytes(&self.mounts).bytes(&self.mountinfo);
+    }
+
+    pub fn decode(d: &mut crate::wire::Decoder) -> Result<RemoteView, crate::wire::Truncated> {
+        let (exe, cwd) = (d.bytes()?, d.bytes()?);
+        let tids = (0..d.count(8)?).map(|_| d.i64()).collect::<Result<_, _>>()?;
+        let fds = (0..d.count(16)?).map(|_| Ok((d.u64()?, d.bytes()?))).collect::<Result<_, crate::wire::Truncated>>()?;
+        Ok(RemoteView { exe, cwd, tids, fds, environ: d.bytes()?, maps: d.bytes()?, mounts: d.bytes()?, mountinfo: d.bytes()? })
+    }
+}
+
+/// Process `pid` as its host shows it, if it's another host's.
+fn remote(p: &Process, pid: i64) -> Result<RemoteView, i64> {
+    p.kernel.remote_view(p, pid)
+}
+
 /// Parse a path below `/proc` (e.g. `self/fd/3`).
 fn parse(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Node, i64> {
     let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
@@ -133,7 +189,8 @@ fn parse(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Node, i64> {
             [] => return Ok(Node::Pid { pid, tid: None, what: Of::TaskDir }),
             [t, more @ ..] => {
                 let t = number(t).ok_or(errno::ENOENT)?;
-                let known = t == pid || with(p, mem, pid, |q, _| q.thread_ids().contains(&t)).unwrap_or(false);
+                let known = t == pid
+                    || with(p, mem, pid, |q, _| q.thread_ids().contains(&t)).or_else(|_| remote(p, pid).map(|r| r.tids.contains(&t))).unwrap_or(false);
                 if !known {
                     return Err(errno::ENOENT);
                 }
@@ -148,7 +205,11 @@ fn parse(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Node, i64> {
         [b"fd"] => Of::FdDir,
         [b"fd", n] => {
             let n = std::str::from_utf8(n).ok().and_then(|n| n.parse().ok()).ok_or(errno::ENOENT)?;
-            with(p, mem, pid, |q, _| q.fds.get(n).is_ok()).ok().filter(|&ok| ok).ok_or(errno::ENOENT)?;
+            with(p, mem, pid, |q, _| q.fds.get(n).is_ok())
+                .or_else(|_| remote(p, pid).map(|r| r.fds.iter().any(|&(m, _)| m == n)))
+                .ok()
+                .filter(|&ok| ok)
+                .ok_or(errno::ENOENT)?;
             Of::Fd(n)
         }
         [name] => PID_FILES.iter().find(|(n, _)| n == name).map(|&(_, of)| of).ok_or(errno::ENOENT)?,
@@ -203,11 +264,19 @@ pub(crate) fn readlink(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Resul
         _ => {}
     }
     match parse(p, mem, rest)? {
-        Node::Pid { pid, what: Of::Exe, .. } => with(p, mem, pid, |q, _| q.exe())?.pipe_nonempty(),
-        Node::Pid { pid, what: Of::Cwd, .. } => with(p, mem, pid, |q, _| q.fs.cwd()),
-        Node::Pid { pid, what: Of::Fd(n), .. } => with(p, mem, pid, |q, _| fd_link(q, n))?,
+        Node::Pid { pid, what: Of::Exe, .. } => with(p, mem, pid, |q, _| q.exe()).or_else(|_| remote(p, pid).map(|r| r.exe))?.pipe_nonempty(),
+        Node::Pid { pid, what: Of::Cwd, .. } => with(p, mem, pid, |q, _| q.fs.cwd()).or_else(|_| remote(p, pid).map(|r| r.cwd)),
+        Node::Pid { pid, what: Of::Fd(n), .. } => match with(p, mem, pid, |q, _| fd_link(q, n)) {
+            Ok(link) => link,
+            Err(_) => remote_fd(p, pid, n),
+        },
         _ => Err(errno::EINVAL),
     }
+}
+
+/// Where another host's process's fd `n` points.
+fn remote_fd(p: &Process, pid: i64, n: u64) -> Result<Vec<u8>, i64> {
+    remote(p, pid)?.fds.into_iter().find(|&(m, _)| m == n).map(|(_, link)| link).ok_or(errno::ENOENT)
 }
 
 /// A process with no executable has no `exe` link (ENOENT).
@@ -273,6 +342,18 @@ pub(crate) fn stat(p: &Process, mem: &dyn GuestMemory, rest: &[u8], follow: bool
             st.st_gid = unsafe { libc::getgid() };
             return Ok(st);
         }
+        // Another host's process's: its paths, as this process sees them
+        // (hosts of a session share the filesystem's view).
+        Node::Pid { pid, what: what @ (Of::Exe | Of::Cwd | Of::Fd(_)), .. } if with(p, mem, pid, |_, _| ()).is_err() => {
+            let r = remote(p, pid)?;
+            let path = match what {
+                Of::Exe => r.exe,
+                Of::Cwd => r.cwd,
+                Of::Fd(n) => r.fds.into_iter().find(|&(m, _)| m == n).map(|(_, l)| l).filter(|l| l.starts_with(b"/")).ok_or(errno::ENOENT)?,
+                _ => unreachable!(),
+            };
+            unsafe { libc::stat(host_of(p, &path)?.as_ptr(), &mut st) }
+        }
         Node::Pid { pid, what: Of::Exe, .. } => with(p, mem, pid, |q, _| -> Result<i32, i64> { Ok(unsafe { libc::stat(host_of(q, &q.exe())?.as_ptr(), &mut st) }) })??,
         Node::Pid { pid, what: Of::Cwd, .. } => with(p, mem, pid, |q, _| -> Result<i32, i64> { Ok(unsafe { libc::stat(host_of(q, &q.fs.cwd())?.as_ptr(), &mut st) }) })??,
         Node::Pid { pid, what: Of::Fd(n), .. } => with(p, mem, pid, |q, _| -> Result<i32, i64> { Ok(unsafe { libc::fstat(q.fds.get(n)?.host.as_raw_fd(), &mut st) }) })??,
@@ -337,30 +418,32 @@ pub(crate) fn open(p: &Process, mem: &dyn GuestMemory, rest: &[u8]) -> Result<Fd
             dir(listing(names))
         }
         Of::FdDir => {
-            let fds = with(p, mem, pid, |q, _| q.fds.numbers())?;
+            let fds = with(p, mem, pid, |q, _| q.fds.numbers()).or_else(|_| remote(p, pid).map(|r| r.fds.into_iter().map(|(n, _)| n).collect()))?;
             dir(listing(fds.into_iter().map(|n| (n.to_string().into_bytes(), libc::DT_LNK))))
         }
         Of::TaskDir => {
-            let mut tids = with(p, mem, pid, |q, _| q.thread_ids()).unwrap_or_default();
+            let mut tids = with(p, mem, pid, |q, _| q.thread_ids()).or_else(|_| remote(p, pid).map(|r| r.tids)).unwrap_or_default();
             if !tids.contains(&pid) {
                 tids.push(pid);
             }
             tids.sort_unstable();
             dir(listing(tids.into_iter().map(|t| (t.to_string().into_bytes(), libc::DT_DIR))))
         }
-        Of::Exe => with(p, mem, pid, |q, _| open_host(q, &q.exe()))?,
-        Of::Cwd => with(p, mem, pid, |q, _| open_host(q, &q.fs.cwd()))?,
+        Of::Exe => with(p, mem, pid, |q, _| open_host(q, &q.exe())).or_else(|_| remote(p, pid).map(|r| open_host(p, &r.exe)))?,
+        Of::Cwd => with(p, mem, pid, |q, _| open_host(q, &q.fs.cwd())).or_else(|_| remote(p, pid).map(|r| open_host(p, &r.cwd)))?,
         // Linux reopens the file; sharing the open file is close enough.
         Of::Fd(n) => with(p, mem, pid, |q, _| -> Result<FdEntry, i64> {
             let entry = q.fds.get(n)?;
             let host = entry.host.try_clone().map_err(|e| errno::from_io(&e))?;
             Ok(FdEntry::new(host).path_opt(entry.path.clone()))
-        })?,
-        Of::Maps => file(with(p, mem, pid, |q, m| maps(q, m))?),
-        Of::Mounts => file(with(p, mem, pid, |q, _| mounts(q, false))?.into_bytes()),
-        Of::MountInfo => file(with(p, mem, pid, |q, _| mounts(q, true))?.into_bytes()),
+        })
+        // Another host's: its file reopened by path, if it has one.
+        .or_else(|_| remote_fd(p, pid, n).map(|link| if link.starts_with(b"/") { open_host(p, &link) } else { Err(errno::ENXIO) }))?,
+        Of::Maps => file(with(p, mem, pid, |q, m| maps(q, m)).or_else(|_| remote(p, pid).map(|r| r.maps))?),
+        Of::Mounts => file(with(p, mem, pid, |q, _| mounts(q, false).into_bytes()).or_else(|_| remote(p, pid).map(|r| r.mounts))?),
+        Of::MountInfo => file(with(p, mem, pid, |q, _| mounts(q, true).into_bytes()).or_else(|_| remote(p, pid).map(|r| r.mountinfo))?),
         Of::Cmdline => file(with(p, mem, pid, |q, m| strings(q, m, false)).unwrap_or_else(|_| status.cmdline.clone().unwrap_or_default())),
-        Of::Environ => file(with(p, mem, pid, |q, m| strings(q, m, true))?),
+        Of::Environ => file(with(p, mem, pid, |q, m| strings(q, m, true)).or_else(|_| remote(p, pid).map(|r| r.environ))?),
         Of::Comm => file([comm(p, mem, pid), b"\n".to_vec()].concat()),
         Of::Stat => file(pid_stat(p, mem, pid, tid.unwrap_or(pid), &status).into_bytes()),
         Of::Status => file(pid_status(p, mem, pid, tid.unwrap_or(pid), &status).into_bytes()),

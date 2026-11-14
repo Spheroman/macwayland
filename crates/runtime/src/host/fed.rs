@@ -82,6 +82,9 @@ const LIST_PIDS: u8 = 38;
 /// Either way: what's known of a process there or beyond (for `/proc`),
 /// answered.
 const ASK_STATUS: u8 = 39;
+/// Either way: what `/proc` shows of a process's state and memory there
+/// or beyond ([`linux_abi::RemoteView`]), answered.
+const ASK_VIEW: u8 = 40;
 
 /// How long the old host waits for the new one's answer to a hand-off.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
@@ -216,6 +219,18 @@ impl Peer {
         e.i64(pid);
         let body = self.request(ASK_STATUS, &e.0).ok_or(errno::ESRCH)?;
         decode_status(&mut Decoder(&body)).map_err(|_| errno::ESRCH)?
+    }
+
+    /// What `/proc` shows there of `pid`'s state and memory.
+    fn view(&self, pid: i64) -> Result<linux_abi::RemoteView, i64> {
+        let mut e = Encoder::default();
+        e.i64(pid);
+        let body = self.request(ASK_VIEW, &e.0).ok_or(errno::ESRCH)?;
+        let mut d = Decoder(&body);
+        if !d.bool().map_err(|_| errno::ESRCH)? {
+            return Err(d.i64().unwrap_or(errno::ESRCH));
+        }
+        linux_abi::RemoteView::decode(&mut d).map_err(|_| errno::ESRCH)
     }
 
     /// A request (`kind`, its id then `body`), and its answer (None: none
@@ -485,6 +500,18 @@ impl Table {
         }
     }
 
+    /// What `/proc` shows of `pid`'s state and memory: here, from the
+    /// process itself, or from the linked host (but `except`) that reaches
+    /// it.
+    pub(super) fn federated_view(&self, pid: i64, except: Option<&Arc<Peer>>) -> Result<linux_abi::RemoteView, i64> {
+        if let Some(proc) = self.local(pid) {
+            let space = proc.space();
+            return Ok(linux_abi::RemoteView::of(&proc.abi, &*space));
+        }
+        let peer = self.peers().into_iter().find(|p| except.is_none_or(|x| !Arc::ptr_eq(p, x)) && p.reaches_pid(pid));
+        peer.ok_or(errno::ESRCH)?.view(pid)
+    }
+
     /// `tcsetpgrp` on pty `n`, another host's: asked of it.
     pub(super) fn remote_foreground(&self, n: u32, pgrp: i64, sid: i64) -> Result<i64, i64> {
         match self.peers().into_iter().find(|p| p.tty(n).is_some()) {
@@ -623,6 +650,18 @@ impl Table {
                 let r = self.federated_status(pid, Some(peer));
                 let mut e = Encoder::default();
                 encode_status(&mut e, &r);
+                peer.answer(id, &e.0);
+            }
+            ASK_VIEW => {
+                let (Ok(id), Ok(pid)) = (d.u64(), d.i64()) else { return true };
+                let mut e = Encoder::default();
+                match self.federated_view(pid, Some(peer)) {
+                    Ok(view) => {
+                        e.bool(true);
+                        view.encode(&mut e);
+                    }
+                    Err(err) => drop(e.bool(false).i64(err)),
+                }
                 peer.answer(id, &e.0);
             }
             ANSWER => {

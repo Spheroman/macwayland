@@ -1844,6 +1844,15 @@ impl Kernel for TableKernel {
         Ok(())
     }
 
+    fn remote_view(&self, _p: &Process, pid: i64) -> Result<linux_abi::RemoteView, i64> {
+        // Not one of this host's (those are read directly): its host's.
+        let table = self.table()?;
+        if table.local(pid).is_some() {
+            return Err(errno::ESRCH);
+        }
+        table.federated_view(pid, None)
+    }
+
     fn process_cpu_time(&self, _p: &Process, pid: i64) -> Result<Option<std::time::Duration>, i64> {
         let proc = self.table()?.local(pid).ok_or(errno::EINVAL)?;
         Ok(Some(std::time::Duration::from_nanos(proc.cpu.times().total())))
