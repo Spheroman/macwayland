@@ -1821,6 +1821,40 @@ fn a_move_keeps_pending_signals_and_kqueue_fds() {
     }
 }
 
+/// `/proc` of another host's process (docs/processes.md, step 9): from the
+/// parent's host, a moved process's `environ`, `exe`, `cwd`, `fd/` and its
+/// links, `maps`, `task/`; and from a moved process, its parent's.
+#[test]
+#[ignore = "needs nix"]
+fn proc_of_another_hosts_process() {
+    let bash = std::path::Path::new(&linux_package("bash")).join("bin/bash");
+    let cu = std::path::Path::new(&linux_package("coreutils")).join("bin");
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let script = format!(
+        "export PATH={cu}; cd {d}; MARK=moved MACWL_NEW_HOST=1 sleep 3 > {d}/out & p=$!; sleep 0.5
+         [[ $(tr '\\0' '\\n' < /proc/$p/environ) == *MARK=moved* ]] && echo environ
+         [[ $(readlink /proc/$p/exe) == */coreutils ]] && echo exe
+         [[ $(readlink /proc/$p/cwd) == {d} ]] && echo cwd
+         echo fds $(ls /proc/$p/fd)
+         [[ $(readlink /proc/$p/fd/1) == {d}/out ]] && echo fd link
+         (( $(wc -l < /proc/$p/maps) > 3 )) && echo maps
+         [[ $(ls /proc/$p/task) == $p ]] && echo task
+         MACWL_NEW_HOST=1 {bash} -c '[[ $(tr \"\\0\" \"\\n\" < /proc/$PPID/environ) == *PATH=* ]] && echo parent environ; [[ $(readlink /proc/$PPID/exe) == */bash ]] && echo parent exe'
+         kill $p",
+        cu = cu.display(),
+        d = dir.display(),
+        bash = bash.display(),
+    );
+    let out = macwl_run().arg(&bash).arg("-c").arg(&script).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "environ\nexe\ncwd\nfds 0 1 2\nfd link\nmaps\ntask\nparent environ\nparent exe\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A moved process's host dying ends it in its parent's eyes as killed by
 /// SIGKILL (docs/processes.md, step 9, "A host's failure").
 #[test]
