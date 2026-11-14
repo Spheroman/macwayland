@@ -18,23 +18,9 @@
 set -eu
 socket=${1:?usage: gpu/vtest.sh SOCKET}
 here=$(cd "$(dirname "$0")" && pwd)
+eval "$("$here/build.sh")"
 out=$here/../target/gpu
-rev=01637fc   # virglrenderer main, 2026-11-11
-mkdir -p "$out"
-if [ ! -x "$out/virglrenderer/build/vtest/virgl_test_server" ]; then
-    rm -rf "$out/virglrenderer"
-    git clone -q https://gitlab.freedesktop.org/virgl/virglrenderer.git "$out/virglrenderer"
-    git -C "$out/virglrenderer" checkout -q "$rev"
-    git -C "$out/virglrenderer" apply "$here/virglrenderer-macos-vtest.patch"
-    (cd "$out/virglrenderer" && nix-shell "$here/build-shell.nix" --run \
-        'meson setup build -Dvrend=false -Dvenus=true -Drender-server-mode=process && ninja -C build')
-fi
-mesa=$(nix build --no-link --print-out-paths --impure -f "$here/kosmickrisp-main.nix" | grep -v -- '-dev$')
-loader=$(nix build --no-link --print-out-paths nixpkgs#vulkan-loader)
 export RENDER_SERVER_EXEC_PATH=$out/virglrenderer/build/server/virgl_render_server
-export VK_ICD_FILENAMES=$mesa/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json
-export DYLD_LIBRARY_PATH=$loader/lib:$out/virglrenderer/build/src
-# Zink wants custom border colours, an experimental feature of KosmicKrisp's.
-export MESA_KK_EXPERIMENTAL=${MESA_KK_EXPERIMENTAL-custom_border}
+export DYLD_LIBRARY_PATH=$MACWL_GPU_DYLD_LIBRARY_PATH:$out/virglrenderer/build/src
 rm -f "$socket"
 exec "$out/virglrenderer/build/vtest/virgl_test_server" --venus --no-virgl --socket-path "$socket"
