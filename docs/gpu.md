@@ -335,7 +335,7 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
    short: prototype the split driver on KosmicKrisp's bridge stubs.
 2. **The virtio-gpu node** in the runtime: contexts, blobs, execbuffer,
    timeline syncobjs, sync_files, PRIME, the dma-buf sync ioctls; the
-   render server as broker. Done (below), but for a worker's death.
+   render server as broker. Done (below).
    Pass: Mesa logs no failed sync-file export; a deliberately slow frame
    never shows half drawn in headless dumps; `vkWaitForFences` wakes in
    under 30 µs p50 with no `nanosleep` under `MACWL_STRACE`; killing the
@@ -364,7 +364,7 @@ Venus over vtest, no runtime work but a fix. `gpu/vtest.sh SOCKET` builds
 and runs the Mac side; the guest is stock nixpkgs Mesa 26.2.6 for
 aarch64-linux (`VN_DEBUG=vtest`, `VTEST_SOCKET_NAME`, its `virtio` ICD).
 
-- **The port** (`gpu/virglrenderer-macos-vtest.patch`, on virglrenderer
+- **The port** (`gpu/virglrenderer-macos.patch`, on virglrenderer
   `01637fc`): ~40 lines. vtest builds with Venus alone (upstream wants
   vrend); its shm comes from `os_create_anonymous_file` (a POSIX shm
   object, sized at creation: macOS sizes one only once); and an eventfd is
@@ -476,11 +476,25 @@ the checklist held.
   the worker, the worker's ring and queue threads, its retire through the
   FIFO "eventfd" to the proxy's sync thread, the callback, the guest
   task's wake. Not yet broken down: step 3.
-- **Not done**: a worker's death (Metal aborting) failing its context's
-  fences at once. The proxy retires them only after its socket goes and
-  100 stalled polls; signalling them on the socket's end, and testing it
-  (killing a worker mid-run), is still to do. Also not checked: Zink and
-  EGL through the node (step 1 ran them over vtest), GBM.
+- **A worker's death** (2026-11-14; Metal aborts a process on misuse,
+  the reason contexts are processes of their own): the guest is told at
+  once. virglrenderer's proxy retired a dead context's fences as
+  *signalled* (after 100 stalled wakeups), and its sync thread then spun on
+  the hung-up socket; and on macOS it never woke at all, `poll` with no
+  events asked for not reporting a stream socket's peer going. Our
+  virglrenderer patch (`gpu/virglrenderer-macos.patch`) watches the socket
+  with a kqueue (EVFILT_READ with a low-water mark no reply reaches: only
+  its end fires), stops watching once it's gone, and says the context is
+  lost before retiring its fences: a fence id of `UINT64_MAX` on the fence
+  callback. The runtime then fails the context's fences (the guest's waits
+  get ENODEV: `VK_ERROR_DEVICE_LOST`) and its submissions. Test
+  `a_gpu_workers_death_is_a_lost_device`: the worker killed under
+  `fencebench`, which gets -4 within a second. A guest waiting on Venus's
+  *ring* when it happens (shared memory, polled in the guest) isn't
+  reached by any of this: Venus's own watchdog aborts it, after ~14 s, as
+  it would on Linux.
+- **Not checked yet**: EGL on Wayland and GBM through the node (Zink on
+  the surfaceless platform works: GL 3.3, below).
 
 ## Transform feedback in KosmicKrisp, 2026-11-14
 
