@@ -563,9 +563,77 @@ fn quad_pipeline(device: &ProtocolObject<dyn MTLDevice>) -> Retained<ProtocolObj
     device.newRenderPipelineStateWithDescriptor_error(&desc).expect("quad pipeline")
 }
 
+/// A tiny GPU job the moment a key goes to a client, so the GPU is waking
+/// up (~1 ms from idle) while the client works on its answer, rather than
+/// when that answer reaches it: key → commit 2.4 → 1.7 ms for a guest
+/// Vulkan client (docs/gpu.md). MACWL_GPU_PREWARM=0 turns it off.
+struct Prewarm {
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+// SAFETY: Metal queues and buffers can be used from any thread.
+unsafe impl Send for Prewarm {}
+unsafe impl Sync for Prewarm {}
+
+static PREWARM: std::sync::OnceLock<Option<Prewarm>> = std::sync::OnceLock::new();
+
+fn prewarm_init(device: &ProtocolObject<dyn MTLDevice>) {
+    PREWARM.get_or_init(|| {
+        if std::env::var("MACWL_GPU_PREWARM").as_deref() == Ok("0") {
+            return None;
+        }
+        // MACWL_GPU_PREWARM_BYTES: how much it fills (16 by default).
+        let bytes = std::env::var("MACWL_GPU_PREWARM_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16).max(16);
+        Some(Prewarm { queue: device.newCommandQueue()?, buffer: device.newBufferWithLength_options(bytes, MTLResourceOptions::StorageModePrivate)? })
+    });
+}
+
+/// MACWL_GPU_KEEPWARM_MS=N: after a key, keep the GPU warm for N ms (a
+/// tiny job each 8 ms), so the next key while typing finds it awake.
+fn keep_warm() {
+    static UNTIL: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+    let Some(ms) = std::env::var("MACWL_GPU_KEEPWARM_MS").ok().and_then(|v| v.parse::<f64>().ok()) else { return };
+    let until = CACurrentMediaTime() + ms / 1e3;
+    let mut u = UNTIL.lock().unwrap();
+    let running = u.is_some();
+    *u = Some(until);
+    if running {
+        return;
+    }
+    drop(u);
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(8));
+        let mut u = UNTIL.lock().unwrap();
+        if u.is_none_or(|t| CACurrentMediaTime() > t) {
+            *u = None;
+            return;
+        }
+        drop(u);
+        prewarm_now();
+    });
+}
+
+fn prewarm() {
+    prewarm_now();
+    keep_warm();
+}
+
+fn prewarm_now() {
+    let Some(Some(p)) = PREWARM.get() else { return };
+    let Some(cmd) = p.queue.commandBuffer() else { return };
+    if let Some(blit) = cmd.blitCommandEncoder() {
+        blit.fillBuffer_range_value(&p.buffer, objc2_foundation::NSRange::new(0, p.buffer.length()), 0);
+        blit.endEncoding();
+    }
+    cmd.commit();
+}
+
 #[derive(Default)]
 struct LatencyStats {
     samples: Vec<f64>,
+    /// The first figure of each sample (key→commit, for keys).
+    firsts: Vec<f64>,
     quiet: bool,
 }
 
@@ -582,6 +650,7 @@ impl LatencyStats {
 
     fn push_labelled(&mut self, what: &str, first: &str, first_ms: f64, second: &str, glass_ms: f64) {
         self.samples.push(glass_ms);
+        self.firsts.push(first_ms);
         if self.quiet {
             return;
         }
@@ -735,10 +804,15 @@ impl Renderer {
         }
         let s = stats.sorted();
         let pct = |p: f64| s[((s.len() - 1) as f64 * p).round() as usize];
+        let mut c = stats.firsts.clone();
+        c.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let cpct = |p: f64| c[((c.len() - 1) as f64 * p).round() as usize];
         println!(
-            "{}: n={} key→glass p50={:.2} p90={:.2} min={:.2} max={:.2} ms",
+            "{}: n={} key→commit p50={:.2} p90={:.2} key→glass p50={:.2} p90={:.2} min={:.2} max={:.2} ms",
             self.config,
             s.len(),
+            cpct(0.5),
+            cpct(0.9),
             pct(0.5),
             pct(0.9),
             s[0],
@@ -1272,6 +1346,7 @@ fn main() {
     window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
 
     let queue = device.newCommandQueue().expect("no command queue");
+    prewarm_init(&device);
 
     let layer = CAMetalLayer::new();
     layer.setDevice(Some(&device));
@@ -1316,6 +1391,7 @@ fn main() {
         if !latency_mode {
             if ty == NSEventType::KeyDown && !event.isARepeat() {
                 *monitor_key_pending.lock().unwrap() = Some((event.timestamp(), CACurrentMediaTime()));
+                prewarm();
             }
             forward_key(&keys, event, ty, flags);
             forward_mouse(&keys, event, ty, &monitor_view, &monitor_layer);
@@ -1384,6 +1460,7 @@ fn main() {
                 let time_ms = (now * 1000.0) as u32;
                 *pending.lock().unwrap() = Some((now, now));
                 let _ = keys.send(InputEvent::Key { code, pressed: true, time_ms });
+                prewarm();
                 let _ = keys.send(InputEvent::Key { code, pressed: false, time_ms });
                 rng ^= rng << 13;
                 rng ^= rng >> 17;

@@ -101,6 +101,11 @@ pub fn report() {
         let p = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
         eprintln!("  {name:48} {:8.1} {:8.1} {:8.1}", p(0.5), p(0.9), p(0.99));
     }
+    // MACWL_GPU_TRACE=3: each submission's fence made → signalled, in order.
+    if std::env::var_os("MACWL_GPU_TRACE").is_some_and(|v| v == "3") {
+        let line: Vec<String> = samples.iter().map(|s| format!("{:.0}", us(at(s, Stage::Fenced), at(s, Stage::Signaled)))).collect();
+        eprintln!("  fence made -> signalled, in order: {}", line.join(" "));
+    }
     // A wait that starts after the fence signalled doesn't wait.
     let late = samples.iter().filter(|s| at(s, Stage::WaitStarted) >= at(s, Stage::Signaled)).count();
     eprintln!("  (waits starting after the signal: {late})");
