@@ -1,0 +1,36 @@
+From 166edc4c6321ececfff9dd9b9dc016b538b3c0d6 Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:03:00 -0800
+Subject: [PATCH 06/10] kk: Pass clip and cull distances to a GS as they are
+
+The stage feeding a GS runs as compute and stores its outputs to memory
+for the GS to read, so it has no use for the Metal lowering of clip and
+cull distances, which also separates the combined clip and cull array the
+GS reads. The GS's rasterization VS lowers them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_shader.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index eca5a6d9106..3110a8e63b5 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1083,9 +1083,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+ 
+    unsigned num_cull_distances =
+       prev_stage ? prev_stage->info.num_cull_distances : 0;
+-   /* A GS lowers clip and cull distances on its rasterization VS instead; the
+-    * stage feeding it has none after linking */
+-   if (stage != MESA_SHADER_GEOMETRY)
++   /* A GS lowers clip and cull distances on its rasterization VS instead. The
++    * stage feeding it passes them to the GS in memory as they are, combined,
++    * which is how the GS reads them. */
++   if (stage != MESA_SHADER_GEOMETRY && next_stage != MESA_SHADER_GEOMETRY)
+       msl_nir_lower_clip_cull_distance(nir, num_cull_distances);
+ 
+    /* When using poly to emulate tessellation or GS, the VS and TCS are turned
+-- 
+2.55.0
+

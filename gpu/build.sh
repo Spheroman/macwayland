@@ -31,7 +31,7 @@ nix build --out-link "$out/roots/vulkan-loader" nixpkgs#vulkan-loader >&2
 # fencebench for Linux (glibc, from nixpkgs' cache: no Linux builder needed)
 # and for macOS, to compare (docs/gpu.md, step 2).
 # (drawbench too, its shaders compiled to SPIR-V with glslang.)
-for src in "$here/drawbench.c" "$here/shaders/draw.vert" "$here/shaders/draw.frag"; do
+for src in "$here/drawbench.c" "$here/keyframe.c" "$here/shaders/draw.vert" "$here/shaders/draw.frag"; do
     [ "$src" -nt "$out/drawbench-linux" ] && rm -f "$out/fencebench-linux"
 done
 if [ ! -x "$out/fencebench-linux" ] || [ "$here/fencebench.c" -nt "$out/fencebench-linux" ]; then
@@ -62,6 +62,24 @@ if [ ! -x "$out/fencebench-linux" ] || [ "$here/fencebench.c" -nt "$out/fenceben
         -rpath "$gl/lib" -rpath "$(readlink "$out/roots/linux-vulkan-loader")/lib" \
         "$gl/lib/crt1.o" "$gl/lib/crti.o" "$out/drawbench.o" -L"$gl/lib" -L"$(readlink "$out/roots/linux-vulkan-loader")/lib" \
         -lvulkan -lc -lm "$gl/lib/crtn.o"
+    # keyframe (Linux only: a Wayland client): libwayland and xdg-shell.
+    nix build --max-jobs 0 --out-link "$out/roots/linux-wayland" "nixpkgs#legacyPackages.aarch64-linux.wayland^out,dev" >&2
+    nix build --max-jobs 0 --out-link "$out/roots/wayland-protocols" "nixpkgs#legacyPackages.aarch64-linux.wayland-protocols" >&2
+    nix build --out-link "$out/roots/wayland-scanner" nixpkgs#wayland-scanner >&2
+    xdg=$(readlink "$out/roots/wayland-protocols")/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+    scanner=$(readlink "$out/roots/wayland-scanner-bin")/bin/wayland-scanner
+    "$scanner" client-header "$xdg" "$out/xdg-shell-client-protocol.h"
+    "$scanner" private-code "$xdg" "$out/xdg-shell-protocol.c"
+    wl=$(readlink "$out/roots/linux-wayland")
+    for c in "$here/keyframe.c" "$out/xdg-shell-protocol.c"; do
+        clang --target=aarch64-unknown-linux-gnu -O2 -nostdinc -isystem "$(readlink "$out/roots/linux-glibc-dev")/include" \
+            -isystem "$(clang -print-resource-dir)/include" -I "$(readlink "$out/roots/vulkan-headers")/include" \
+            -I "$(readlink "$out/roots/linux-wayland-dev")/include" -I "$out" -c "$c" -o "$out/$(basename "$c" .c).o"
+    done
+    "$(readlink "$out/roots/lld")/bin/ld.lld" -o "$out/keyframe-linux" --dynamic-linker="$gl/lib/ld-linux-aarch64.so.1" \
+        -rpath "$gl/lib" -rpath "$(readlink "$out/roots/linux-vulkan-loader")/lib" -rpath "$wl/lib" \
+        "$gl/lib/crt1.o" "$gl/lib/crti.o" "$out/keyframe.o" "$out/xdg-shell-protocol.o" -L"$gl/lib" \
+        -L"$(readlink "$out/roots/linux-vulkan-loader")/lib" -L"$wl/lib" -lvulkan -lwayland-client -lc "$gl/lib/crtn.o"
     clang -O2 -I "$(readlink "$out/roots/vulkan-headers")/include" -I "$out" "$here/drawbench.c" \
         -L "$(readlink "$out/roots/vulkan-loader")/lib" -lvulkan -Wl,-rpath,"$(readlink "$out/roots/vulkan-loader")/lib" \
         -o "$out/drawbench-mac"

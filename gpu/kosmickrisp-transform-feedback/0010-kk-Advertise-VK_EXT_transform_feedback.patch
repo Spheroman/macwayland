@@ -1,0 +1,48 @@
+From 8d33fa27f3401a139394b62ea45c5389d945666b Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:50:43 -0800
+Subject: [PATCH 10/10] kk: Advertise VK_EXT_transform_feedback
+
+With transformFeedback and geometryStreams, and the properties the
+physical device already reports: 4 streams and buffers, queries,
+rasterization stream select and vkCmdDrawIndirectByteCountEXT.
+transformFeedbackStreamsLinesTriangles stays false.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/vulkan/kk_physical_device.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index a0b882cb973..8c1036b4625 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -202,6 +202,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_shader_replicated_composites = true,
+       .EXT_shader_subgroup_ballot = true,
+       .EXT_shader_subgroup_vote = true,
++      .EXT_transform_feedback = true,
+ #ifdef KK_USE_WSI_PLATFORM
+       .EXT_swapchain_maintenance1 = true,
+ #endif
+@@ -236,6 +237,7 @@ kk_get_device_features(
+       .fragmentStoresAndAtomics = true,
+       .fullDrawIndexUint32 = true,
+       .geometryShader = true,
++      .geometryStreams = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+       .inheritedQueries = true,
+@@ -513,6 +515,9 @@ kk_get_device_features(
+       .shaderSharedFloat32AtomicAdd =
+          info->msl_version >= MTL_LANGUAGE_VERSION_4_1,
+ 
++      /* VK_EXT_transform_feedback */
++      .transformFeedback = true,
++
+       /* VK_EXT_vertex_attribute_robustness */
+       .vertexAttributeRobustness = true,
+ 
+-- 
+2.55.0
+

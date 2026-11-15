@@ -1,0 +1,60 @@
+From 30d2c20e1c1cc083cc524d4ef4f798720a46e1fa Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:17:22 -0800
+Subject: [PATCH 01/10] nir/opt_vectorize_io: optionally keep no_varying stores
+ separate
+
+Merging an output store the next shader reads with one it doesn't, such
+as a component only transform feedback captures, clears the no_varying
+flag of the merged store, so the driver can't tell those components
+apart anymore. Metal needs a vertex function's outputs to match the
+fragment function's inputs exactly, so KosmicKrisp has to drop the
+components transform feedback captures alone. Add an IO option to keep
+such stores separate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/compiler/nir/nir_opt_vectorize_io.c        | 6 ++++++
+ src/compiler/nir/nir_shader_compiler_options.h | 9 +++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/compiler/nir/nir_opt_vectorize_io.c b/src/compiler/nir/nir_opt_vectorize_io.c
+index 0669b6e9a11..39fc8343d1d 100644
+--- a/src/compiler/nir/nir_opt_vectorize_io.c
++++ b/src/compiler/nir/nir_opt_vectorize_io.c
+@@ -91,6 +91,12 @@ compare_is_not_vectorizable(nir_intrinsic_instr *a, nir_intrinsic_instr *b)
+ 
+    nir_shader *shader = a->instr.block->impl->function->shader;
+ 
++   if (nir_intrinsic_has_src_type(a) &&
++       (shader->options->io_options &
++        nir_io_vectorizer_keeps_no_varying_separate) &&
++       sem0.no_varying != sem1.no_varying)
++      return sem0.no_varying > sem1.no_varying ? 1 : -1;
++
+    /* Compare the types. */
+    if (!(shader->options->io_options & nir_io_vectorizer_ignores_types)) {
+       unsigned type_a, type_b;
+diff --git a/src/compiler/nir/nir_shader_compiler_options.h b/src/compiler/nir/nir_shader_compiler_options.h
+index 5bc04386de7..354b070a43c 100644
+--- a/src/compiler/nir/nir_shader_compiler_options.h
++++ b/src/compiler/nir/nir_shader_compiler_options.h
+@@ -240,6 +240,15 @@ typedef enum {
+     */
+    nir_io_non_interpolated_as_uint = BITFIELD_BIT(14),
+ 
++   /**
++    * Whether nir_opt_vectorize_io should keep output stores with the
++    * no_varying flag (e.g. components only transform feedback captures)
++    * separate from those the next shader reads, instead of merging them into
++    * a store without the flag. For drivers that can't have outputs the next
++    * shader doesn't read in the same slot as those it reads.
++    */
++   nir_io_vectorizer_keeps_no_varying_separate = BITFIELD_BIT(15),
++
+    /* Options affecting the GLSL compiler or Gallium are below. */
+ 
+    /**
+-- 
+2.55.0
+

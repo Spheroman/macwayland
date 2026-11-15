@@ -145,6 +145,120 @@ index ce29ecae..62b77dfe 100644
     } sync_thread;
  };
  
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index bba1f6a5..3e67380a 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -37,6 +37,18 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
++   /* With host memory import, a dma-buf here is host shm imported as host
++    * memory (vkr_dispatch_vkAllocateMemory): say so to the driver, which
++    * knows nothing of dma-bufs. */
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   if (dev && dev->physical_device->use_host_memory_import) {
++      VkExternalMemoryBufferCreateInfo *ext = vkr_find_struct(
++         args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
++      if (ext && (ext->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
++                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)))
++         ext->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++   }
++
+    vkr_buffer_create_and_add(dispatch->data, args);
+ }
+ 
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 929254b8..1a473a1f 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -135,7 +135,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
+-   if (ext_count > args->pCreateInfo->enabledExtensionCount) {
++   /* (With host memory import, the guest's external memory extensions are
++    * ours, emulated: they're taken out, so the list is always rebuilt.) */
++   if (ext_count > args->pCreateInfo->enabledExtensionCount ||
++       physical_dev->use_host_memory_import) {
+       exts = malloc(sizeof(*exts) * ext_count);
+       if (!exts) {
+          args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -148,6 +151,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          const char *name = args->pCreateInfo->ppEnabledExtensionNames[i];
+          if (!strcmp(name, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+             has_external_memory_host = true;
++         if (physical_dev->use_host_memory_import &&
++             (!strcmp(name, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) ||
++              !strcmp(name, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)))
++            continue;
+          exts[ext_count++] = name;
+       }
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index fd393c16..8268d82f 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -376,7 +376,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    VkExportMemoryAllocateInfo local_export_info;
+    VkImportMemoryHostPointerInfoEXT local_host_import;
+ 
+-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
++   /* With host memory import, memory the guest may export (a dma-buf: WSI's
++    * prime buffers, its sync-file probe) is host shm too, whatever its type:
++    * shm is what an export hands out. */
++   const bool export_as_shm = might_export && physical_dev->use_host_memory_import;
++   if (((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || export_as_shm) &&
++       !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+        * If the client driver is using external memory and requesting dma_buf, without
+        * dma_buf fd export support, we must use gbm bo import path instead of forcing
+@@ -425,7 +430,15 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+             }
+          }
+       } else if (physical_dev->use_host_memory_import) {
+-         /* Allocate shm and import it as host memory. */
++         /* Allocate shm and import it as host memory. An export request
++          * goes: import and export together are invalid, and the export is
++          * the shm (valid_fd_types). */
++         if (export_info) {
++            void *prev_of_export_info = vkr_find_prev_struct(
++               alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++            vkr_pnext_set_next(prev_of_export_info, export_info->pNext);
++            export_info = NULL;
++         }
+          shm = vkr_shm_alloc(alloc_info->allocationSize,
+                              physical_dev->min_imported_host_pointer_alignment);
+          if (!shm) {
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index f6531e1c..c28c8e54 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -372,14 +372,23 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+                                           !physical_dev->KHR_external_memory_fd &&
+                                           !physical_dev->EXT_external_memory_dma_buf;
+    if (physical_dev->use_host_memory_import) {
++      /* VK_EXT_external_memory_dma_buf too: memory the guest exports as a
++       * dma-buf is host shm as well (vkr_dispatch_vkAllocateMemory), its fd
++       * the blob's. That puts the guest's Wayland WSI on its prime path: a
++       * GPU copy into a linear buffer it presents as a dma-buf, which a
++       * compositor maps, rather than a CPU copy into wl_shm. */
+       VkExtensionProperties *new_exts =
+-         realloc(exts, sizeof(*exts) * (advertised_count + 1));
++         realloc(exts, sizeof(*exts) * (advertised_count + 2));
+       if (new_exts) {
+          exts = new_exts;
+          strcpy(new_exts[advertised_count].extensionName,
+                 VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+          new_exts[advertised_count].specVersion = 0;
+          advertised_count++;
++         strcpy(new_exts[advertised_count].extensionName,
++                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
++         new_exts[advertised_count].specVersion = 1;
++         advertised_count++;
+       } else {
+          vkr_log("failed to inject VK_KHR_external_memory_fd");
+       }
 diff --git a/src/virgl_util.c b/src/virgl_util.c
 index b770a0a9..a2242039 100644
 --- a/src/virgl_util.c

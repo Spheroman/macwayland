@@ -1,0 +1,52 @@
+From c4b1a5c6fca842c4c84be1d4171ef4cf20f146f9 Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:03:50 -0800
+Subject: [PATCH 03/10] poly: Let the passthrough GS keep outputs only for
+ transform feedback
+
+A driver building the passthrough GS after linking the stage it passes
+through can tell it which output components only transform feedback
+captures. Flagging their stores no_varying keeps them out of the
+rasterized outputs, as for a linked GS. The mask is zero for a key built
+as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/poly/nir/poly_nir.h                | 4 ++++
+ src/poly/nir/poly_nir_passthrough_gs.c | 4 +++-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/poly/nir/poly_nir.h b/src/poly/nir/poly_nir.h
+index 70715618182..a3a76478456 100644
+--- a/src/poly/nir/poly_nir.h
++++ b/src/poly/nir/poly_nir.h
+@@ -80,6 +80,10 @@ struct poly_passthrough_gs_key {
+    /* Transform feedback buffer strides */
+    uint8_t xfb_stride[MAX_XFB_BUFFERS];
+ 
++   /* Components of each output only transform feedback captures, which the
++    * next stage doesn't read */
++   uint8_t xfb_only_mask[NUM_TOTAL_VARYING_SLOTS];
++
+    /* Decomposed primitive */
+    enum mesa_prim prim;
+ 
+diff --git a/src/poly/nir/poly_nir_passthrough_gs.c b/src/poly/nir/poly_nir_passthrough_gs.c
+index 1c2e9ed9000..97b2284ae16 100644
+--- a/src/poly/nir/poly_nir_passthrough_gs.c
++++ b/src/poly/nir/poly_nir_passthrough_gs.c
+@@ -102,8 +102,10 @@ poly_nir_passthrough_gs(nir_builder *b, const void *key_)
+                                                   .dest_type = type);
+ 
+          for (unsigned c = 0; c < comps; ++c) {
++            nir_io_semantics store_sem = sem;
++            store_sem.no_varying = (key->xfb_only_mask[loc] >> c) & 1;
+             nir_store_output(b, nir_channel(b, val, c), offset,
+-                             .io_semantics = sem,
++                             .io_semantics = store_sem,
+                              .src_type = type,
+                              .component = c);
+          }
+-- 
+2.55.0
+
