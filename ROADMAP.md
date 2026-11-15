@@ -385,7 +385,11 @@ from a static Linux binary.
     GLES 3.1 without an override. A render worker's death is a lost
     device to the guest at once. Step 3 done: 91–95% of native frame rate
     draw-bound (10,000 draws a frame), 95–100% GPU-bound; a fence's round
-    trip ~40 µs over native, broken down (`MACWL_GPU_TRACE`).
+    trip ~40 µs over native, broken down (`MACWL_GPU_TRACE`). Step 4
+    done: zero-copy presenting (the guest WSI's prime path: a GPU copy into
+    a dma-buf that is shared memory the shell draws from; linux-dmabuf in
+    the compositor); Zink presents the same way. A guest GPU client's key →
+    glass is ~1.5–2 ms over native Metal (`gpu/latency.sh`).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with

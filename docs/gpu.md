@@ -1,6 +1,7 @@
 # GPU: Vulkan through Venus, GL through Zink
 
-Status: steps 1 to 3 done (2026-11-14, below): Linux Vulkan and GLES
+Status: steps 1 to 4 done (2026-11-14, below; step 4's latency just over
+its target): Linux Vulkan and GLES
 programs under macwl-run draw on the Mac's GPU through the runtime's own
 render node. ROADMAP item 11. Costs below are still estimates from measured ones (`docs/processes.md`,
 `docs/mn-threads.md`, `docs/d3dmetal-proton.md`). Worked out with a
@@ -348,7 +349,8 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
    under 30 µs, p99 under 150 µs; no system calls per frame but present's.
    Fail: the case for the split driver.
 4. **Zero-copy presenting**: the three extensions in virglrenderer,
-   linux-dmabuf in the compositor. Key press to colour change from a guest
+   linux-dmabuf in the compositor. Done (below; one extension was
+   enough), latency ~1.5–2 ms over native. Key press to colour change from a guest
    Vulkan app on the `presentedTime` harness, against `native-probe metal
    --no-capture`.
    Pass: p50 within 1 ms and p90 within 2 ms of native (6.2 / 10.5 ms).
@@ -541,11 +543,73 @@ before a fence wait sleeps (trading a CPU for ~5 µs; not by default).
 Not done: none is worth it until presenting (step 4) says the frame's
 budget needs it.
 
+## Step 4, 2026-11-14: presenting
+
+**Zero copy.** The guest's Wayland WSI is on its *prime* path: it renders
+to an optimal image, then copies it on the GPU into a linear buffer
+exported as a dma-buf, which it presents with `zwp_linux_dmabuf_v1`. Here
+that buffer is a GPU blob, shared memory, which the shell maps and draws
+from as it does a `wl_shm` pool (`Host::frame_dmabuf`); other hosts get a
+copy. (Linear *images* on host memory, the other way, KosmicKrisp can't
+do; buffers it can.) Fable traced what selects the path in Mesa's WSI and
+what virglrenderer needed:
+
+- virglrenderer (`gpu/virglrenderer-macos.patch`): advertises
+  `VK_EXT_external_memory_dma_buf` (not image modifiers: with modifiers
+  hidden, WSI takes the prime path whatever device the compositor names),
+  takes it and `VK_KHR_external_memory_fd` out of the driver's device
+  extensions again, allocates any memory the guest may export as host shm
+  imported as host memory (whatever its type: WSI's sync-file probe uses
+  the device-local one), and makes dma-buf buffers host-allocation ones.
+- The compositor: `zwp_linux_dmabuf_v1` v4+ with default feedback naming
+  the guests' render node (226:128; the vendored Smithay now sends a
+  dev_t as Linux's 8 bytes), XRGB/ARGB8888 with LINEAR and INVALID (what
+  prime buffers carry) modifiers, one plane. WSI's stride is 256-byte
+  aligned, offset 0: what the shell's linear textures need.
+- The runtime, found on the way: a sync file holds its fence (Venus resets
+  the syncobj right after exporting one); a timeline's point 0 is its last
+  fence (Venus exports point 0; without this the export failed and WSI
+  committed frames the GPU hadn't finished: black frames in the dumps); an
+  empty execbuffer is a fence alone; `fstat` of the node is the node
+  (libdrm finds the device by its number; Zink on EGL Wayland failed).
+- Zink presents the same way (kopper on Venus's WSI): `es2gears_wayland`
+  right in the dumps.
+- Test `a_gpu_client_presents_finished_frames_as_dma_bufs`:
+  `gpu/keyframe.c` (a Vulkan client that draws a new colour for each key)
+  under the headless compositor, typed at; each frame's colour right, each
+  buffer a blob.
+
+**Latency** (`gpu/latency.sh`: keyframe in macwl-shell, the shell typing
+40 keys and timing each to its answer's `presentedTime`; 120 Hz). Today
+the machine ran slower than the Done table's day (native 10–11 ms p50
+against 6.2 then), so these compare with each other:
+
+| p50 / p90, ms | |
+|---|---|
+| native Metal (`native-probe metal --no-capture 30`, 4 runs) | 10.0–11.2 / 15.7–16.7 |
+| the shell's own (`macwl-shell --latency --auto 30`) | 11.3 / 17.0 |
+| keyframe through the node, FIFO (3 runs) | 12.5–12.8 / 18.1–19.0 |
+| keyframe, mailbox (2 runs) | 13.6–14.6 / 18.4–19.4 |
+| keyframe, the shell copying (`MACWL_SHM_COPY=1`) | 16.0 / 21.2 |
+
+So a guest GPU client is ~1.5–2 ms behind native at p50 and ~2 ms at p90:
+just outside step 4's target (1 and 2 ms). The gap is the client's own
+key → commit, 1–2.5 ms, where a native app presents from inside its
+command buffer: the key's way to the guest, Venus's present thread, the
+blit, the fence wait, the commit. Zero copy is worth ~3.3 ms over copying.
+Mailbox is no faster. What would close it: see where key → commit goes
+(`MACWL_GPU_TRACE` covers the GPU part); the blit could go if the shell
+sampled the optimal image itself (an IOSurface, a Mach-port channel); and
+the composite pass could go for a full-screen client (its buffer as the
+layer's contents).
+
 ## Transform feedback in KosmicKrisp, 2026-11-14
 
-`gpu/kosmickrisp-transform-feedback.patch` (ours, on Mesa `c9ce420`,
-applied by `gpu/kosmickrisp-main.nix`; written by a subagent in its own
-Mesa checkout): `VK_EXT_transform_feedback`, captured the way Honeykrisp
+`gpu/kosmickrisp-transform-feedback/` (ours, ten commits on Mesa
+`c9ce420` meant for upstream, applied by `gpu/kosmickrisp-main.nix`;
+written by a subagent in its own Mesa checkout, then revised for review:
+the passthrough GS built on first capture, a NIR io option in place of an
+output-trimming workaround, no compute path while capture is off): `VK_EXT_transform_feedback`, captured the way Honeykrisp
 does on top of the shared geometry shader emulation (`src/poly`): the GS
 rasterization vertex function writes the captured outputs, after the GS
 count pass, its prefix sum and the pre-GS program have placed each
