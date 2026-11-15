@@ -334,6 +334,70 @@ fn a_unix_socket_path_longer_than_macos_allows() {
     assert_eq!(exit, Exit::Code(0));
 }
 
+/// macwl-run with the GPU on (`gpu/build.sh`'s environment) and nixpkgs'
+/// Linux Mesa as the guest's Vulkan driver.
+fn gpu_setup() -> impl Fn() -> std::process::Command {
+    let build = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gpu/build.sh")).stderr(std::process::Stdio::null()).output().unwrap();
+    assert!(build.status.success(), "gpu/build.sh failed");
+    let env: Vec<(String, String)> = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("export ")?.split_once('=').map(|(k, v)| (k.to_string(), v.replace("${MESA_KK_EXPERIMENTAL-custom_border}", "custom_border"))))
+        .collect();
+    let mesa = std::path::PathBuf::from(linux_package("mesa"));
+    move || {
+        let mut cmd = macwl_run();
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.env("MACWL_ENV_VK_ICD_FILENAMES", mesa.join("share/vulkan/icd.d/virtio_icd.aarch64.json"));
+        cmd
+    }
+}
+
+/// A GPU context's worker dying (Metal aborts a process on misuse: why it's
+/// a process of its own) is a lost device to the guest, at once: a
+/// program waiting on fences gets VK_ERROR_DEVICE_LOST rather than hang
+/// or be told its work finished (gpu/fencebench.c, its worker killed).
+#[test]
+#[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
+fn a_gpu_workers_death_is_a_lost_device() {
+    use std::time::{Duration, Instant};
+    let gpu = gpu_setup();
+    let bench = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/gpu/fencebench-linux");
+    let mut child = gpu().arg(bench).args(["100000000", "0"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let children = |pid: u32| -> Vec<i32> {
+        let out = std::process::Command::new("pgrep").args(["-P", &pid.to_string()]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
+    };
+    // Its render server is macwl-run's child; the context's worker, the
+    // server's.
+    let start = Instant::now();
+    let worker = loop {
+        if let Some(w) = children(child.id()).into_iter().flat_map(|server| children(server as u32)).next() {
+            break w;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "no render worker");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    let killed = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if killed.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!("the guest hung after its GPU worker died");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert!(!status.success(), "{err}");
+    // VK_ERROR_DEVICE_LOST
+    assert!(err.contains(": -4"), "{err}");
+    assert!(killed.elapsed() < Duration::from_secs(2), "{:?} to notice", killed.elapsed());
+}
+
 /// The GPU (docs/gpu.md, step 2): Mesa's Venus driver finds the render
 /// node, `/dev/dri/renderD128`, and runs Vulkan on the Mac's GPU through
 /// it (virglrenderer's render server on KosmicKrisp): `vulkaninfo` names
@@ -342,19 +406,7 @@ fn a_unix_socket_path_longer_than_macos_allows() {
 #[test]
 #[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
 fn venus_through_the_render_node() {
-    let build = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gpu/build.sh")).stderr(std::process::Stdio::null()).output().unwrap();
-    assert!(build.status.success(), "gpu/build.sh failed");
-    let env: Vec<(String, String)> = String::from_utf8_lossy(&build.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix("export ")?.split_once('=').map(|(k, v)| (k.to_string(), v.replace("${MESA_KK_EXPERIMENTAL-custom_border}", "custom_border"))))
-        .collect();
-    let mesa = std::path::PathBuf::from(linux_package("mesa"));
-    let gpu = || {
-        let mut cmd = macwl_run();
-        cmd.envs(env.iter().map(|(k, v)| (k, v)));
-        cmd.env("MACWL_ENV_VK_ICD_FILENAMES", mesa.join("share/vulkan/icd.d/virtio_icd.aarch64.json"));
-        cmd
-    };
+    let gpu = gpu_setup();
     let tools = std::path::PathBuf::from(linux_package("vulkan-tools"));
     let out = gpu().arg(tools.join("bin/vulkaninfo")).arg("--summary").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
