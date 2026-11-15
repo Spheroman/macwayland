@@ -30,7 +30,15 @@ nix build --out-link "$out/roots/kk-main" --impure -f "$here/kosmickrisp-main.ni
 nix build --out-link "$out/roots/vulkan-loader" nixpkgs#vulkan-loader >&2
 # fencebench for Linux (glibc, from nixpkgs' cache: no Linux builder needed)
 # and for macOS, to compare (docs/gpu.md, step 2).
+# (drawbench too, its shaders compiled to SPIR-V with glslang.)
+for src in "$here/drawbench.c" "$here/shaders/draw.vert" "$here/shaders/draw.frag"; do
+    [ "$src" -nt "$out/drawbench-linux" ] && rm -f "$out/fencebench-linux"
+done
 if [ ! -x "$out/fencebench-linux" ] || [ "$here/fencebench.c" -nt "$out/fencebench-linux" ]; then
+    nix build --out-link "$out/roots/glslang" nixpkgs#glslang >&2
+    for stage in vert frag; do
+        "$(readlink "$out/roots/glslang-bin")/bin/glslangValidator" -V --vn "draw_$stage" -o "$out/draw.$stage.h" "$here/shaders/draw.$stage" >&2
+    done
     # (Nix names a non-default output's link LINK-OUTPUT: linux-glibc-dev.)
     nix build --max-jobs 0 --out-link "$out/roots/linux-glibc" "nixpkgs#legacyPackages.aarch64-linux.glibc^out,dev" >&2
     nix build --max-jobs 0 --out-link "$out/roots/linux-vulkan-loader" "nixpkgs#legacyPackages.aarch64-linux.vulkan-loader^out" >&2
@@ -47,6 +55,16 @@ if [ ! -x "$out/fencebench-linux" ] || [ "$here/fencebench.c" -nt "$out/fenceben
     clang -O2 -I "$(readlink "$out/roots/vulkan-headers")/include" "$here/fencebench.c" \
         -L "$(readlink "$out/roots/vulkan-loader")/lib" -lvulkan -Wl,-rpath,"$(readlink "$out/roots/vulkan-loader")/lib" \
         -o "$out/fencebench-mac"
+    clang --target=aarch64-unknown-linux-gnu -O2 -nostdinc -isystem "$(readlink "$out/roots/linux-glibc-dev")/include" \
+        -isystem "$(clang -print-resource-dir)/include" -I "$(readlink "$out/roots/vulkan-headers")/include" -I "$out" \
+        -c "$here/drawbench.c" -o "$out/drawbench.o"
+    "$(readlink "$out/roots/lld")/bin/ld.lld" -o "$out/drawbench-linux" --dynamic-linker="$gl/lib/ld-linux-aarch64.so.1" \
+        -rpath "$gl/lib" -rpath "$(readlink "$out/roots/linux-vulkan-loader")/lib" \
+        "$gl/lib/crt1.o" "$gl/lib/crti.o" "$out/drawbench.o" -L"$gl/lib" -L"$(readlink "$out/roots/linux-vulkan-loader")/lib" \
+        -lvulkan -lc -lm "$gl/lib/crtn.o"
+    clang -O2 -I "$(readlink "$out/roots/vulkan-headers")/include" -I "$out" "$here/drawbench.c" \
+        -L "$(readlink "$out/roots/vulkan-loader")/lib" -lvulkan -Wl,-rpath,"$(readlink "$out/roots/vulkan-loader")/lib" \
+        -o "$out/drawbench-mac"
 fi
 kk=$(readlink "$out/roots/kk-main")
 loader=$(readlink "$out/roots/vulkan-loader")
