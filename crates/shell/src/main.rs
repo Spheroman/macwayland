@@ -164,15 +164,20 @@ impl MappedPool {
     /// Map `pool` and wrap it, if its file is as big as it says.
     fn new(device: &ProtocolObject<dyn MTLDevice>, pool: &ShmPoolHandle) -> Option<MappedPool> {
         use std::os::fd::AsRawFd;
-        let fd = pool.fd().as_raw_fd();
+        Self::of_file(device, pool.fd().as_raw_fd(), pool.size())
+    }
+
+    /// Map the first `size` bytes of file `fd` and wrap them, if it's as
+    /// big as that.
+    fn of_file(device: &ProtocolObject<dyn MTLDevice>, fd: i32, size: usize) -> Option<MappedPool> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } != 0 || (st.st_size as usize) < pool.size() {
+        if unsafe { libc::fstat(fd, &mut st) } != 0 || (st.st_size as usize) < size {
             return None;
         }
         // newBufferWithBytesNoCopy wants whole pages; the last one may run
         // past the end of the file, which reads as zeros.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let len = pool.size().div_ceil(page) * page;
+        let len = size.div_ceil(page) * page;
         let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
         if ptr == libc::MAP_FAILED {
             return None;
@@ -229,6 +234,9 @@ struct ShellHost {
     /// Clients' pools, mapped: each as big as it was when last mapped (a
     /// pool that grew is mapped again).
     pools: Vec<(ShmPoolHandle, Arc<MappedPool>)>,
+    /// Dma-bufs' planes (macwl-run's GPU blobs) mapped, while the
+    /// client has them.
+    dmabufs: Vec<(macwl_compositor::WeakDmabuf, Arc<MappedPool>)>,
     /// MACWL_SHM_COPY=1: copy every buffer, as before (to compare).
     copy: bool,
 }
@@ -248,6 +256,51 @@ impl ShellHost {
         self.pools.retain(|(p, _)| !p.same_pool(pool));
         self.pools.push((pool.clone(), m.clone()));
         Some(m)
+    }
+
+    /// Show surface `id`'s buffer `data`, in `mapped`: a linear texture
+    /// over it, held (with the buffer) while it's on screen.
+    fn show(&mut self, id: u32, mapped: Arc<MappedPool>, data: &BufferData, release: BufferRelease) -> Option<BufferRelease> {
+        use macwl_compositor::ShmFormat;
+        let (w, h) = (data.width as usize, data.height as usize);
+        let (offset, stride) = (data.offset as usize, data.stride as usize);
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                w,
+                h,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Shared);
+        desc.setUsage(MTLTextureUsage::ShaderRead);
+        let Some(texture) = mapped.buffer.as_ref().and_then(|b| b.newTextureWithDescriptor_offset_bytesPerRow(&desc, offset, stride))
+        else {
+            return Some(release);
+        };
+        LEASES.fetch_add(1, Ordering::Relaxed);
+        let lease = Arc::new(Lease { texture, _pool: mapped, _release: release });
+        let opaque = data.format != ShmFormat::Argb8888;
+        let mut scene = self.scene.lock().unwrap();
+        scene.seq += 1;
+        let seq = scene.seq;
+        scene.surfaces.insert(
+            id,
+            ClientFrame {
+                lease: Some(lease),
+                width: w,
+                height: h,
+                opaque,
+                stride: 0,
+                pixels: Vec::new(),
+                seq,
+                committed: CACurrentMediaTime(),
+                dirty: None,
+            },
+        );
+        drop(scene);
+        request_render();
+        None
     }
 }
 
@@ -301,43 +354,30 @@ impl macwl_compositor::Host for ShellHost {
             return Some(release);
         }
         let Some(mapped) = self.mapped(&pool) else { return Some(release) };
-        let desc = unsafe {
-            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                MTLPixelFormat::BGRA8Unorm,
-                w,
-                h,
-                false,
-            )
-        };
-        desc.setStorageMode(MTLStorageMode::Shared);
-        desc.setUsage(MTLTextureUsage::ShaderRead);
-        let Some(texture) = mapped.buffer.as_ref().and_then(|b| b.newTextureWithDescriptor_offset_bytesPerRow(&desc, offset, stride))
-        else {
+        self.show(id, mapped, data, release)
+    }
+
+    /// A dma-buf: its plane's file is mapped and drawn from as a pool is.
+    fn frame_dmabuf(&mut self, id: u32, buffer: &macwl_compositor::Dmabuf, data: &BufferData, _damage: &[Rect], release: BufferRelease) -> Option<BufferRelease> {
+        use std::os::fd::AsRawFd;
+        let (w, h) = (data.width as usize, data.height as usize);
+        let (offset, stride) = (data.offset as usize, data.stride as usize);
+        let fits = w > 0 && h > 0 && stride >= w * 4 && offset % self.align == 0 && stride % self.align == 0;
+        if self.copy || !fits {
             return Some(release);
+        }
+        let need = offset + stride * (h - 1) + w * 4;
+        self.dmabufs.retain(|(b, _)| !b.is_gone());
+        let mapped = match self.dmabufs.iter().find(|(b, m)| b.upgrade().as_ref() == Some(buffer) && m.len >= need) {
+            Some((_, m)) => m.clone(),
+            None => {
+                let fd = buffer.handles().next()?.as_raw_fd();
+                let Some(m) = MappedPool::of_file(&self.device, fd, need).map(Arc::new) else { return Some(release) };
+                self.dmabufs.push((buffer.weak(), m.clone()));
+                m
+            }
         };
-        LEASES.fetch_add(1, Ordering::Relaxed);
-        let lease = Arc::new(Lease { texture, _pool: mapped, _release: release });
-        let opaque = data.format != ShmFormat::Argb8888;
-        let mut scene = self.scene.lock().unwrap();
-        scene.seq += 1;
-        let seq = scene.seq;
-        scene.surfaces.insert(
-            id,
-            ClientFrame {
-                lease: Some(lease),
-                width: w,
-                height: h,
-                opaque,
-                stride: 0,
-                pixels: Vec::new(),
-                seq,
-                committed: CACurrentMediaTime(),
-                dirty: None,
-            },
-        );
-        drop(scene);
-        request_render();
-        None
+        self.show(id, mapped, data, release)
     }
 
     /// The client under the pointer changed its cursor.
@@ -1182,6 +1222,7 @@ fn main() {
             device: device.clone(),
             align: device.minimumLinearTextureAlignmentForPixelFormat(MTLPixelFormat::BGRA8Unorm),
             pools: Vec::new(),
+            dmabufs: Vec::new(),
             copy: std::env::var("MACWL_SHM_COPY").is_ok_and(|v| v == "1"),
         };
         if std::env::var("MACWL_DEBUG_LEASES").is_ok_and(|v| v == "1") {
