@@ -389,7 +389,9 @@ from a static Linux binary.
     done: zero-copy presenting (the guest WSI's prime path: a GPU copy into
     a dma-buf that is shared memory the shell draws from; linux-dmabuf in
     the compositor); Zink presents the same way. A guest GPU client's key →
-    glass is ~1.5–2 ms over native Metal (`gpu/latency.sh`).
+    glass was ~1.5–2 ms over native Metal (`gpu/latency.sh`); after the
+    GPU warm-up on keys, keys flushed at once and framebuffer-only
+    drawables, 0.65 ms (p50, warm GPU; to confirm on an idle machine).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with

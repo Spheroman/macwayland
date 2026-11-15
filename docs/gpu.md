@@ -1,7 +1,7 @@
 # GPU: Vulkan through Venus, GL through Zink
 
-Status: steps 1 to 4 done (2026-11-14, below; step 4's latency just over
-its target): Linux Vulkan and GLES
+Status: steps 1 to 4 done (2026-11-14, below; step 4's latency within
+its target, to confirm on an idle machine): Linux Vulkan and GLES
 programs under macwl-run draw on the Mac's GPU through the runtime's own
 render node. ROADMAP item 11. Costs below are still estimates from measured ones (`docs/processes.md`,
 `docs/mn-threads.md`, `docs/d3dmetal-proton.md`). Worked out with a
@@ -628,6 +628,21 @@ native-probe, the system call log), on the direct full-screen path:
   key → glass p50 7.2 ms, keyframe 9.5 (key → commit 2.0 loaded, 1.7 idle;
   the shell's composite 0.5 ms; then as native). Native's own render is
   ~1 ms of its total. So ~1.2–1.5 ms over native, not yet under 1.
+- **Measured again** (later the same day, another workload keeping the
+  GPU ~37% busy, so neither side woke a cold GPU; samples on the direct
+  path only): native Metal key → glass p50 6.96 / p90 10.73 ms (43
+  samples), keyframe through the node 7.61 / 9.96 ms (99 of 200); its key →
+  commit 1.09 ms. **0.65 ms over native at p50**, under step 4's 1 ms; to
+  confirm on an idle machine, where the GPU's wake is back (the warm-up
+  covers most of it). The shell now draws its background and surfaces in
+  one pass (no separate clear pass; the composite's 0.5 ms is reading the
+  client's frame, not the clear).
+- Where a blocked guest thread's wake goes after ~150 ms idle
+  (`MACWL_WAKE_TRACE=1` times guest runs): 81 µs from a message to the
+  guest's next clock reading, native 35; ~10 of it is waiting in `poll`
+  rather than `read` (native measures the same difference), ~11 entering
+  the guest after the host thread slept, ~20 the dispatcher. Small next to
+  the GPU's wake, which a key's answer waits on anyway.
 - An IOSurface shown as the layer's contents (no composite) was looked at
   with Fable: feasible with public APIs (an IOSurface's Mach port handed
   over a bootstrap name from the worker to the shell; KosmicKrisp writing

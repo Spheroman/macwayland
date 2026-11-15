@@ -744,15 +744,19 @@ impl Renderer {
             None if self.latency_mode => 0.0,
             None => 0.08,
         };
-        let rpd = MTLRenderPassDescriptor::new();
-        let attachment = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
-        attachment.setTexture(Some(&target));
-        attachment.setLoadAction(MTLLoadAction::Clear);
-        attachment.setStoreAction(MTLStoreAction::Store);
-        attachment.setClearColor(MTLClearColor { red: shade, green: shade, blue: shade, alpha: 1.0 });
-        cmd.renderCommandEncoderWithDescriptor(&rpd).expect("no encoder").endEncoding();
-
-        let new_client_frame = if self.latency_mode { None } else { self.draw_scene(&cmd, &target) };
+        let clear = MTLClearColor { red: shade, green: shade, blue: shade, alpha: 1.0 };
+        let new_client_frame = if self.latency_mode {
+            let rpd = MTLRenderPassDescriptor::new();
+            let attachment = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
+            attachment.setTexture(Some(&target));
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            attachment.setClearColor(clear);
+            cmd.renderCommandEncoderWithDescriptor(&rpd).expect("no encoder").endEncoding();
+            None
+        } else {
+            self.draw_scene(&cmd, &target, clear)
+        };
 
         let mtl_drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(drawable);
         // A client frame committed after a key press: the client's answer.
@@ -883,6 +887,7 @@ impl Renderer {
         &mut self,
         cmd: &ProtocolObject<dyn MTLCommandBuffer>,
         target: &ProtocolObject<dyn MTLTexture>,
+        clear: MTLClearColor,
     ) -> Option<f64> {
         let mut new_frame = None;
         {
@@ -913,12 +918,15 @@ impl Renderer {
         // The window and its popups, all drawn in one render pass (no blits
         // into the drawable: it can then be framebuffer-only, which the
         // display takes directly; ~3 ms of a key's latency otherwise).
+        // One pass: the background cleared as it loads (no pass of its own:
+        // that was a second full-screen write), then the surfaces.
         let popups: Vec<_> = layers.collect();
-        if !popups.is_empty() {
+        {
             let rpd = MTLRenderPassDescriptor::new();
             let attachment = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
             attachment.setTexture(Some(target));
-            attachment.setLoadAction(MTLLoadAction::Load);
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setClearColor(clear);
             attachment.setStoreAction(MTLStoreAction::Store);
             let encoder = cmd.renderCommandEncoderWithDescriptor(&rpd).expect("no encoder");
             encoder.setRenderPipelineState(&self.quad);
