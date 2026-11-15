@@ -337,12 +337,19 @@ fn a_unix_socket_path_longer_than_macos_allows() {
 /// macwl-run with the GPU on (`gpu/build.sh`'s environment) and nixpkgs'
 /// Linux Mesa as the guest's Vulkan driver.
 fn gpu_setup() -> impl Fn() -> std::process::Command {
-    let build = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gpu/build.sh")).stderr(std::process::Stdio::null()).output().unwrap();
-    assert!(build.status.success(), "gpu/build.sh failed");
-    let env: Vec<(String, String)> = String::from_utf8_lossy(&build.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix("export ")?.split_once('=').map(|(k, v)| (k.to_string(), v.replace("${MESA_KK_EXPERIMENTAL-custom_border}", "custom_border"))))
-        .collect();
+    // gpu/build.sh once for every test of this process (it can't run twice
+    // at once).
+    static ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let env = ENV
+        .get_or_init(|| {
+            let build = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gpu/build.sh")).stderr(std::process::Stdio::null()).output().unwrap();
+            assert!(build.status.success(), "gpu/build.sh failed");
+            String::from_utf8_lossy(&build.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix("export ")?.split_once('=').map(|(k, v)| (k.to_string(), v.replace("${MESA_KK_EXPERIMENTAL-custom_border}", "custom_border"))))
+                .collect()
+        })
+        .clone();
     let mesa = std::path::PathBuf::from(linux_package("mesa"));
     move || {
         let mut cmd = macwl_run();
@@ -396,6 +403,69 @@ fn a_gpu_workers_death_is_a_lost_device() {
     // VK_ERROR_DEVICE_LOST
     assert!(err.contains(": -4"), "{err}");
     assert!(killed.elapsed() < Duration::from_secs(2), "{:?} to notice", killed.elapsed());
+}
+
+/// Presenting (docs/gpu.md, step 4): a guest Vulkan client's frames reach
+/// the compositor as dma-bufs (Mesa's WSI on its prime path: a GPU copy
+/// into a linear buffer, which is a GPU blob's shared memory), each one
+/// finished before it's committed: gpu/keyframe.c under the headless
+/// compositor, which types `a`, `b` and Escape into it and dumps the
+/// frames it gets (grey, then red, then green).
+#[test]
+#[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
+fn a_gpu_client_presents_finished_frames_as_dma_bufs() {
+    use std::time::{Duration, Instant};
+    let gpu = gpu_setup();
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let built = std::process::Command::new("cargo").args(["build", "-q", "-p", "macwl-compositor"]).current_dir(root).status().unwrap();
+    assert!(built.success());
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let mut compositor = std::process::Command::new(format!("{root}/target/debug/macwl-compositor"))
+        .current_dir(&dir)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("MACWL_TYPE", "a\\pb\\p\\e")
+        .env("RUST_LOG", "info")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !dir.join("wayland-mac").exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no compositor");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = gpu()
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("WAYLAND_DISPLAY", "wayland-mac")
+        .arg(format!("{root}/target/gpu/keyframe-linux"))
+        .output()
+        .unwrap();
+    let _ = compositor.kill();
+    let log = {
+        let mut s = String::new();
+        std::io::Read::read_to_string(compositor.stdout.as_mut().unwrap(), &mut s).unwrap();
+        s
+    };
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The middle pixel of each frame dumped (PPM: RGB).
+    let middle = |name: &str| -> [u8; 3] {
+        let d = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}\n{log}"));
+        let mut parts = d.splitn(4, |&b| b == b'\n');
+        let (_, size, _) = (parts.next(), parts.next().unwrap(), parts.next());
+        let px = parts.next().unwrap();
+        let size = String::from_utf8_lossy(size);
+        let (w, h) = size.split_once(' ').map(|(w, h)| (w.parse::<usize>().unwrap(), h.parse::<usize>().unwrap())).unwrap();
+        let i = ((h / 2) * w + w / 2) * 3;
+        [px[i], px[i + 1], px[i + 2]]
+    };
+    assert_eq!(middle("frame-0.ppm"), [26, 26, 26], "{log}");
+    assert_eq!(middle("frame-1.ppm"), [229, 77, 51], "{log}");
+    assert_eq!(middle("frame-2.ppm"), [51, 178, 77], "{log}");
+    // Dma-bufs: their buffers are GPU blobs, whole 16 KiB pages (a wl_shm
+    // pool would be the frame's size).
+    let lens: Vec<usize> = log.lines().filter_map(|l| l.split("pool_len=").nth(1)?.trim().parse().ok()).collect();
+    assert!(!lens.is_empty() && lens.iter().all(|l| l % 16384 == 0), "{log}");
 }
 
 /// The GPU (docs/gpu.md, step 2): Mesa's Venus driver finds the render
