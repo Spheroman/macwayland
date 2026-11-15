@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #define VK_USE_PLATFORM_WAYLAND_KHR
@@ -22,6 +23,15 @@ static struct wl_compositor *compositor;
 static struct xdg_wm_base *wm_base;
 static struct wl_seat *seat;
 static int width = 640, height = 480, configured, resized, keys, quit;
+// KEYFRAME_TRACE=1: when each key came and each stage of its answer (µs on
+// CLOCK_MONOTONIC: the host's uptime clock under macwl-run).
+static int trace;
+static double key_at;
+static double now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
 
 static void ping(void *d, struct xdg_wm_base *b, uint32_t serial) { (void)d; xdg_wm_base_pong(b, serial); }
 static const struct xdg_wm_base_listener wm_listener = {ping};
@@ -55,6 +65,7 @@ static void kb_key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint3
         if (key == 1) // Esc
             quit = 1;
         keys++;
+        key_at = now_us();
     }
 }
 static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t g) { (void)d, (void)k, (void)s, (void)a, (void)b, (void)c, (void)g; }
@@ -116,6 +127,7 @@ static void make_swapchain(void) {
 }
 
 int main(int argc, char **argv) {
+    trace = getenv("KEYFRAME_TRACE") != NULL;
     if (argc > 1 && !strcmp(argv[1], "mailbox"))
         mode = VK_PRESENT_MODE_MAILBOX_KHR;
     struct wl_display *display = wl_display_connect(NULL);
@@ -189,10 +201,13 @@ int main(int argc, char **argv) {
         }
         if (drawn != keys) {
             drawn = keys;
+            double t0 = now_us();
             CHECK(vkWaitForFences(dev, 1, &done, VK_TRUE, UINT64_MAX));
             CHECK(vkResetFences(dev, 1, &done));
             uint32_t i;
+            double t1 = now_us();
             CHECK(vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &i));
+            double t2 = now_us();
             VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
             CHECK(vkBeginCommandBuffer(cb, &bi));
             VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -212,12 +227,16 @@ int main(int argc, char **argv) {
             VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = 1, .pWaitSemaphores = &acquired, .pWaitDstStageMask = &wait_stage,
                                .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &rendered};
             CHECK(vkQueueSubmit(q, 1, &si, done));
+            double t3 = now_us();
             VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &rendered, .swapchainCount = 1, .pSwapchains = &swapchain, .pImageIndices = &i};
             VkResult pr = vkQueuePresentKHR(q, &pi);
             if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
                 resized = 1;
             else
                 CHECK(pr);
+            if (trace)
+                fprintf(stderr, "keyframe: key %.1f loop +%.0f fence +%.0f acquire +%.0f record+submit +%.0f present +%.0f\n", key_at,
+                        t0 - key_at, t1 - t0, t2 - t1, t3 - t2, now_us() - t3);
         }
         // Then wait for the next key (or configure).
         if (wl_display_dispatch(display) < 0)

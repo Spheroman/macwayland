@@ -339,6 +339,8 @@ struct App {
     /// When frame callbacks were last sent.
     last_callbacks: Instant,
     start: Instant,
+    /// A key press was traced (MACWL_KEY_TRACE): trace the flush after it.
+    key_traced: bool,
 }
 
 impl CompositorHandler for App {
@@ -992,12 +994,32 @@ impl App {
     fn input(&mut self, event: InputEvent) {
         match event {
             InputEvent::Key { code, pressed, time_ms } => {
+                // MACWL_KEY_TRACE=1: when a key press is handled, in µs on
+                // the host's uptime clock (a guest's CLOCK_MONOTONIC).
+                if pressed && std::env::var_os("MACWL_KEY_TRACE").is_some() {
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
+                    eprintln!("compositor: key {code} handled {:.1}", ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3);
+                    self.key_traced = true;
+                }
                 let Some(keyboard) = self.seat.get_keyboard() else { return };
                 let state = if pressed { KeyState::Pressed } else { KeyState::Released };
                 // xkb keycodes are evdev codes + 8.
+                let t_in = Instant::now();
                 keyboard.input::<(), _>(self, (code + 8).into(), state, SERIAL_COUNTER.next_serial(), time_ms, |_, _, _| {
                     FilterResult::Forward
                 });
+                if pressed && self.key_traced {
+                    eprintln!("compositor: keyboard.input took {:.1} µs", t_in.elapsed().as_secs_f64() * 1e6);
+                }
+                // Out to the client now, not after the rest of this turn of
+                // the loop (~180 µs of a key's latency).
+                let _ = self.dh.flush_clients();
+                if pressed && self.key_traced {
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
+                    eprintln!("compositor: key sent to client {:.1}", ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3);
+                }
             }
             InputEvent::PointerMotion { x, y, time_ms } => {
                 let Some(pointer) = self.seat.get_pointer() else { return };
@@ -1275,6 +1297,7 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
         releases,
         last_callbacks: Instant::now(),
         start: Instant::now(),
+        key_traced: false,
     };
 
     // Everything happens in an event loop, the moment there's something to
@@ -1350,6 +1373,11 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
         state.read_copy();
         state.show_cursor();
         state.dh.flush_clients()?;
+        if std::mem::take(&mut state.key_traced) {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
+            eprintln!("compositor: flushed {:.1}", ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3);
+        }
     }
 }
 

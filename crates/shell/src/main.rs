@@ -688,6 +688,11 @@ impl Renderer {
             if pending.is_some_and(|(_, seen)| committed > seen) { pending.take().map(|p| (p, committed)) } else { None }
         });
         if let Some(((key_ts, _), committed)) = answered {
+            // MACWL_KEY_TRACE=1: when, on the host's uptime clock (a guest's
+            // CLOCK_MONOTONIC), in µs, to line up with the client's own.
+            if std::env::var_os("MACWL_KEY_TRACE").is_some() {
+                eprintln!("shell: key sent {:.1} committed {:.1}", key_ts * 1e6, committed * 1e6);
+            }
             let stats = self.stats.clone();
             let handler = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
                 let glass = unsafe { d.as_ref().presentedTime() };
