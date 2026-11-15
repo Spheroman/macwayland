@@ -105,6 +105,9 @@ struct Gpu {
     /// Blobs whose fds the guest holds, by the fd's (device, inode): a
     /// PRIME import of one finds it again.
     exported: Mutex<HashMap<(u64, u64), Weak<Resource>>>,
+    /// Contexts whose worker went (Metal aborting, say): their fences
+    /// failed, their calls ENODEV, as a lost device.
+    lost: Mutex<std::collections::HashSet<u32>>,
 }
 
 fn gpu() -> Result<&'static Gpu, i64> {
@@ -178,6 +181,7 @@ impl Gpu {
             next_res: AtomicU32::new(1),
             pending: Mutex::default(),
             exported: Mutex::default(),
+            lost: Mutex::default(),
         })
     }
 
@@ -204,8 +208,17 @@ extern "C" fn write_fence(_cookie: *mut c_void, _fence: u32) {}
 
 /// A context's fence `fence_id` on `ring_idx` retired: so did every
 /// earlier one on that ring (fences retire in creation order per ring).
+/// `u64::MAX` says the context is lost: its worker went, and the proxy is
+/// about to retire its fences anyway (gpu/virglrenderer-macos-vtest.patch).
 extern "C" fn write_context_fence(_cookie: *mut c_void, ctx_id: u32, ring_idx: u32, fence_id: u64) {
     let Ok(gpu) = gpu_started() else { return };
+    if fence_id == u64::MAX {
+        if gpu.lost.lock().unwrap_or_else(|e| e.into_inner()).insert(ctx_id) {
+            eprintln!("macwl-run: GPU context {ctx_id} lost (its render worker went)");
+        }
+        gpu.fail_context(ctx_id);
+        return;
+    }
     let done: Vec<Arc<Fence>> = {
         let mut p = gpu.pending.lock().unwrap_or_else(|e| e.into_inner());
         let Some(ring) = p.get_mut(&(ctx_id, ring_idx)) else { return };
@@ -332,11 +345,18 @@ impl Drop for ContextState {
             });
             drop(bos);
             gpu.fail_context(self.id);
+            gpu.lost.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
         }
     }
 }
 
 impl Context {
+    /// ENODEV once its worker has gone.
+    fn alive(&self) -> Result<&Self, i64> {
+        let lost = gpu().map(|g| g.lost.lock().unwrap_or_else(|e| e.into_inner()).contains(&self.0.id)).unwrap_or(true);
+        if lost { Err(errno::ENODEV) } else { Ok(self) }
+    }
+
     fn add(&self, r: Arc<Resource>) -> u32 {
         let mut bos = self.0.bos.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((&h, _)) = bos.by_handle.iter().find(|(_, b)| Arc::ptr_eq(b, &r)) {
@@ -448,6 +468,7 @@ pub fn ioctl(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, n
         //   u64 size; u32 pad, cmd_size; u64 cmd; u64 blob_id }
         0x4a => {
             let ctx = node.context()?;
+            ctx.alive()?;
             let gpu = gpu()?;
             let [blob_mem, blob_flags, _, _]: [u32; 4] = mem.read_pod(arg)?;
             let size = page_round(mem.read_pod::<u64>(arg + 16)?);
@@ -581,6 +602,7 @@ const EXECBUF_SYNCOBJ_RESET: u32 = 1;
 
 fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, size: usize, arg: u64) -> Result<i64, i64> {
     let ctx = node.context()?;
+    ctx.alive()?;
     let gpu = gpu()?;
     let [flags, len]: [u32; 2] = mem.read_pod(arg)?;
     let command: u64 = mem.read_pod(arg + 8)?;
@@ -639,6 +661,10 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
         gpu.pending.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(ctx.0.id, ring)).map(|r| r.remove(&id));
         fence.fail();
         return Err(errno::EINVAL);
+    }
+    // Lost as it was made: no retire will come for it.
+    if ctx.alive().is_err() {
+        gpu.fail_context(ctx.0.id);
     }
     if flags & EXECBUF_FENCE_FD_OUT != 0 {
         let fd = p.fds.insert(FdEntry::new(sync::fd_for(Token::SyncFile(fence))?).cloexec(true));
