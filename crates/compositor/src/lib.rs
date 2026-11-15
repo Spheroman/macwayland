@@ -75,14 +75,22 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState, shm_buffer_pool, with_buffer_contents},
         socket::ListeningSocketSource,
+        dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf},
     },
+    backend::allocator::{Buffer as _, Format as DrmFormat, Fourcc, Modifier},
 };
 use tracing::{info, warn};
 
 pub use smithay::{
+    backend::allocator::dmabuf::{Dmabuf, WeakDmabuf},
     reexports::wayland_server::protocol::wl_shm::Format as ShmFormat,
     wayland::shm::{BufferData, ShmPoolHandle},
 };
+
+/// The device clients render with, as a Linux `dev_t`: the render node
+/// macwl-run gives its guests, /dev/dri/renderD128 (226, 128). linux-dmabuf
+/// feedback names it; clients pick their GPU by it.
+const RENDER_NODE: u64 = (226 << 8) | 128;
 
 pub mod keymap;
 
@@ -204,6 +212,13 @@ pub trait Host: Send {
     ) -> Option<BufferRelease> {
         Some(release)
     }
+    /// Surface `id` committed a dma-buf (linux-dmabuf): one plane, linear,
+    /// whose fd is shared memory (macwl-run's GPU blobs), `data` saying
+    /// where in it the pixels are. As [`Host::frame_shared`]: taken, or
+    /// given back to come again as [`Host::frame`].
+    fn frame_dmabuf(&mut self, _id: u32, _buffer: &Dmabuf, _data: &BufferData, _damage: &[Rect], release: BufferRelease) -> Option<BufferRelease> {
+        Some(release)
+    }
     /// What's on screen changed: these surfaces, bottom to top. A surface
     /// not listed isn't shown: forget it, and if it comes back, take all
     /// of its next frame.
@@ -289,6 +304,8 @@ struct App {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
+    dmabuf_state: DmabufState,
+    _dmabuf_global: DmabufGlobal,
     seat_state: SeatState<Self>,
     seat: Seat<Self>,
     data_device_state: DataDeviceState,
@@ -418,8 +435,9 @@ impl App {
                     // The host reads the buffer where it is, if it can (and
                     // releases it later); otherwise it gets a copy now.
                     let release = BufferRelease { buffer: Some(buffer.clone()), to: self.releases.clone() };
-                    let declined = match shm_buffer_pool(&buffer) {
-                        Ok((pool, data)) => {
+                    let dmabuf = get_dmabuf(&buffer).ok().cloned();
+                    let declined = match (shm_buffer_pool(&buffer), dmabuf) {
+                        (Ok((pool, data)), _) => {
                             let rects = buffer_damage(&damage, scale, data.width, data.height);
                             let declined = host.frame_shared(id, pool, &data, &rects, release);
                             if declined.is_none() {
@@ -427,7 +445,21 @@ impl App {
                             }
                             declined
                         }
-                        Err(_) => Some(release),
+                        (_, Some(dmabuf)) => {
+                            let data = dmabuf_data(&dmabuf);
+                            let rects = buffer_damage(&damage, scale, data.width, data.height);
+                            set_mapped(surface, Some(Mapped { size: (data.width, data.height), scale }));
+                            host.frame_dmabuf(id, &dmabuf, &data, &rects, release).and_then(|release| {
+                                // Copied, then: read where it is.
+                                let ok = with_dmabuf_contents(&dmabuf, |pixels| host.frame(id, pixels, &data, &rects));
+                                if !ok {
+                                    warn!("a dma-buf the host couldn't read");
+                                }
+                                release.now();
+                                None
+                            })
+                        }
+                        _ => Some(release),
                     };
                     if let Some(release) = declined {
                         let result = with_buffer_contents(&buffer, |ptr, len, data| {
@@ -606,6 +638,62 @@ fn window_geometry(surface: &WlSurface) -> Option<Rectangle<i32, Logical>> {
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+impl DmabufHandler for App {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    /// One plane, linear, in a format the host draws: what macwl-run's
+    /// GPU makes (its blobs: shared memory).
+    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: smithay::backend::allocator::dmabuf::Dmabuf, notifier: ImportNotifier) {
+        let format = dmabuf.format();
+        let ok = dmabuf.num_planes() == 1
+            // (INVALID: "implicit", which Mesa's prime buffers say: linear.)
+            && matches!(format.modifier, Modifier::Linear | Modifier::Invalid)
+            && matches!(format.code, Fourcc::Argb8888 | Fourcc::Xrgb8888);
+        if ok {
+            let _ = notifier.successful::<App>();
+        } else {
+            warn!("declined a dma-buf: {} planes, {:?}", dmabuf.num_planes(), format);
+            notifier.failed();
+        }
+    }
+}
+
+/// A dma-buf's one plane as shm `BufferData`.
+fn dmabuf_data(dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf) -> BufferData {
+    let format = match dmabuf.format().code {
+        Fourcc::Argb8888 => ShmFormat::Argb8888,
+        _ => ShmFormat::Xrgb8888,
+    };
+    BufferData {
+        offset: dmabuf.offsets().next().unwrap_or(0) as i32,
+        width: dmabuf.width() as i32,
+        height: dmabuf.height() as i32,
+        stride: dmabuf.strides().next().unwrap_or(0) as i32,
+        format,
+    }
+}
+
+/// Call `f` with a dma-buf's plane's memory (the whole of its file), if it
+/// can be mapped. Whether it could.
+fn with_dmabuf_contents(dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf, f: impl FnOnce(&[u8])) -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(fd) = dmabuf.handles().next() else { return false };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || st.st_size <= 0 {
+        return false;
+    }
+    let len = st.st_size as usize;
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+    if ptr == libc::MAP_FAILED {
+        return false;
+    }
+    f(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) });
+    unsafe { libc::munmap(ptr, len) };
+    true
 }
 
 impl ShmHandler for App {
@@ -1105,6 +1193,7 @@ delegate_data_device!(App);
 delegate_xdg_decoration!(App);
 delegate_seat!(App);
 delegate_shm!(App);
+smithay::delegate_dmabuf!(App);
 delegate_xdg_shell!(App);
 delegate_cursor_shape!(App);
 
@@ -1149,12 +1238,22 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
     output.set_preferred(mode);
     let (copies, copied) = channel::channel::<String>();
     let (releases, released) = channel::channel::<wl_buffer::WlBuffer>();
+    // linux-dmabuf: linear XRGB and ARGB, rendered on the guests' node.
+    let mut dmabuf_state = DmabufState::new();
+    let formats: Vec<DrmFormat> = [Fourcc::Xrgb8888, Fourcc::Argb8888]
+        .into_iter()
+        .flat_map(|code| [Modifier::Linear, Modifier::Invalid].map(|modifier| DrmFormat { code, modifier }))
+        .collect();
+    let feedback = DmabufFeedbackBuilder::new(RENDER_NODE as libc::dev_t, formats).build()?;
+    let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<App>(&dh, &feedback);
     let mut state = App {
         dh: dh.clone(),
         host,
         compositor_state: CompositorState::new::<App>(&dh),
         xdg_shell_state: XdgShellState::new::<App>(&dh),
         shm_state: ShmState::new::<App>(&dh, vec![wl_shm::Format::Xrgb8888]),
+        dmabuf_state,
+        _dmabuf_global: dmabuf_global,
         seat_state,
         seat,
         data_device_state: DataDeviceState::new::<App>(&dh),

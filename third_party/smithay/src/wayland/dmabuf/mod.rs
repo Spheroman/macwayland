@@ -447,14 +447,16 @@ impl PartialEq for DmabufFeedback {
 impl DmabufFeedback {
     /// Send this feedback to the provided [`ZwpLinuxDmabufFeedbackV1`](zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1)
     pub fn send(&self, feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1) {
-        feedback.main_device(self.0.main_device.to_ne_bytes().to_vec());
+        // A dev_t is 8 bytes on Linux, where clients are; 4 on macOS
+        // (macwayland change).
+        feedback.main_device((self.0.main_device as u64).to_ne_bytes().to_vec());
         feedback.format_table(
             self.0.format_table.file.as_fd(),
             self.0.format_table.file.size() as u32,
         );
 
         for tranche in self.0.tranches.iter() {
-            feedback.tranche_target_device(tranche.target_device.to_ne_bytes().to_vec());
+            feedback.tranche_target_device((tranche.target_device as u64).to_ne_bytes().to_vec());
             feedback.tranche_flags(tranche.flags);
             feedback.tranche_formats(
                 tranche
