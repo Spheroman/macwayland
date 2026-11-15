@@ -1,6 +1,6 @@
 # GPU: Vulkan through Venus, GL through Zink
 
-Status: steps 1 and 2 done (2026-11-14, below): Linux Vulkan and GLES
+Status: steps 1 to 3 done (2026-11-14, below): Linux Vulkan and GLES
 programs under macwl-run draw on the Mac's GPU through the runtime's own
 render node. ROADMAP item 11. Costs below are still estimates from measured ones (`docs/processes.md`,
 `docs/mn-threads.md`, `docs/d3dmetal-proton.md`). Worked out with a
@@ -342,7 +342,8 @@ ms per pipeline the first time, ~1 ms from Metal's cache.
    worker mid-frame gets the guest `VK_ERROR_DEVICE_LOST` within a frame,
    not a hang.
 3. **Overhead**: one benchmark (vkoverhead or a 10,000-draw scene, and one
-   fill-bound scene) through the guest and natively on KosmicKrisp.
+   fill-bound scene) through the guest and natively on KosmicKrisp. Done
+   (below): 91–95% draw-bound, 95–100% GPU-bound.
    Pass: 85% of native or better draw-bound, 95% GPU-bound; fence wake p50
    under 30 µs, p99 under 150 µs; no system calls per frame but present's.
    Fail: the case for the split driver.
@@ -495,6 +496,50 @@ the checklist held.
   it would on Linux.
 - **Not checked yet**: EGL on Wayland and GBM through the node (Zink on
   the surfaceless platform works: GL 3.3, below).
+
+## Step 3, 2026-11-14: overhead
+
+Two benchmarks, each the same source built for Linux (under macwl-run,
+through the render node) and natively for macOS (KosmicKrisp directly):
+`gpu/fencebench.c` (a submission and a wait for its fence, over and over)
+and `gpu/drawbench.c` (offscreen 1920x1080, three frames in flight,
+command buffers recorded anew each frame: DRAWS tiny triangles with
+their push constants, or PASSES full-screen ones of a heavy fragment
+shader). `gpu/build.sh` builds them (glibc ones for Linux from nixpkgs'
+cache, so no Linux builder; SPIR-V with glslang).
+
+**Throughput** (fps, two runs each): the pass criteria hold.
+
+| | natively | through the node | |
+|---|---|---|---|
+| 10,000 draws a frame | 180–189 | 171 | 91–95% (criterion 85%) |
+| 1,000 draws a frame | 4380–4512 | 3538–3563 | 79–81% |
+| 16 full-screen passes | 1653–1694 | 1565–1696 | 95–100% (criterion 95%) |
+
+What the small frames pay is a fixed ~50 µs a frame: the round trip
+below, 0.05 ms of a 120 Hz frame's 8.3.
+
+**A fence's round trip** (fencebench, empty command buffer, p50): 25–27 µs
+natively, 64–81 µs through the node. `MACWL_GPU_TRACE=1` (macwl-run's
+environment; `=2` also logs execbuffers) stamps each fence through its
+execbuffer, virglrenderer's callback and the guest's wait, and prints the
+segments as the context goes (`drm/trace.rs`):
+
+| p50 | |
+|---|---|
+| execbuffer, before virglrenderer | 1.7 µs (5.2 before reading the struct in one read: each read of guest memory walks its page tables) |
+| `virgl_renderer_submit_cmd` | 2.8 µs (a one-way socket send) |
+| making the fence (`context_create_fence`) | 4.4 µs (another) |
+| fence made → signalled (worker, GPU, proxy) | 33–41 µs (the native round trip is ~27: ~6–14 µs in vkr's ring and sync threads, the FIFO "eventfd" and the proxy's sync thread) |
+| signalled → the guest's wait returns | 9–10 µs (the runtime's wake, as for any wait) |
+| the rest, in the guest | ~10 µs: Venus encodes `vkQueueSubmit` on its ring, then makes *two* execbuffers a submission (`vkSubmitVirtqueueSeqnoMESA` on ring 0, `vkWaitRingSeqnoMESA` on the queue's ring 1 with the fence), the syncobj reset |
+
+Nothing left is one big cost. What would cut it: the eventfd as a kqueue
+user event rather than a FIFO (the proxy and worker are ours to patch),
+the two execbuffers' sends as one (they're consecutive), a short spin
+before a fence wait sleeps (trading a CPU for ~5 µs; not by default).
+Not done: none is worth it until presenting (step 4) says the frame's
+budget needs it.
 
 ## Transform feedback in KosmicKrisp, 2026-11-14
 

@@ -382,7 +382,10 @@ from a static Linux binary.
     it as on Linux (`vkcube`, the dEQP-VK subset, fences ~40–70 µs over
     native a round trip). Transform feedback in KosmicKrisp (our patch,
     `gpu/kosmickrisp-transform-feedback.patch`): Zink says GL 3.3 and
-    GLES 3.1 without an override.
+    GLES 3.1 without an override. A render worker's death is a lost
+    device to the guest at once. Step 3 done: 91–95% of native frame rate
+    draw-bound (10,000 draws a frame), 95–100% GPU-bound; a fence's round
+    trip ~40 µs over native, broken down (`MACWL_GPU_TRACE`).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with
