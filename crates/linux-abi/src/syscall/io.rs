@@ -27,7 +27,7 @@ fn read_host(p: &Process, t: &Thread, fd: u64, data: &mut [u8], off: Option<u64>
         FileKind::TimerFd(timer) => return kfd::timerfd_read(p, t, &entry, timer, data),
         FileKind::Inotify(_) => return super::inotify_read(p, t, &entry, data),
         FileKind::SignalFd(signalfd) => return super::signalfd_read(p, t, &entry, signalfd, data),
-        FileKind::Epoll(_) | FileKind::PidFd(_) | FileKind::Drm(_) => return Err(errno::EINVAL),
+        FileKind::Epoll(_) | FileKind::PidFd(_) | FileKind::Drm(_) | FileKind::Sync(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
     let host = entry.host.as_raw_fd();
@@ -62,7 +62,7 @@ fn write_host(p: &Process, t: &Thread, fd: u64, data: &[u8], off: Option<u64>) -
     let entry = p.fds.get(fd)?;
     match &entry.kind {
         FileKind::EventFd(state) => return kfd::eventfd_write(&entry, state, data),
-        FileKind::TimerFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::SignalFd(_) | FileKind::PidFd(_) | FileKind::Drm(_) => return Err(errno::EINVAL),
+        FileKind::TimerFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::SignalFd(_) | FileKind::PidFd(_) | FileKind::Drm(_) | FileKind::Sync(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
     let host = entry.host.as_raw_fd();
@@ -322,7 +322,7 @@ pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, f
     }
     match (req >> 8) & 0xff {
         0x3e /* '>' */ => {
-            if let Some(crate::drm::sync::Token::SyncFile(fence)) = crate::drm::sync::token_of(host) {
+            if let Some(crate::drm::sync::Token::SyncFile(fence)) = crate::drm::sync::token_of_fd(p, fd) {
                 return crate::drm::node::sync_file_ioctl(p, &crate::memory::ByRef(mem), &fence, req, arg);
             }
         }

@@ -153,13 +153,13 @@ pub fn ioctl(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, r
             } else {
                 Token::Syncobj(s)
             };
-            let fd = p.fds.insert(crate::fs::FdEntry::new(sync::fd_for(token)?).cloexec(true));
+            let fd = p.fds.insert(sync::entry(token)?);
             mem.write_pod(arg + 8, &(fd as i32))?;
             Ok(0)
         }
         nr::SYNCOBJ_FD_TO_HANDLE => {
             let [handle, flags, fd, _pad]: [u32; 4] = mem.read_pod(arg)?;
-            let token = sync::token_of(p.fds.host(fd as i32 as u64)?).ok_or(errno::EINVAL)?;
+            let token = sync::token_of_fd(p, fd as i32 as u64).ok_or(errno::EINVAL)?;
             if flags & SYNCOBJ_FD_TO_HANDLE_IMPORT_SYNC_FILE != 0 {
                 let Token::SyncFile(f) = token else { return Err(errno::EINVAL) };
                 let point = if size >= 24 { mem.read_pod::<u64>(arg + 16)? } else { 0 };
@@ -346,9 +346,9 @@ pub fn sync_file_ioctl(p: &Process, mem: &dyn GuestMemory, fence: &Arc<Fence>, r
         MERGE => {
             // { char name[32]; s32 fd2; s32 fence }
             let fd2: i32 = mem.read_pod(arg + 32)?;
-            let Some(Token::SyncFile(other)) = sync::token_of(p.fds.host(fd2 as u64)?) else { return Err(errno::EINVAL) };
+            let Some(Token::SyncFile(other)) = sync::token_of_fd(p, fd2 as u64) else { return Err(errno::EINVAL) };
             let merged = Fence::all(&[fence.clone(), other]);
-            let fd = p.fds.insert(crate::fs::FdEntry::new(sync::fd_for(Token::SyncFile(merged))?).cloexec(true));
+            let fd = p.fds.insert(sync::entry(Token::SyncFile(merged))?);
             mem.write_pod(arg + 36, &(fd as i32))?;
             Ok(0)
         }
@@ -374,7 +374,7 @@ pub fn dma_buf_ioctl(p: &Process, mem: &dyn GuestMemory, req: u64, arg: u64) -> 
     match req {
         // { u32 flags; s32 fd }
         EXPORT_SYNC_FILE => Some((|| {
-            let fd = p.fds.insert(crate::fs::FdEntry::new(sync::fd_for(Token::SyncFile(Fence::signaled_now()))?).cloexec(true));
+            let fd = p.fds.insert(sync::entry(Token::SyncFile(Fence::signaled_now()))?);
             mem.write_pod(arg + 4, &(fd as i32))?;
             Ok(0)
         })()),

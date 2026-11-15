@@ -172,7 +172,7 @@ impl Process {
         }
         // The kqueue-backed fds it inherits, by their state.
         // (A render node's GPU context is this host's: it doesn't move.)
-        let made: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| !matches!(f.kind, crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_) | crate::fs::FileKind::Drm(_))).collect();
+        let made: Vec<_> = self.fds.inherited_files().into_iter().filter(|(_, f)| !matches!(f.kind, crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_) | crate::fs::FileKind::Drm(_) | crate::fs::FileKind::Sync(_))).collect();
         e.u64(made.len() as u64);
         for (n, f) in &made {
             e.u64(*n as u64);
@@ -201,7 +201,7 @@ impl Process {
                     }
                 }
                 crate::fs::FileKind::SignalFd(signalfd) => drop(e.u64(5).u64(signalfd.mask())),
-                crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_) | crate::fs::FileKind::Drm(_) => unreachable!(),
+                crate::fs::FileKind::Plain | crate::fs::FileKind::PidFd(_) | crate::fs::FileKind::Drm(_) | crate::fs::FileKind::Sync(_) => unreachable!(),
             }
             e.bool(nonblock);
         }

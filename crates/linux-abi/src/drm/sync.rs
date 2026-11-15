@@ -180,11 +180,13 @@ impl Syncobj {
     }
 
     /// The fence at `point` (or, for a timeline, the first after it), if
-    /// one has been attached.
+    /// one has been attached. Point 0 is a binary syncobj's payload, or a
+    /// timeline's last fence (as Linux's syncobj's fence is its chain's
+    /// head: what exporting a sync file or a binary wait takes).
     pub fn fence(&self, point: u64) -> Option<Arc<Fence>> {
         let points = self.points.lock().unwrap_or_else(|e| e.into_inner());
         if point == 0 {
-            return points.get(&0).cloned();
+            return points.get(&0).or_else(|| points.values().next_back()).cloned();
         }
         points.range(point..).next().map(|(_, f)| f.clone())
     }
@@ -267,6 +269,23 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino))
 }
 
+/// A new fd's entry for `token`: the fd of [`fd_for`], holding the token.
+pub fn entry(token: Token) -> Result<crate::fs::FdEntry, i64> {
+    let mut e = crate::fs::FdEntry::new(fd_for(token.clone())?).cloexec(true);
+    e.kind = crate::fs::FileKind::Sync(token);
+    Ok(e)
+}
+
+/// What a process's fd `fd` stands for: its own entry's token, or (an fd
+/// that came from elsewhere, through SCM_RIGHTS) the registry's.
+pub fn token_of_fd(p: &crate::Process, fd: u64) -> Option<Token> {
+    let file = p.fds.get(fd).ok()?;
+    if let crate::fs::FileKind::Sync(t) = &file.kind {
+        return Some(t.clone());
+    }
+    token_of(std::os::fd::AsRawFd::as_raw_fd(&file.host))
+}
+
 /// What host fd `fd` stands for, if it's one made here.
 pub fn token_of(fd: i32) -> Option<Token> {
     let id = identity(fd)?;
@@ -321,6 +340,16 @@ mod tests {
         assert_eq!(s.signaled_point(), 3);
         s.trim();
         assert!(s.fence(1).is_some_and(|f| Arc::ptr_eq(&f, &b)));
+    }
+
+    #[test]
+    fn point_0_of_a_timeline_is_its_last_fence() {
+        let s = Syncobj::new(false);
+        assert!(s.fence(0).is_none());
+        let (a, b) = (Fence::new(), Fence::new());
+        s.attach(1, a);
+        s.attach(2, b.clone());
+        assert!(Arc::ptr_eq(&s.fence(0).unwrap(), &b));
     }
 
     #[test]

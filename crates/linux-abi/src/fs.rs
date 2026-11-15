@@ -127,6 +127,9 @@ pub enum FileKind {
     PidFd(i64),
     /// The GPU's render node (see `crate::drm`).
     Drm(std::sync::Arc<crate::drm::node::Node>),
+    /// A sync file or a DRM syncobj's fd: it holds what it stands for, as
+    /// Linux's does (see `crate::drm::sync`).
+    Sync(crate::drm::sync::Token),
 }
 
 /// One fd an epoll instance watches.

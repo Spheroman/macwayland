@@ -161,6 +161,10 @@ fn fd_stat(p: &Process, fd: u64) -> Result<libc::stat, i64> {
         st.st_gid = unsafe { libc::getgid() };
         return Ok(st);
     }
+    // The render node: the device it is (libdrm finds it by its number).
+    if let crate::fs::FileKind::Drm(_) = &entry.kind {
+        return crate::drm::stat(b"/dev/dri/renderD128");
+    }
     shm::fstat(p.fds.host(fd)?)
 }
 

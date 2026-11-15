@@ -620,7 +620,7 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
     // Venus waits on the GPU through its ring, so these are rare).
     let mut waits = Vec::new();
     if flags & EXECBUF_FENCE_FD_IN != 0 {
-        match sync::token_of(p.fds.host(fence_fd as u64)?) {
+        match sync::token_of_fd(p, fence_fd as u64) {
             Some(Token::SyncFile(f)) => waits.push(f),
             _ => return Err(errno::EINVAL),
         }
@@ -642,7 +642,8 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
     mem.read(command, &mut cmd)?;
     super::trace::execbuffer(ctx.0.id, flags, len, ring, n_out, &cmd);
     let calling = super::trace::now();
-    if gpu.call(|l| unsafe { (l.submit_cmd)(cmd.as_mut_ptr().cast(), ctx.0.id as c_int, (len / 4) as c_int) }) != 0 {
+    // (An empty one is only for its fence, as Linux's driver allows.)
+    if len >= 4 && gpu.call(|l| unsafe { (l.submit_cmd)(cmd.as_mut_ptr().cast(), ctx.0.id as c_int, (len / 4) as c_int) }) != 0 {
         return Err(errno::EINVAL);
     }
     let submitted = super::trace::now();
@@ -680,7 +681,7 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
         gpu.fail_context(ctx.0.id);
     }
     if flags & EXECBUF_FENCE_FD_OUT != 0 {
-        let fd = p.fds.insert(FdEntry::new(sync::fd_for(Token::SyncFile(fence.clone()))?).cloexec(true));
+        let fd = p.fds.insert(sync::entry(Token::SyncFile(fence.clone()))?);
         mem.write_pod(arg + 28, &(fd as i32))?;
     }
     super::trace::stamp(&fence, super::trace::Stage::Returned);
