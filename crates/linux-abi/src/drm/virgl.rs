@@ -344,6 +344,7 @@ impl Drop for ContextState {
                 (l.context_destroy)(self.id)
             });
             drop(bos);
+            super::trace::report();
             gpu.fail_context(self.id);
             gpu.lost.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
         }
@@ -604,16 +605,17 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
     let ctx = node.context()?;
     ctx.alive()?;
     let gpu = gpu()?;
-    let [flags, len]: [u32; 2] = mem.read_pod(arg)?;
-    let command: u64 = mem.read_pod(arg + 8)?;
-    let fence_fd: i32 = mem.read_pod(arg + 28)?;
-    let ring = if flags & EXECBUF_RING_IDX != 0 && size >= 36 { mem.read_pod::<u32>(arg + 32)? } else { 0 };
-    let (stride, n_in, n_out, ins, outs) = if size >= 64 {
-        let [stride, n_in, n_out]: [u32; 3] = mem.read_pod(arg + 36)?;
-        (stride.max(16) as u64, n_in, n_out, mem.read_pod::<u64>(arg + 48)?, mem.read_pod::<u64>(arg + 56)?)
-    } else {
-        (16, 0, 0, 0, 0)
-    };
+    let entered = super::trace::now();
+    // The struct in one read (each read of guest memory walks its page
+    // tables): older uapis' smaller ones, the rest zero.
+    let mut raw = [0u8; 64];
+    let n = size.clamp(28, 64);
+    mem.read(arg, &mut raw[..n])?;
+    let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(raw[o..o + 8].try_into().unwrap());
+    let (flags, len, command, fence_fd) = (u32_at(0), u32_at(4), u64_at(8), u32_at(28) as i32);
+    let ring = if flags & EXECBUF_RING_IDX != 0 { u32_at(32) } else { 0 };
+    let (stride, n_in, n_out, ins, outs) = (u32_at(36).max(16) as u64, u32_at(40), u32_at(44), u64_at(48), u64_at(56));
     // What it waits for first: a sync file, syncobjs' points (on the CPU:
     // Venus waits on the GPU through its ring, so these are rare).
     let mut waits = Vec::new();
@@ -638,19 +640,29 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
     }
     let mut cmd = vec![0u8; len as usize];
     mem.read(command, &mut cmd)?;
+    super::trace::execbuffer(ctx.0.id, flags, len, ring, n_out, &cmd);
+    let calling = super::trace::now();
     if gpu.call(|l| unsafe { (l.submit_cmd)(cmd.as_mut_ptr().cast(), ctx.0.id as c_int, (len / 4) as c_int) }) != 0 {
         return Err(errno::EINVAL);
     }
+    let submitted = super::trace::now();
     if flags & EXECBUF_FENCE_FD_OUT == 0 && n_out == 0 {
         return Ok(0);
     }
     // A fence for the submission: pending from now, retired by the callback.
     let fence = Fence::new();
+    super::trace::stamp_at(&fence, super::trace::Stage::Entered, entered);
+    super::trace::stamp_at(&fence, super::trace::Stage::Calling, calling);
+    super::trace::stamp_at(&fence, super::trace::Stage::Submitted, submitted);
     let id = ctx.0.next_fence.fetch_add(1, Ordering::Relaxed);
     gpu.pending.lock().unwrap_or_else(|e| e.into_inner()).entry((ctx.0.id, ring)).or_default().insert(id, fence.clone());
-    for i in 0..n_out.min(256) as u64 {
-        let [handle, sflags]: [u32; 2] = mem.read_pod(outs + stride * i)?;
-        let point: u64 = mem.read_pod(outs + stride * i + 8)?;
+    let n_out = n_out.min(256) as u64;
+    let mut out_entries = vec![0u8; (stride * n_out) as usize];
+    mem.read(outs, &mut out_entries)?;
+    for i in 0..n_out {
+        let e = &out_entries[(stride * i) as usize..];
+        let (handle, sflags) = (u32::from_le_bytes(e[0..4].try_into().unwrap()), u32::from_le_bytes(e[4..8].try_into().unwrap()));
+        let point = u64::from_le_bytes(e[8..16].try_into().unwrap());
         let s = node_syncobj(node, handle)?;
         if sflags & EXECBUF_SYNCOBJ_RESET != 0 {
             s.reset();
@@ -662,14 +674,16 @@ fn execbuffer(node: &Arc<Node>, p: &Process, t: &Thread, mem: &dyn GuestMemory, 
         fence.fail();
         return Err(errno::EINVAL);
     }
+    super::trace::stamp(&fence, super::trace::Stage::Fenced);
     // Lost as it was made: no retire will come for it.
     if ctx.alive().is_err() {
         gpu.fail_context(ctx.0.id);
     }
     if flags & EXECBUF_FENCE_FD_OUT != 0 {
-        let fd = p.fds.insert(FdEntry::new(sync::fd_for(Token::SyncFile(fence))?).cloexec(true));
+        let fd = p.fds.insert(FdEntry::new(sync::fd_for(Token::SyncFile(fence.clone()))?).cloexec(true));
         mem.write_pod(arg + 28, &(fd as i32))?;
     }
+    super::trace::stamp(&fence, super::trace::Stage::Returned);
     Ok(0)
 }
 

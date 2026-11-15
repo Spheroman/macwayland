@@ -283,6 +283,7 @@ fn wait(node: &Node, p: &Process, t: &Thread, handles: &[u32], points: &[u64], t
     let objs = handles.iter().map(|&h| node.syncobj(h)).collect::<Result<Vec<_>, _>>()?;
     let deadline = deadline_of(timeout);
     let all = flags & SYNCOBJ_WAIT_ALL != 0;
+    let waited_from = super::trace::now();
     let mut first = 0u32;
     sync::wait_until(p, t, deadline, |register| {
         let mut done = 0;
@@ -312,7 +313,10 @@ fn wait(node: &Node, p: &Process, t: &Thread, handles: &[u32], points: &[u64], t
     if objs.iter().zip(points).any(|(s, &pt)| s.fence(pt).is_some_and(|f| f.failed())) {
         return Err(errno::ENODEV);
     }
-    for s in &objs {
+    for (s, &pt) in objs.iter().zip(points) {
+        if let Some(f) = s.fence(pt) {
+            super::trace::waited(&f, waited_from);
+        }
         s.trim();
     }
     Ok(first)

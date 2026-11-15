@@ -31,6 +31,9 @@ type Callback = Box<dyn FnOnce() + Send>;
 #[derive(Default)]
 pub struct Fence {
     state: Mutex<FenceState>,
+    /// When it went through each stage, with `MACWL_GPU_TRACE` on
+    /// (`super::trace`).
+    pub(super) stamps: Mutex<super::trace::Stamps>,
 }
 
 #[derive(Default)]
@@ -78,6 +81,7 @@ impl Fence {
     }
 
     fn finish(&self, error: bool) {
+        super::trace::stamp(self, super::trace::Stage::Signaled);
         let then = {
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if s.signaled {
