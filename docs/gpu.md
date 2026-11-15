@@ -603,6 +603,41 @@ sampled the optimal image itself (an IOSurface, a Mach-port channel); and
 the composite pass could go for a full-screen client (its buffer as the
 layer's contents).
 
+### Under 1 ms? (2026-11-14, continued)
+
+Traced on one clock (the host's uptime: `MACWL_KEY_TRACE=1` in the shell
+and compositor, `KEYFRAME_TRACE=1` in keyframe, `NATIVE_TRACE=1` in
+native-probe, the system call log), on the direct full-screen path:
+
+- **The GPU wakes slowly.** After ~150 ms idle, even native KosmicKrisp
+  takes ~1.4 ms for a frame's clear and copy (0.2 warm); the GPU's own
+  timestamps say the work is short, so it's the wake. The shell now
+  starts a tiny GPU job the moment it sends a key (on by default,
+  `MACWL_GPU_PREWARM=0` off): key → commit 2.4 → 1.7 ms. Keeping it warm
+  while typing (`MACWL_GPU_KEEPWARM_MS`) gains ~0.15 ms more, not by
+  default; bigger warm-up jobs don't help.
+- **The compositor held keys** for the rest of its loop's turn (~180 µs)
+  before flushing them: it flushes at once now.
+- **The shell's frames went through compositing**: its compositor mode
+  blitted the window into the drawable, so the drawable couldn't be
+  framebuffer-only. GPU done → glass was ~9.3 ms against native's 6.3; the
+  window is now drawn by the same quad pass as popups, the drawable is
+  framebuffer-only, and it's 6.4. (This is every client's latency, not
+  only GPU ones'.)
+- What's left, on the direct path (under CPU load from other work): native
+  key → glass p50 7.2 ms, keyframe 9.5 (key → commit 2.0 loaded, 1.7 idle;
+  the shell's composite 0.5 ms; then as native). Native's own render is
+  ~1 ms of its total. So ~1.2–1.5 ms over native, not yet under 1.
+- An IOSurface shown as the layer's contents (no composite) was looked at
+  with Fable: feasible with public APIs (an IOSurface's Mach port handed
+  over a bootstrap name from the worker to the shell; KosmicKrisp writing
+  it through a no-copy buffer over its memory), but it saves at most the
+  0.5 ms composite, may cost a frame in Core Animation's transaction, and
+  can't be timed with `presentedTime`. Not built.
+- Left to try: the runtime's wake of a blocked guest thread (102–132 µs
+  against native's 45 after idle), Venus's per-frame CPU work (~0.35 ms),
+  the prime path's blit (rendering straight to linear memory).
+
 ## Transform feedback in KosmicKrisp, 2026-11-14
 
 `gpu/kosmickrisp-transform-feedback/` (ours, ten commits on Mesa

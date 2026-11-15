@@ -234,10 +234,24 @@ fn apply(light: bool) {
                 let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
                 let event_time = shared().pending.map(|(t, _)| t);
                 if let Some(event_time) = event_time {
+                    // NATIVE_TRACE=1: the event → GPU done, GPU done → glass
+                    // split, to compare with macwl-shell's MACWL_KEY_TRACE.
+                    let gpu_done = std::sync::Arc::new(std::sync::Mutex::new(0.0f64));
+                    if std::env::var_os("NATIVE_TRACE").is_some() {
+                        let done = gpu_done.clone();
+                        let on_done = RcBlock::new(move |_: NonNull<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>| {
+                            *done.lock().unwrap() = unsafe { objc2_quartz_core::CACurrentMediaTime() };
+                        });
+                        unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&on_done)) };
+                    }
                     let handler = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
                         let glass = unsafe { d.as_ref().presentedTime() };
                         if glass > 0.0 {
                             shared().metal_ms.push((glass - event_time) * 1e3);
+                            let done = *gpu_done.lock().unwrap();
+                            if done > 0.0 {
+                                eprintln!("native: event→GPU done {:.2} →glass {:.2} ms", (done - event_time) * 1e3, (glass - done) * 1e3);
+                            }
                         }
                     });
                     unsafe { d.addPresentedHandler(RcBlock::as_ptr(&handler)) };

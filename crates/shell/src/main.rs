@@ -34,7 +34,7 @@
 //! MACWL_LOG_SCROLL=1 prints each trackpad event as macOS has it.
 //!
 //! Tuning knobs (env): MACWL_FRAME_LATENCY=<float frames, default 1; link only>,
-//! MACWL_DRAWABLES=2|3, MACWL_VSYNC=1|0, MACWL_FBONLY=1|0.
+//! MACWL_DRAWABLES=2|3, MACWL_VSYNC=1|0, MACWL_FBONLY=1|0 (default 1).
 //!
 //! Esc quits.
 
@@ -686,6 +686,8 @@ struct Auto {
 }
 
 struct Renderer {
+    /// When this render started and got its drawable (MACWL_KEY_TRACE).
+    trace_render: Option<(f64, f64)>,
     layer: Retained<CAMetalLayer>,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
@@ -712,7 +714,9 @@ struct Renderer {
 impl Renderer {
     /// Render and present right now (on-demand pacing).
     fn render_now(&mut self) {
+        let start = CACurrentMediaTime();
         if let Some(drawable) = self.layer.nextDrawable() {
+            self.trace_render = Some((start, CACurrentMediaTime()));
             self.frame(&drawable);
         }
     }
@@ -756,11 +760,36 @@ impl Renderer {
             let mut pending = self.key_pending.lock().unwrap();
             if pending.is_some_and(|(_, seen)| committed > seen) { pending.take().map(|p| (p, committed)) } else { None }
         });
+        let render = self.trace_render.take();
         if let Some(((key_ts, _), committed)) = answered {
             // MACWL_KEY_TRACE=1: when, on the host's uptime clock (a guest's
-            // CLOCK_MONOTONIC), in µs, to line up with the client's own.
+            // CLOCK_MONOTONIC), in µs, to line up with the client's own; and
+            // where the shell's part goes: its render starting (on the main
+            // queue), a drawable got, the GPU done, on glass.
             if std::env::var_os("MACWL_KEY_TRACE").is_some() {
                 eprintln!("shell: key sent {:.1} committed {:.1}", key_ts * 1e6, committed * 1e6);
+                let (start, got) = render.unwrap_or((0.0, 0.0));
+                let encoded = CACurrentMediaTime();
+                let gpu_done = Arc::new(Mutex::new(0.0f64));
+                let done = gpu_done.clone();
+                let on_done = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    *done.lock().unwrap() = CACurrentMediaTime();
+                });
+                unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&on_done)) };
+                let on_glass = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                    let glass = unsafe { d.as_ref().presentedTime() };
+                    let ms = |a: f64, b: f64| (b - a) * 1e3;
+                    let done = *gpu_done.lock().unwrap();
+                    eprintln!(
+                        "shell: commit→render {:.2} →drawable {:.2} →encoded {:.2} →GPU done {:.2} →glass {:.2} ms",
+                        ms(committed, start),
+                        ms(start, got),
+                        ms(got, encoded),
+                        ms(encoded, done),
+                        ms(done, glass)
+                    );
+                });
+                unsafe { mtl_drawable.addPresentedHandler(RcBlock::as_ptr(&on_glass)) };
             }
             let stats = self.stats.clone();
             let handler = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
@@ -880,30 +909,10 @@ impl Renderer {
             }
         }
         let (tw, th) = (target.width() as i32, target.height() as i32);
-        let mut layers = self.layers.iter().filter_map(|l| self.textures.get(&l.id).map(|(t, _, opaque, _)| (l, t, *opaque)));
-        if let Some((window, tex, _)) = layers.next() {
-            // The part on screen.
-            let (x0, y0) = (window.x.max(0), window.y.max(0));
-            let x1 = (window.x + tex.width() as i32).min(tw);
-            let y1 = (window.y + tex.height() as i32).min(th);
-            if x1 > x0 && y1 > y0 {
-                let blit = cmd.blitCommandEncoder().expect("no blit encoder");
-                unsafe {
-                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                        tex,
-                        0,
-                        0,
-                        MTLOrigin { x: (x0 - window.x) as usize, y: (y0 - window.y) as usize, z: 0 },
-                        MTLSize { width: (x1 - x0) as usize, height: (y1 - y0) as usize, depth: 1 },
-                        target,
-                        0,
-                        0,
-                        MTLOrigin { x: x0 as usize, y: y0 as usize, z: 0 },
-                    )
-                };
-                blit.endEncoding();
-            }
-        }
+        let layers = self.layers.iter().filter_map(|l| self.textures.get(&l.id).map(|(t, _, opaque, _)| (l, t, *opaque)));
+        // The window and its popups, all drawn in one render pass (no blits
+        // into the drawable: it can then be framebuffer-only, which the
+        // display takes directly; ~3 ms of a key's latency otherwise).
         let popups: Vec<_> = layers.collect();
         if !popups.is_empty() {
             let rpd = MTLRenderPassDescriptor::new();
@@ -1261,14 +1270,10 @@ fn main() {
         std::env::var("MACWL_FRAME_LATENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let drawables: usize = std::env::var("MACWL_DRAWABLES").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     let vsync = env_flag("MACWL_VSYNC", true);
-    let fb_only = env_flag("MACWL_FBONLY", latency_mode);
+    let fb_only = env_flag("MACWL_FBONLY", true);
     let on_demand = std::env::var("MACWL_PACING").map(|v| v != "link").unwrap_or(true);
     ON_DEMAND.store(on_demand, Ordering::Relaxed);
     LOG_SCROLL.store(env_flag("MACWL_LOG_SCROLL", false), Ordering::Relaxed);
-    if !latency_mode && fb_only {
-        eprintln!("MACWL_FBONLY=1 needs --latency (compositor mode blits into the drawable)");
-        return;
-    }
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
 
     let scene: Arc<Mutex<Scene>> = Arc::default();
@@ -1480,6 +1485,7 @@ fn main() {
         screen.maximumFramesPerSecond(),
     );
     let renderer = Renderer {
+        trace_render: None,
         layer: layer.clone(),
         device: device.clone(),
         queue,
