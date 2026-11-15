@@ -1,6 +1,6 @@
 #!/bin/sh
 # Venus over vtest (docs/gpu.md, step 1): build virglrenderer for macOS
-# with gpu/virglrenderer-macos-vtest.patch and KosmicKrisp from Mesa main
+# with gpu/virglrenderer-macos.patch and KosmicKrisp from Mesa main
 # (gpu/kosmickrisp-main.nix), then run the vtest server on SOCKET.
 #
 #   gpu/vtest.sh SOCKET

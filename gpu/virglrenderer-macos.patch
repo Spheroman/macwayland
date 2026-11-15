@@ -1,0 +1,271 @@
+diff --git a/meson.build b/meson.build
+index 79aa049b..dbff1af5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -489,7 +489,7 @@ if with_unstable_apis
+ endif
+ 
+ subdir('src')
+-if with_vrend and not with_host_windows
++if (with_vrend or with_venus) and not with_host_windows
+    subdir('vtest')
+ endif
+ 
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index 4f87d5ac..06b1cf05 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -3,6 +3,19 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#ifdef __APPLE__
++/* (First, and its BSD list macros gone: util/list.h has its own.) */
++#include <sys/event.h>
++#undef LIST_ENTRY
++#undef LIST_HEAD
++#undef LIST_INIT
++#undef LIST_FIRST
++#undef LIST_NEXT
++#undef LIST_EMPTY
++#undef LIST_FOREACH
++#undef LIST_INSERT_HEAD
++#undef LIST_REMOVE
++#endif
+ #include "proxy_context.h"
+ 
+ #include <fcntl.h>
+@@ -114,12 +127,21 @@ proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
+     */
+    if (timeline->cur_seqno == cur_seqno && !list_is_empty(&timeline->fences)) {
+       timeline->cur_seqno_stall_count++;
+-      if (timeline->cur_seqno_stall_count < 100 ||
+-          proxy_socket_is_connected(&ctx->socket))
++      if (!atomic_load(&ctx->sync_thread.hung_up) &&
++          (timeline->cur_seqno_stall_count < 100 ||
++           proxy_socket_is_connected(&ctx->socket)))
+          return false;
+ 
+       /* socket has been disconnected */
+       force_retire_all = true;
++      /* Tell the client first that the context is lost (its worker died):
++       * a fence id of UINT64_MAX, which no client submits, before the
++       * fences are retired, so they can be failed rather than signaled.
++       */
++      if (!timeline->lost_reported) {
++         timeline->lost_reported = true;
++         ctx->base.fence_retire(&ctx->base, ring_idx, UINT64_MAX);
++      }
+    }
+ 
+    timeline->cur_seqno = cur_seqno;
+@@ -175,6 +197,24 @@ proxy_context_sync_thread(void *arg)
+          .fd = ctx->socket.fd,
+       },
+    };
++#ifdef __APPLE__
++   /* macOS's poll() doesn't report a stream socket's peer going (POLLHUP)
++    * when no events are asked for, and POLLIN would wake for every reply.
++    * A kqueue watching the socket for reading with a low-water mark no
++    * reply reaches says only when it ends (EV_EOF). */
++   int kq = kqueue();
++   if (kq >= 0) {
++      struct kevent ev;
++      EV_SET(&ev, ctx->socket.fd, EVFILT_READ, EV_ADD, NOTE_LOWAT, INT32_MAX, NULL);
++      if (kevent(kq, &ev, 1, NULL, 0, NULL) == 0) {
++         poll_fds[1].fd = kq;
++         poll_fds[1].events = POLLIN;
++      } else {
++         close(kq);
++         kq = -1;
++      }
++   }
++#endif
+ 
+    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
+ 
+@@ -188,9 +228,38 @@ proxy_context_sync_thread(void *arg)
+          break;
+       }
+ 
++      /* A hung-up socket stays readable: stop watching it once it has gone,
++       * or this thread spins until the context is destroyed. */
++      bool hung_up = poll_fds[1].revents & (POLLHUP | POLLERR | POLLNVAL);
++#ifdef __APPLE__
++      if (kq >= 0 && poll_fds[1].fd == kq && (poll_fds[1].revents & POLLIN)) {
++         struct kevent ev;
++         const struct timespec zero = { 0, 0 };
++         hung_up = kevent(kq, NULL, 0, &ev, 1, &zero) == 1 && (ev.flags & EV_EOF);
++      }
++#endif
++      if (hung_up) {
++         atomic_store(&ctx->sync_thread.hung_up, true);
++         poll_fds[1].fd = -1;
++         /* The context is lost whether or not fences are pending: say so
++          * (a fence id of UINT64_MAX, see below). */
++         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++            mtx_lock(&ctx->timeline_mutex);
++         if (!ctx->timelines[0].lost_reported) {
++            ctx->timelines[0].lost_reported = true;
++            ctx->base.fence_retire(&ctx->base, 0, UINT64_MAX);
++         }
++         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++            mtx_unlock(&ctx->timeline_mutex);
++      }
++
+       proxy_context_retire_fences_internal(ctx);
+    }
+ 
++#ifdef __APPLE__
++   if (kq >= 0)
++      close(kq);
++#endif
+    return 0;
+ }
+ 
+diff --git a/src/proxy/proxy_context.h b/src/proxy/proxy_context.h
+index ce29ecae..62b77dfe 100644
+--- a/src/proxy/proxy_context.h
++++ b/src/proxy/proxy_context.h
+@@ -22,6 +22,8 @@ struct proxy_timeline {
+    struct list_head fences;
+ 
+    int cur_seqno_stall_count;
++   /* the client has been told the context is lost */
++   bool lost_reported;
+ };
+ 
+ struct proxy_context {
+@@ -58,6 +60,8 @@ struct proxy_context {
+       thrd_t thread;
+       bool created;
+       bool stop;
++      /* the socket hung up (the context's worker went) */
++      atomic_bool hung_up;
+    } sync_thread;
+ };
+ 
+diff --git a/src/virgl_util.c b/src/virgl_util.c
+index b770a0a9..a2242039 100644
+--- a/src/virgl_util.c
++++ b/src/virgl_util.c
+@@ -29,6 +29,11 @@
+ #include "virgl_util.h"
+ 
+ #include <errno.h>
++#ifdef __APPLE__
++#include <fcntl.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#endif
+ #ifdef HAVE_EVENTFD_H
+ #include <sys/eventfd.h>
+ #endif
+@@ -88,7 +93,7 @@ bool equal_func(const void *key1, const void *key2)
+ 
+ bool has_eventfd(void)
+ {
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
+    return true;
+ #else
+    return false;
+@@ -99,6 +104,26 @@ int create_eventfd(unsigned int initval)
+ {
+ #ifdef HAVE_EVENTFD_H
+    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
++#elif defined(__APPLE__)
++   /* No eventfds on macOS. A FIFO opened for reading and writing is one fd
++    * that is both written to and polled (and can be passed to another
++    * process, as vtest does), as an eventfd is; it's unlinked at once.
++    * Each write of 8 bytes is one wakeup to read; flush_eventfd drains. */
++   char path[64];
++   static unsigned counter;
++   for (int tries = 0; tries < 16; tries++) {
++      snprintf(path, sizeof(path), "/tmp/virgl-efd-%d-%u", (int)getpid(),
++               __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED));
++      if (mkfifo(path, 0600) == 0)
++         break;
++      if (errno != EEXIST)
++         return -1;
++   }
++   int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++   unlink(path);
++   if (fd >= 0 && initval)
++      write_eventfd(fd, initval);
++   return fd;
+ #else
+    (void)initval;
+    return -1;
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index 39e9ea27..ec3f80a9 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -40,6 +40,7 @@
+ 
+ #include "virgl_context.h"
+ #include "virgl_fence.h"
++#include "virgl_util.h"
+ 
+ #include <sys/uio.h>
+ #include <sys/socket.h>
+@@ -983,7 +984,7 @@ int vtest_get_param(UNUSED uint32_t length_dw)
+    case VCMD_PARAM_MAX_TIMELINE_COUNT:
+       resp[0] = true;
+       /* TODO until we have a timerfd */
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
+       if (!getenv("VIRGL_DISABLE_MT"))
+          resp[1] = VTEST_MAX_TIMELINE_COUNT;
+ #endif
+@@ -2130,12 +2131,7 @@ static int vtest_sync_wait_init(struct vtest_sync_wait *wait,
+ {
+    uint32_t i;
+ 
+-#ifdef HAVE_EVENTFD_H
+-   wait->fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+-#else
+-   /* TODO pipe */
+-   wait->fd = -1;
+-#endif
++   wait->fd = create_eventfd(0);
+    if (wait->fd < 0)
+       return -ENODEV;
+ 
+diff --git a/vtest/vtest_shm.c b/vtest/vtest_shm.c
+index efaad8a0..50ad5819 100644
+--- a/vtest/vtest_shm.c
++++ b/vtest/vtest_shm.c
+@@ -33,6 +33,26 @@
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
++#ifdef __APPLE__
++/* No memfds on macOS: an anonymous (unlinked) POSIX shm object, as Venus
++ * itself uses. macOS sizes one only once, so it's made at its size. */
++#include "util/anon_file.h"
++
++int vtest_new_shm(uint32_t handle, size_t size)
++{
++   (void)handle;
++   int fd = os_create_anonymous_file(size, "vtest-res");
++   if (fd < 0)
++      return report_failed_call("os_create_anonymous_file", -errno);
++   return fd;
++}
++
++int vtest_shm_check(void)
++{
++   return 1;
++}
++#else
++
+ static int memfd_create(const char *name, unsigned int flags)
+ {
+ #ifdef __NR_memfd_create
+@@ -77,4 +97,4 @@ int vtest_shm_check(void)
+ 
+     return 0;
+ }
+-
++#endif
