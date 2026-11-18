@@ -92,7 +92,10 @@ pub use smithay::{
 /// feedback names it; clients pick their GPU by it.
 const RENDER_NODE: u64 = (226 << 8) | 128;
 
+pub mod fences;
 pub mod keymap;
+
+pub use fences::Ready;
 
 /// Input from the host (the shell's AppKit events), in Linux terms. Times
 /// are the event's, in milliseconds.
@@ -215,8 +218,18 @@ pub trait Host: Send {
     /// Surface `id` committed a dma-buf (linux-dmabuf): one plane, linear,
     /// whose fd is shared memory (macwl-run's GPU blobs), `data` saying
     /// where in it the pixels are. As [`Host::frame_shared`]: taken, or
-    /// given back to come again as [`Host::frame`].
-    fn frame_dmabuf(&mut self, _id: u32, _buffer: &Dmabuf, _data: &BufferData, _damage: &[Rect], release: BufferRelease) -> Option<BufferRelease> {
+    /// given back to come again as [`Host::frame`]. Its pixels may not be
+    /// drawn yet: `ready`, if given, is done once they are (`fences`), and
+    /// nothing may read them before.
+    fn frame_dmabuf(
+        &mut self,
+        _id: u32,
+        _buffer: &Dmabuf,
+        _data: &BufferData,
+        _damage: &[Rect],
+        _ready: Option<Ready>,
+        release: BufferRelease,
+    ) -> Option<BufferRelease> {
         Some(release)
     }
     /// What's on screen changed: these surfaces, bottom to top. A surface
@@ -341,6 +354,8 @@ struct App {
     start: Instant,
     /// A key press was traced (MACWL_KEY_TRACE): trace the flush after it.
     key_traced: bool,
+    /// Dma-bufs' pending fences, as macwl-run tells them (`fences`).
+    fences: Option<fences::Fences>,
 }
 
 impl CompositorHandler for App {
@@ -451,8 +466,16 @@ impl App {
                             let data = dmabuf_data(&dmabuf);
                             let rects = buffer_damage(&damage, scale, data.width, data.height);
                             set_mapped(surface, Some(Mapped { size: (data.width, data.height), scale }));
-                            host.frame_dmabuf(id, &dmabuf, &data, &rects, release).and_then(|release| {
-                                // Copied, then: read where it is.
+                            let ready = {
+                                use std::os::fd::AsRawFd;
+                                let fd = dmabuf.handles().next().map(|fd| fd.as_raw_fd());
+                                self.fences.as_ref().zip(fd).and_then(|(f, fd)| f.ready_for(fd))
+                            };
+                            host.frame_dmabuf(id, &dmabuf, &data, &rects, ready.clone(), release).and_then(|release| {
+                                // Copied, then (once drawn): read where it is.
+                                if let Some(ready) = &ready {
+                                    ready.wait();
+                                }
                                 let ok = with_dmabuf_contents(&dmabuf, |pixels| host.frame(id, pixels, &data, &rects));
                                 if !ok {
                                     warn!("a dma-buf the host couldn't read");
@@ -1298,6 +1321,13 @@ pub fn run_with(host: Box<dyn Host>, options: Options) -> Result<(), Box<dyn std
         last_callbacks: Instant::now(),
         start: Instant::now(),
         key_traced: false,
+        fences: std::env::var_os("XDG_RUNTIME_DIR").and_then(|dir| match fences::Fences::listen(dir.as_ref(), "wayland-mac") {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("no fences socket (clients' GPU frames wait for their GPU before committing): {e}");
+                None
+            }
+        }),
     };
 
     // Everything happens in an event loop, the moment there's something to

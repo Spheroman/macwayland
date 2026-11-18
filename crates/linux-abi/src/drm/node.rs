@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -364,21 +364,57 @@ pub fn sync_file_ioctl(p: &Process, mem: &dyn GuestMemory, fence: &Arc<Fence>, r
 }
 
 /// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and `IMPORT_SYNC_FILE` (`'b'`, 2 and
-/// 3), on a blob's fd: what the GPU writes, Venus waits for itself
-/// (docs/gpu.md, "Sync and presenting"), so an exported sync file is
-/// signalled already, and an imported one kept by nobody. Both must
-/// succeed, or Mesa's WSI stops waiting for rendering at all.
-pub fn dma_buf_ioctl(p: &Process, mem: &dyn GuestMemory, req: u64, arg: u64) -> Option<Result<i64, i64>> {
+/// 3), on a blob's fd (host fd `host`): implicit sync, as Linux keeps it
+/// for a dma-buf. An imported fence is the buffer's until the next: an
+/// export gives it (or one signalled already), and the Mac's compositor is
+/// told, to wait for it before reading the buffer (`fences`). With no
+/// compositor listening, the import waits for it (docs/gpu.md, "Implicit
+/// fencing").
+pub fn dma_buf_ioctl(p: &Process, t: &Thread, host: i32, mem: &dyn GuestMemory, req: u64, arg: u64) -> Option<Result<i64, i64>> {
     const EXPORT_SYNC_FILE: u64 = ioc(RW, b'b', 2, 8);
     const IMPORT_SYNC_FILE: u64 = ioc(W, b'b', 3, 8);
     match req {
         // { u32 flags; s32 fd }
         EXPORT_SYNC_FILE => Some((|| {
-            let fd = p.fds.insert(sync::entry(Token::SyncFile(Fence::signaled_now()))?);
+            let fence = implicit(host).filter(|f| !f.signaled()).unwrap_or_else(Fence::signaled_now);
+            let fd = p.fds.insert(sync::entry(Token::SyncFile(fence))?);
             mem.write_pod(arg + 4, &(fd as i32))?;
             Ok(0)
         })()),
-        IMPORT_SYNC_FILE => Some(Ok(0)),
+        IMPORT_SYNC_FILE => Some((|| {
+            let fd: i32 = mem.read_pod(arg + 4)?;
+            let Some(Token::SyncFile(fence)) = sync::token_of_fd(p, fd as u64) else { return Err(errno::EINVAL) };
+            if fence.signaled() {
+                return Ok(0);
+            }
+            set_implicit(host, &fence);
+            if !super::fences::announce(host, &fence) {
+                sync::wait_until(p, t, None, |register| {
+                    if fence.signaled() {
+                        return Ok(true);
+                    }
+                    register(&fence);
+                    Ok(false)
+                })?;
+            }
+            Ok(0)
+        })()),
         _ => None,
     }
+}
+
+/// Blobs' last imported fences, by what names their memory
+/// (`fences::buffer_key`): a weak hold, so nothing here outlives its use.
+static IMPLICIT: Mutex<Vec<([u8; 64], Weak<Fence>)>> = Mutex::new(Vec::new());
+
+fn implicit(host: i32) -> Option<Arc<Fence>> {
+    let id = super::fences::buffer_key(host)?;
+    IMPLICIT.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id).and_then(|(_, f)| f.upgrade())
+}
+
+fn set_implicit(host: i32, fence: &Arc<Fence>) {
+    let Some(id) = super::fences::buffer_key(host) else { return };
+    let mut all = IMPLICIT.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|(i, f)| *i != id && f.strong_count() > 0);
+    all.push((id, Arc::downgrade(fence)));
 }

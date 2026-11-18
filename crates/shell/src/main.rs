@@ -205,8 +205,16 @@ impl Drop for MappedPool {
 /// A committed buffer drawn where it is: a texture over its part of the
 /// pool. Held while it's on screen and while the GPU may be reading it;
 /// when the last holder lets go, the buffer goes back to the client.
+/// A shared event, signalled from another thread (Metal's events are
+/// thread-safe).
+struct SendEvent(Retained<ProtocolObject<dyn objc2_metal::MTLSharedEvent>>);
+unsafe impl Send for SendEvent {}
+
 struct Lease {
     texture: Texture,
+    /// Done once the client's GPU has drawn it (a dma-buf committed before
+    /// that: implicit fencing, `macwl_compositor::fences`).
+    ready: Option<macwl_compositor::Ready>,
     _pool: Arc<MappedPool>,
     _release: BufferRelease,
 }
@@ -260,7 +268,14 @@ impl ShellHost {
 
     /// Show surface `id`'s buffer `data`, in `mapped`: a linear texture
     /// over it, held (with the buffer) while it's on screen.
-    fn show(&mut self, id: u32, mapped: Arc<MappedPool>, data: &BufferData, release: BufferRelease) -> Option<BufferRelease> {
+    fn show(
+        &mut self,
+        id: u32,
+        mapped: Arc<MappedPool>,
+        data: &BufferData,
+        ready: Option<macwl_compositor::Ready>,
+        release: BufferRelease,
+    ) -> Option<BufferRelease> {
         use macwl_compositor::ShmFormat;
         let (w, h) = (data.width as usize, data.height as usize);
         let (offset, stride) = (data.offset as usize, data.stride as usize);
@@ -279,7 +294,7 @@ impl ShellHost {
             return Some(release);
         };
         LEASES.fetch_add(1, Ordering::Relaxed);
-        let lease = Arc::new(Lease { texture, _pool: mapped, _release: release });
+        let lease = Arc::new(Lease { texture, ready, _pool: mapped, _release: release });
         let opaque = data.format != ShmFormat::Argb8888;
         let mut scene = self.scene.lock().unwrap();
         scene.seq += 1;
@@ -354,11 +369,19 @@ impl macwl_compositor::Host for ShellHost {
             return Some(release);
         }
         let Some(mapped) = self.mapped(&pool) else { return Some(release) };
-        self.show(id, mapped, data, release)
+        self.show(id, mapped, data, None, release)
     }
 
     /// A dma-buf: its plane's file is mapped and drawn from as a pool is.
-    fn frame_dmabuf(&mut self, id: u32, buffer: &macwl_compositor::Dmabuf, data: &BufferData, _damage: &[Rect], release: BufferRelease) -> Option<BufferRelease> {
+    fn frame_dmabuf(
+        &mut self,
+        id: u32,
+        buffer: &macwl_compositor::Dmabuf,
+        data: &BufferData,
+        _damage: &[Rect],
+        ready: Option<macwl_compositor::Ready>,
+        release: BufferRelease,
+    ) -> Option<BufferRelease> {
         use std::os::fd::AsRawFd;
         let (w, h) = (data.width as usize, data.height as usize);
         let (offset, stride) = (data.offset as usize, data.stride as usize);
@@ -377,7 +400,7 @@ impl macwl_compositor::Host for ShellHost {
                 m
             }
         };
-        self.show(id, mapped, data, release)
+        self.show(id, mapped, data, ready, release)
     }
 
     /// The client under the pointer changed its cursor.
@@ -774,23 +797,31 @@ impl Renderer {
                 eprintln!("shell: key sent {:.1} committed {:.1}", key_ts * 1e6, committed * 1e6);
                 let (start, got) = render.unwrap_or((0.0, 0.0));
                 let encoded = CACurrentMediaTime();
-                let gpu_done = Arc::new(Mutex::new(0.0f64));
+                // (And the GPU's own times: when the command buffer was
+                // scheduled, started and ended on it.)
+                let gpu_done = Arc::new(Mutex::new((0.0f64, 0.0f64, 0.0f64, 0.0f64)));
                 let done = gpu_done.clone();
-                let on_done = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                    *done.lock().unwrap() = CACurrentMediaTime();
+                let on_done = RcBlock::new(move |c: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    let c = unsafe { c.as_ref() };
+                    *done.lock().unwrap() = (CACurrentMediaTime(), c.kernelEndTime(), c.GPUStartTime(), c.GPUEndTime());
                 });
                 unsafe { cmd.addCompletedHandler(RcBlock::as_ptr(&on_done)) };
                 let on_glass = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
                     let glass = unsafe { d.as_ref().presentedTime() };
                     let ms = |a: f64, b: f64| (b - a) * 1e3;
-                    let done = *gpu_done.lock().unwrap();
+                    let (done, scheduled, gpu_start, gpu_end) = *gpu_done.lock().unwrap();
                     eprintln!(
-                        "shell: commit→render {:.2} →drawable {:.2} →encoded {:.2} →GPU done {:.2} →glass {:.2} ms",
+                        "shell: commit→render {:.2} →drawable {:.2} →encoded {:.2} →GPU done {:.2} →glass {:.2} ms \
+                         (encoded→scheduled {:.3} →GPU start {:.3} →GPU end {:.3} →handler {:.3})",
                         ms(committed, start),
                         ms(start, got),
                         ms(got, encoded),
                         ms(encoded, done),
-                        ms(done, glass)
+                        ms(done, glass),
+                        ms(encoded, scheduled),
+                        ms(scheduled, gpu_start),
+                        ms(gpu_start, gpu_end),
+                        ms(gpu_end, done)
                     );
                 });
                 unsafe { mtl_drawable.addPresentedHandler(RcBlock::as_ptr(&on_glass)) };
@@ -890,6 +921,8 @@ impl Renderer {
         clear: MTLClearColor,
     ) -> Option<f64> {
         let mut new_frame = None;
+        // New frames' pixels the client's GPU may still be drawing.
+        let mut pending: Vec<macwl_compositor::Ready> = Vec::new();
         {
             let mut scene = self.scene.lock().unwrap();
             if scene.seq != self.scene_seq {
@@ -902,7 +935,10 @@ impl Renderer {
                     }
                     new_frame = Some(new_frame.map_or(frame.committed, |t: f64| t.max(frame.committed)));
                     let (tex, lease) = match &frame.lease {
-                        Some(lease) => (lease.texture.clone(), Some(lease.clone())),
+                        Some(lease) => {
+                            pending.extend(lease.ready.clone().filter(|r| !r.done()));
+                            (lease.texture.clone(), Some(lease.clone()))
+                        }
                         None => {
                             // Never upload into a client's own buffer.
                             let existing = self.textures.get(&id).filter(|e| e.3.is_none()).map(|(t, ..)| t);
@@ -912,6 +948,24 @@ impl Renderer {
                     self.textures.insert(id, (tex, frame.seq, frame.opaque, lease));
                 }
             }
+        }
+        // The GPU reads them once they're drawn: encoded now, started as
+        // each one's fence signals (sooner than the client could commit
+        // after waiting for it itself).
+        for ready in pending {
+            let Some(event) = self.device.newSharedEvent() else {
+                ready.wait();
+                continue;
+            };
+            let event_obj: &ProtocolObject<dyn objc2_metal::MTLEvent> = ProtocolObject::from_ref(&*event);
+            cmd.encodeWaitForEvent_value(event_obj, 1);
+            let event = SendEvent(event);
+            ready.then(move || {
+                // (The whole `SendEvent`, not its field, moved in.)
+                let event = &event;
+                use objc2_metal::MTLSharedEvent as _;
+                event.0.setSignaledValue(1);
+            });
         }
         let (tw, th) = (target.width() as i32, target.height() as i32);
         let layers = self.layers.iter().filter_map(|l| self.textures.get(&l.id).map(|(t, _, opaque, _)| (l, t, *opaque)));

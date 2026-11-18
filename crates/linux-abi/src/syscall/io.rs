@@ -327,7 +327,7 @@ pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, f
             }
         }
         0x62 /* 'b' */ => {
-            if let Some(r) = crate::drm::node::dma_buf_ioctl(p, &crate::memory::ByRef(mem), req, arg) {
+            if let Some(r) = crate::drm::node::dma_buf_ioctl(p, t, host, &crate::memory::ByRef(mem), req, arg) {
                 return r;
             }
         }

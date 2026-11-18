@@ -271,6 +271,10 @@ Linux doesn't either. If one tears, the runtime has the fence it imported
 for the object (`IMPORT_SYNC_FILE`) and the compositor can be made to
 wait on it.
 
+(Since 2026-11-18 the compositor does: macwl-run sets
+`venus_implicit_fencing=true`, so step 3's wait is gone and the shell
+waits instead. See "Implicit fencing" below.)
+
 ## Costs (estimates, at 120 Hz)
 
 | | |
@@ -664,6 +668,71 @@ native-probe, the system call log), on the direct full-screen path:
 - Left to try: the runtime's wake of a blocked guest thread (102–132 µs
   against native's 45 after idle), Venus's per-frame CPU work (~0.35 ms),
   the prime path's blit (rendering straight to linear memory).
+
+### Implicit fencing, 2026-11-18
+
+Where the idle machine's ~1 ms over native went, traced (`MACWL_KEY_TRACE`,
+`KEYFRAME_TRACE`, `MACWL_STRACE` on the uptime clock; the shell now also
+prints Metal's own scheduled / GPU start / GPU end times):
+
+- The key reaches keyframe ~215 µs after the shell sends it (most of the
+  compositor's apparent ~110 µs was the trace's own `eprintln!`s), and
+  keyframe's acquire, record, submit and present take ~200 µs.
+- Then ~560 µs to the commit: Venus's present thread blocks on the frame's
+  sync file (`vn_wsi_sync_wait`, because virtio-gpu has no implicit
+  fencing) until the GPU has drawn it and the fence has come back, then
+  imports it into the dma-buf and commits.
+- The shell's composite: ~0.1 ms encoding, ~0.1 ms to the GPU scheduling
+  it, and a steady 0.247 ms on the GPU: a full-screen read of the client's
+  linear buffer and write of the drawable (3024×1964, 48 MB, ~190 GB/s:
+  bandwidth). Native only clears.
+
+Venus can skip its wait: drirc's `venus_implicit_fencing` (default off)
+makes it present without the async present thread, the fence going into
+the dma-buf (`IMPORT_SYNC_FILE`) and the commit out at once; the
+compositor is then to wait, as a Linux compositor waits on a dma-buf's
+fences. Explicit sync (`wp_linux_drm_syncobj_v1`) isn't an alternative:
+Venus exports no timeline semaphores, so Mesa's WSI never uses it.
+
+So macwl-run sets `venus_implicit_fencing=true` for guests when the GPU is
+on, and tells the compositor of each imported fence over a socket next to
+the Wayland one, `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY.fences`
+(`linux-abi` `drm::fences`, `macwl_compositor::fences`): `WAIT seq key`
+as the client imports it, before its commit, and `DONE seq` once it has
+signalled. A buffer's key is what names its memory in both processes: a
+POSIX shm object's name, which macOS keeps after unlinking and reports
+through `proc_pidfdinfo(PROC_PIDFDPSHMINFO)` (`fstat` says device 0,
+inode 0 for every one), or a file's device and inode. The WAIT is in the
+fences socket before the commit is sent, so the compositor reads that
+socket before looking (no race between the two). The shell encodes the
+composite at once with `encodeWaitForEvent` on an `MTLSharedEvent` it
+signals as DONE comes: the GPU starts reading the moment the client's
+drawing is done, the encoding and scheduling already behind it. A
+connection that ends signals all it was waiting on (no shell hung on a
+dead runtime); a lost device fails its fences, which send DONE too. The
+compositor's CPU path (a buffer it copies) waits on the CPU. With no
+compositor listening, the import waits for the fence itself, as Venus
+would have, so turning it on is safe with any compositor.
+`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` now gives a buffer's last imported fence.
+`MACWL_ENV_venus_implicit_fencing=false` turns it off.
+
+Measured as key → GPU done, which a key's phase in the frame doesn't move
+(glass is the next refresh after it: its p50 moves ±0.5 ms between runs
+of the same thing), interleaved, two rounds of 150 keys each, idle
+machine:
+
+| key → GPU done, p50 | round 1 | round 2 | all | over native |
+|---|---|---|---|---|
+| native Metal (`NATIVE_TRACE`) | 0.86 | 0.73 | 0.82 ms | |
+| keyframe, Venus waiting | 1.88 | 1.94 | 1.90 ms | +1.08 |
+| keyframe, implicit fencing | 1.34 | 1.40 | 1.35 ms | **+0.53** |
+
+Key → commit 1.17 / 1.13 → 0.46 / 0.53 ms; key → glass p50 in the same
+runs 8.30 / 9.08 → 7.96 / 7.89. **About 0.5 ms over native**, under step
+4's 1 ms, with the GPU not kept warm. (Both guest modes had long tails in
+these runs, p90 ~5 ms, as the machine's other work had then.) What's left
+is mostly the composite's full-screen copy (~0.25 ms GPU) and the
+client's ~0.2 ms of Venus CPU work.
 
 ## Transform feedback in KosmicKrisp, 2026-11-14
 

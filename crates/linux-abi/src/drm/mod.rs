@@ -80,6 +80,7 @@ pub fn open(path: &[u8], guest: Vec<u8>) -> Result<FdEntry, i64> {
 
 pub mod node;
 pub mod sync;
+mod fences;
 mod trace;
 mod virgl;
 
