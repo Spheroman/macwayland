@@ -15,6 +15,7 @@ objc2-core-graphics = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-foundation = "0.3.2"
-objc2-metal = "0.3.2"
+objc2-io-surface = "0.3.2"
+objc2-metal = { version = "0.3.2", features = ["objc2-io-surface"] }
 objc2-quartz-core = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"

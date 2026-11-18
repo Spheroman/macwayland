@@ -38,7 +38,7 @@ root() {
 }
 # KosmicKrisp again only when its recipe or patches change.
 kkstamp=$out/roots/.kk-main
-if [ ! -e "$out/roots/kk-main" ] || [ ! -e "$kkstamp" ] || [ -n "$(find "$here/kosmickrisp-main.nix" "$here/kosmickrisp-transform-feedback" -newer "$kkstamp" | head -1)" ]; then
+if [ ! -e "$out/roots/kk-main" ] || [ ! -e "$kkstamp" ] || [ -n "$(find "$here/kosmickrisp-main.nix" "$here/kosmickrisp-transform-feedback" "$here/kosmickrisp-macwl" -newer "$kkstamp" | head -1)" ]; then
     nix build --out-link "$out/roots/kk-main" --impure -f "$here/kosmickrisp-main.nix" >&2
     touch "$kkstamp"
 fi

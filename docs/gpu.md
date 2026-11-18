@@ -761,9 +761,75 @@ drawable was the question, tried natively before any plumbing
 
 So showing a client's IOSurface through Core Animation would trade the
 ~0.4 ms composite for a frame (8.3 ms). Not built. Saving the composite
-would need the client's frame drawn into the drawable itself (the
-drawable's IOSurface handed to the GPU worker each frame), which
-CAMetalLayer's ownership of its drawables makes awkward.
+needs the client's frame drawn into the drawable itself: built next.
+
+### Drawing into the drawable, 2026-11-18
+
+The GPU worker copies a full-screen client's frame straight into the
+shell's drawable, which the shell then presents as it is.
+
+What had to hold first (`native-probe metal`, in one process):
+
+- A framebuffer-only drawable's IOSurface takes writes through another
+  texture made over it (`NATIVE_VIA_SURFACE=1`, red and blue checked by
+  eye), and presenting it so is as quick (p50 7.75 / 8.31 against 8.07).
+- It isn't linear memory: its format is `&BGA`, Apple's lossless-compressed
+  BGRA (`NATIVE_VIA=cpu|buffer` show it), so a copy into a buffer over it
+  won't do; a texture over it is needed. A drawable that isn't
+  framebuffer-only is plain `BGRA` but composited (p50 19.29 / 17.91
+  against 7.85 / 8.70, `NATIVE_FBONLY=0`).
+- An unprivileged process can still register a bootstrap name, and an
+  IOSurface crosses to another process as a Mach port.
+
+How (on by default; `MACWL_DIRECT=0` is off):
+
+- **KosmicKrisp** (`gpu/kosmickrisp-macwl/`, ours alone, after the
+  transform feedback series): `VK_EXT_external_memory_metal`'s
+  `MTLTEXTURE` handle type, for a dedicated image only, the image binding
+  the texture as its plane's own; made resident (Metal 4 tracks nothing
+  by itself: without that, the first copy lost the device).
+- **The GPU worker** (`vkr_direct.c` in `gpu/virglrenderer-macos.patch`):
+  finds the shell through `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY.direct` (a
+  bootstrap name) and says HELLO with its Mach port. A command buffer
+  copying a whole BGRA image into a buffer bound to shared memory is a
+  prime blit; when one is submitted for a buffer the shell has offered a
+  drawable for (by its shm object's name, as `fences`), the worker first
+  submits its own copy, the swapchain image into a VkImage over a texture
+  over the drawable's IOSurface (kept per surface: drawables recycle a
+  few), taking the blit's waits and signalling a semaphore the blit then
+  waits on; it says CLAIM, and DONE when its fence signals. The blit runs
+  after as before, so the client's buffer is right for anything that
+  composites it later.
+- **The shell** (`crates/shell/src/direct.rs`): while one opaque surface
+  exactly fills the drawable, holds a drawable (three, not two) and offers
+  its IOSurface for that surface's buffers (REKEY as it learns more);
+  presents it on DONE, from the receive thread; for a frame claimed (or
+  presented already), keeps the scene's books and draws nothing. When
+  that stops being so it revokes; a claim never done is given up on after
+  200 ms (a dead worker). With no worker, or a frame not claimed (within
+  4 ms or by its fence), it composites as before.
+- `gpu/keyframe.c` now draws at the output's scale (`wl_output.scale`,
+  `wl_surface.set_buffer_scale`; `KEYFRAME_SCALE=1` the old way), as a
+  HiDPI client does: at 1× its 1512×982 buffer was shown centred, never
+  filling the drawable (and the composites measured before read 6 MB, not
+  24).
+
+Measured as key → frame finished (native: GPU done; composited: the
+shell's GPU done; direct: DONE, the drawable presented), interleaved, three
+rounds of 150 keys, keyframe full-screen at 2×, idle machine (load ~3–4;
+`caffeinate -d`, the display having gone to sleep on a first try):
+
+| p50, ms | round 1 | round 2 | round 3 | over native |
+|---|---|---|---|---|
+| native Metal | 0.93 | 1.01 | 1.54 | |
+| composited (`MACWL_DIRECT=0`) | 1.93 | 2.36 | 2.48 | +1.00 / +1.35 / +0.94 |
+| direct | 1.30 | 1.70 | 1.72 | **+0.37 / +0.69 / +0.18** |
+
+About 0.4 ms over native, from ~1.1 for a full-screen client composited
+(its 24 MB composite and blit). Key → glass p50 in the same runs, direct
+against composited: 11.41 / 12.11 / 12.07 against 13.26 / 12.48 / 12.95
+(native's 10.92 / 9.56 / 11.26 were high throughout: composited by
+WindowServer, it seems, after the display woke).
 
 ## Transform feedback in KosmicKrisp, 2026-11-14
 

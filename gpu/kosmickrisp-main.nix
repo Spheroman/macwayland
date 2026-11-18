@@ -17,8 +17,10 @@ in {
   };
   # VK_EXT_transform_feedback for KosmicKrisp (ours, a series meant for
   # upstream; Zink needs it for GL 3.x and GLES 3).
-  patches = map (p: ./kosmickrisp-transform-feedback + "/${p}")
-    (builtins.sort builtins.lessThan (builtins.attrNames (builtins.readDir ./kosmickrisp-transform-feedback)));
+  # Then ours alone (gpu/kosmickrisp-macwl/: importing a Metal texture as
+  # a dedicated image's memory, for drawing into the shell's drawable).
+  patches = let dir = d: map (p: d + "/${p}") (builtins.sort builtins.lessThan (builtins.attrNames (builtins.readDir d)));
+    in dir ./kosmickrisp-transform-feedback ++ dir ./kosmickrisp-macwl;
   # Options main no longer has.
   mesonFlags = builtins.filter (f: f != clangFlag)
     (map (f: if lib.hasPrefix "-Dvulkan-layers" f then "-Dvulkan-layers=" else f) o.mesonFlags);

@@ -72,6 +72,21 @@ static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s, uint32_t a, uint
 static void kb_repeat(void *d, struct wl_keyboard *k, int32_t r, int32_t de) { (void)d, (void)k, (void)r, (void)de; }
 static const struct wl_keyboard_listener kb_listener = {kb_keymap, kb_enter, kb_leave, kb_key, kb_mods, kb_repeat};
 
+// The output's scale: the swapchain is the window's size in pixels at it, as
+// a HiDPI client draws (KEYFRAME_SCALE=N overrides; 1 is the old way).
+static int32_t scale = 1;
+static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph, int32_t sp, const char *mk, const char *md, int32_t t) {
+    (void)d, (void)o, (void)x, (void)y, (void)pw, (void)ph, (void)sp, (void)mk, (void)md, (void)t;
+}
+static void out_mode(void *d, struct wl_output *o, uint32_t f, int32_t w, int32_t h, int32_t r) { (void)d, (void)o, (void)f, (void)w, (void)h, (void)r; }
+static void out_done(void *d, struct wl_output *o) { (void)d, (void)o; }
+static void out_scale(void *d, struct wl_output *o, int32_t f) {
+    (void)d, (void)o;
+    if (!getenv("KEYFRAME_SCALE") && f > 0)
+        scale = f;
+}
+static const struct wl_output_listener output_listener = {out_geometry, out_mode, out_done, out_scale};
+
 static void global(void *d, struct wl_registry *r, uint32_t name, const char *iface, uint32_t v) {
     (void)d, (void)v;
     if (!strcmp(iface, wl_compositor_interface.name))
@@ -81,6 +96,8 @@ static void global(void *d, struct wl_registry *r, uint32_t name, const char *if
         xdg_wm_base_add_listener(wm_base, &wm_listener, NULL);
     } else if (!strcmp(iface, wl_seat_interface.name))
         seat = wl_registry_bind(r, name, &wl_seat_interface, 1);
+    else if (!strcmp(iface, wl_output_interface.name) && v >= 2)
+        wl_output_add_listener(wl_registry_bind(r, name, &wl_output_interface, 2), &output_listener, NULL);
 }
 static void global_remove(void *d, struct wl_registry *r, uint32_t n) { (void)d, (void)r, (void)n; }
 static const struct wl_registry_listener registry_listener = {global, global_remove};
@@ -110,7 +127,7 @@ static void make_swapchain(void) {
         .minImageCount = caps.minImageCount + 1 > 3 ? caps.minImageCount + 1 : 3,
         .imageFormat = f.format,
         .imageColorSpace = f.colorSpace,
-        .imageExtent = {width, height},
+        .imageExtent = {width * scale, height * scale},
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
@@ -138,6 +155,10 @@ int main(int argc, char **argv) {
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
     wl_display_roundtrip(display);
+    // (And the outputs' events.)
+    wl_display_roundtrip(display);
+    if (getenv("KEYFRAME_SCALE"))
+        scale = atoi(getenv("KEYFRAME_SCALE")) > 0 ? atoi(getenv("KEYFRAME_SCALE")) : 1;
     if (!compositor || !wm_base || !seat) {
         fprintf(stderr, "missing globals\n");
         return 1;
@@ -150,6 +171,7 @@ int main(int argc, char **argv) {
     struct xdg_toplevel *top = xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(top, &toplevel_listener, NULL);
     xdg_toplevel_set_title(top, "keyframe");
+    wl_surface_set_buffer_scale(surface, scale);
     wl_surface_commit(surface);
     while (!configured)
         wl_display_dispatch(display);

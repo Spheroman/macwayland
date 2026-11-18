@@ -393,7 +393,9 @@ from a static Linux binary.
     GPU warm-up on keys, keys flushed at once and framebuffer-only
     drawables, ~1 ms on an idle machine; with implicit fencing (Venus
     commits at once, the shell's GPU waits for the client's fence, told by
-    macwl-run over a socket) ~0.5 ms (key → GPU done p50; docs/gpu.md).
+    macwl-run over a socket) ~0.5 ms (key → GPU done p50; docs/gpu.md);
+    for a full-screen client, ~0.4 ms with its frames drawn by the GPU
+    worker straight into the shell's drawable (~1.1 composited).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with

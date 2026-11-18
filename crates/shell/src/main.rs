@@ -38,6 +38,8 @@
 //!
 //! Esc quits.
 
+mod direct;
+
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -215,6 +217,8 @@ struct Lease {
     /// Done once the client's GPU has drawn it (a dma-buf committed before
     /// that: implicit fencing, `macwl_compositor::fences`).
     ready: Option<macwl_compositor::Ready>,
+    /// What names its buffer's memory (a dma-buf's: `direct`).
+    key: Option<direct::Key>,
     _pool: Arc<MappedPool>,
     _release: BufferRelease,
 }
@@ -274,6 +278,7 @@ impl ShellHost {
         mapped: Arc<MappedPool>,
         data: &BufferData,
         ready: Option<macwl_compositor::Ready>,
+        key: Option<direct::Key>,
         release: BufferRelease,
     ) -> Option<BufferRelease> {
         use macwl_compositor::ShmFormat;
@@ -294,7 +299,7 @@ impl ShellHost {
             return Some(release);
         };
         LEASES.fetch_add(1, Ordering::Relaxed);
-        let lease = Arc::new(Lease { texture, ready, _pool: mapped, _release: release });
+        let lease = Arc::new(Lease { texture, ready, key, _pool: mapped, _release: release });
         let opaque = data.format != ShmFormat::Argb8888;
         let mut scene = self.scene.lock().unwrap();
         scene.seq += 1;
@@ -369,7 +374,7 @@ impl macwl_compositor::Host for ShellHost {
             return Some(release);
         }
         let Some(mapped) = self.mapped(&pool) else { return Some(release) };
-        self.show(id, mapped, data, None, release)
+        self.show(id, mapped, data, None, None, release)
     }
 
     /// A dma-buf: its plane's file is mapped and drawn from as a pool is.
@@ -400,7 +405,8 @@ impl macwl_compositor::Host for ShellHost {
                 m
             }
         };
-        self.show(id, mapped, data, ready, release)
+        let key = buffer.handles().next().and_then(|fd| macwl_compositor::fences::buffer_key(fd.as_raw_fd()));
+        self.show(id, mapped, data, ready, key, release)
     }
 
     /// The client under the pointer changed its cursor.
@@ -732,15 +738,155 @@ struct Renderer {
     key_pending: Arc<Mutex<Option<(f64, f64)>>>,
     /// Stop after this many key → glass samples (MACWL_AUTO_KEYS).
     auto_keys: Option<usize>,
+    /// Clients' frames drawn into our drawable by their GPU worker
+    /// (`direct`; MACWL_DIRECT=0 is off).
+    direct_on: bool,
+    direct: Option<direct::Direct>,
+    /// The full-screen surface's buffers' keys (what an offer is for).
+    window: Option<(u32, Vec<direct::Key>)>,
 }
 
 impl Renderer {
     /// Render and present right now (on-demand pacing).
     fn render_now(&mut self) {
-        let start = CACurrentMediaTime();
-        if let Some(drawable) = self.layer.nextDrawable() {
-            self.trace_render = Some((start, CACurrentMediaTime()));
-            self.frame(&drawable);
+        if !self.direct_frame() {
+            let start = CACurrentMediaTime();
+            if let Some(drawable) = self.layer.nextDrawable() {
+                self.trace_render = Some((start, CACurrentMediaTime()));
+                self.frame(&drawable);
+            }
+        }
+        self.direct_tick();
+    }
+
+    /// A new frame of the full-screen surface that its GPU worker draws
+    /// into our offered drawable: keep the scene's books (its buffer is the
+    /// surface's now), draw nothing. Whether it was one.
+    fn direct_frame(&mut self) -> bool {
+        let Some(direct) = self.direct.clone() else { return false };
+        let (key, ready) = {
+            let scene = self.scene.lock().unwrap();
+            if scene.seq == self.scene_seq || scene.layers.len() != 1 {
+                return false;
+            }
+            let id = scene.layers[0].id;
+            let Some(frame) = scene.surfaces.get(&id) else { return false };
+            if self.textures.get(&id).is_some_and(|(_, seq, ..)| *seq == frame.seq) {
+                return false;
+            }
+            let Some(lease) = &frame.lease else { return false };
+            let Some(key) = lease.key else { return false };
+            (key, lease.ready.clone())
+        };
+        // The claim is sent before the copy is submitted, so by the time
+        // the frame's own fence is done it has come, if it's coming.
+        let claim = direct.wait_claim(&key, Duration::from_millis(4), || ready.as_ref().is_none_or(|r| r.done()));
+        if claim == direct::Claim::No {
+            return false;
+        }
+        let (committed, _) = self.sync_scene();
+        // Key → glass, as `frame` counts it, on the offered drawable.
+        let answered = committed.and_then(|committed| {
+            let mut pending = self.key_pending.lock().unwrap();
+            if pending.is_some_and(|(_, seen)| committed > seen) { pending.take().map(|p| (p, committed)) } else { None }
+        });
+        if let Some(((key_ts, _), committed)) = answered {
+            if std::env::var_os("MACWL_KEY_TRACE").is_some() {
+                eprintln!("shell: key sent {:.1} committed {:.1} (direct: {claim:?})", key_ts * 1e6, committed * 1e6);
+            }
+            let s = direct.state.0.lock().unwrap();
+            if let Some(d) = s.offer.as_ref().and_then(|o| o.drawable.as_ref()) {
+                let stats = self.stats.clone();
+                let handler = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                    let glass = unsafe { d.as_ref().presentedTime() };
+                    if glass > 0.0 {
+                        stats.lock().unwrap().push_labelled("key", "key→commit", (committed - key_ts) * 1e3, "key→glass", (glass - key_ts) * 1e3);
+                    }
+                });
+                let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*d.0);
+                unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
+            }
+        }
+        self.check_auto_keys_done();
+        true
+    }
+
+    /// Offer a drawable while one opaque surface fills the screen; take it
+    /// back when that ends.
+    fn direct_tick(&mut self) {
+        if !self.direct_on || self.latency_mode {
+            return;
+        }
+        if self.direct.is_none() {
+            // (Once there's a runtime directory: the compositor makes one.)
+            static TRIED: AtomicBool = AtomicBool::new(false);
+            let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
+            if TRIED.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            self.direct = direct::Direct::start(dir.as_ref(), "wayland-mac", || {
+                DispatchQueue::main().exec_async(|| with_renderer(Renderer::direct_tick));
+            });
+            if self.direct.is_none() {
+                return;
+            }
+        }
+        let direct = self.direct.clone().unwrap();
+        direct.expire(0.2);
+        let size = self.layer.drawableSize();
+        let full = (self.layers.len() == 1)
+            .then(|| &self.layers[0])
+            .filter(|l| l.x == 0 && l.y == 0)
+            .and_then(|l| self.textures.get(&l.id).map(|e| (l.id, e)))
+            .and_then(|(id, (tex, _, opaque, lease))| {
+                let key = lease.as_ref()?.key?;
+                (*opaque && tex.width() as f64 == size.width && tex.height() as f64 == size.height).then_some((id, key))
+            });
+        if std::env::var_os("MACWL_DIRECT_TRACE").is_some() {
+            static LAST: Mutex<String> = Mutex::new(String::new());
+            let why = format!(
+                "layers {} first {:?} tex {:?} drawable {}x{} full {}",
+                self.layers.len(),
+                self.layers.first().map(|l| (l.id, l.x, l.y)),
+                self.layers.first().and_then(|l| self.textures.get(&l.id)).map(|(t, _, o, lease)| (t.width(), t.height(), *o, lease.as_ref().map(|l| l.key.is_some()))),
+                size.width,
+                size.height,
+                full.is_some()
+            );
+            let mut last = LAST.lock().unwrap();
+            if *last != why {
+                eprintln!("shell: direct: {why}");
+                *last = why;
+            }
+        }
+        match full {
+            Some((id, key)) => {
+                let keys = match &mut self.window {
+                    Some((wid, keys)) if *wid == id => keys,
+                    _ => &mut self.window.insert((id, Vec::new())).1,
+                };
+                if !keys.contains(&key) {
+                    if keys.len() == 8 {
+                        keys.remove(0);
+                    }
+                    keys.push(key);
+                }
+            }
+            None => self.window = None,
+        }
+        let (offered, peers) = {
+            let s = direct.state.0.lock().unwrap();
+            (s.offer.is_some(), s.has_peers())
+        };
+        match (&self.window, offered) {
+            (Some((_, keys)), false) if peers => {
+                if let Some(drawable) = self.layer.nextDrawable() {
+                    direct.offer(drawable, keys);
+                }
+            }
+            (Some((_, keys)), true) => direct.rekey(keys),
+            (None, true) => direct.revoke(),
+            _ => {}
         }
     }
 
@@ -920,8 +1066,16 @@ impl Renderer {
         target: &ProtocolObject<dyn MTLTexture>,
         clear: MTLClearColor,
     ) -> Option<f64> {
+        let (new_frame, pending) = self.sync_scene();
+        self.encode_scene(cmd, target, clear, pending);
+        new_frame
+    }
+
+    /// Bring the textures up to the scene: when a new frame was committed,
+    /// if one was, and new frames' pixels the client's GPU may still be
+    /// drawing.
+    fn sync_scene(&mut self) -> (Option<f64>, Vec<macwl_compositor::Ready>) {
         let mut new_frame = None;
-        // New frames' pixels the client's GPU may still be drawing.
         let mut pending: Vec<macwl_compositor::Ready> = Vec::new();
         {
             let mut scene = self.scene.lock().unwrap();
@@ -949,6 +1103,16 @@ impl Renderer {
                 }
             }
         }
+        (new_frame, pending)
+    }
+
+    fn encode_scene(
+        &mut self,
+        cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        clear: MTLClearColor,
+        pending: Vec<macwl_compositor::Ready>,
+    ) {
         // The GPU reads them once they're drawn: encoded now, started as
         // each one's fence signals (sooner than the client could commit
         // after waiting for it itself).
@@ -1002,7 +1166,6 @@ impl Renderer {
             }
             encoder.endEncoding();
         }
-        new_frame
     }
 }
 
@@ -1330,7 +1493,9 @@ fn main() {
         .map(|i| args.get(i + 1).and_then(|n| n.parse().ok()).unwrap_or(40));
     let frame_latency: f32 =
         std::env::var("MACWL_FRAME_LATENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let drawables: usize = std::env::var("MACWL_DRAWABLES").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    // (Direct drawing holds a drawable on offer: a third for the rest.)
+    let direct_on = env_flag("MACWL_DIRECT", true);
+    let drawables: usize = std::env::var("MACWL_DRAWABLES").ok().and_then(|v| v.parse().ok()).unwrap_or(if direct_on { 3 } else { 2 });
     let vsync = env_flag("MACWL_VSYNC", true);
     let fb_only = env_flag("MACWL_FBONLY", true);
     let on_demand = std::env::var("MACWL_PACING").map(|v| v != "link").unwrap_or(true);
@@ -1538,12 +1703,13 @@ fn main() {
     }
 
     let config = format!(
-        "{} pacing={} callbacks={} frame_latency={frame_latency} drawables={drawables} vsync={} fbonly={} refresh={}Hz",
+        "{} pacing={} callbacks={} frame_latency={frame_latency} drawables={drawables} vsync={} fbonly={} direct={} refresh={}Hz",
         if latency_mode { "latency" } else { "compositor" },
         if on_demand { "demand" } else { "link" },
         if refresh_callbacks { "refresh" } else { "timer" },
         vsync as u8,
         fb_only as u8,
+        direct_on as u8,
         screen.maximumFramesPerSecond(),
     );
     let renderer = Renderer {
@@ -1563,9 +1729,14 @@ fn main() {
         config,
         key_pending,
         auto_keys,
+        direct_on,
+        direct: None,
+        window: None,
     };
 
     RENDERER.with_borrow_mut(|r| *r = Some(renderer));
+    // Listen for GPU workers before any client comes (`direct`).
+    with_renderer(Renderer::direct_tick);
 
     // --- Frame pacing ------------------------------------------------------------
     // Under display-link pacing the delegate is a weak property, so it and the

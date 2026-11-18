@@ -229,11 +229,61 @@ fn apply(light: bool) {
                 let cmd = queue.commandBuffer().unwrap();
                 let rpd = MTLRenderPassDescriptor::new();
                 let a = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
-                a.setTexture(Some(&drawable.texture()));
+                // NATIVE_VIA_SURFACE=1: draw through another texture made
+                // over the drawable's IOSurface (as another process would
+                // have to), in red and blue to see it's right.
+                let via = std::env::var_os("NATIVE_VIA_SURFACE").is_some();
+                if via {
+                    let texture = drawable.texture();
+                    let surface = objc2_metal::MTLTexture::iosurface(&*texture).expect("drawable without IOSurface");
+                    let desc = unsafe {
+                        objc2_metal::MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                            MTLPixelFormat::BGRA8Unorm,
+                            objc2_metal::MTLTexture::width(&*texture),
+                            objc2_metal::MTLTexture::height(&*texture),
+                            false,
+                        )
+                    };
+                    desc.setUsage(objc2_metal::MTLTextureUsage::RenderTarget);
+                    let device = objc2_metal::MTLCommandQueue::device(&**queue);
+                    let other = device.newTextureWithDescriptor_iosurface_plane(&desc, &surface, 0).expect("texture over the drawable's IOSurface");
+                    a.setTexture(Some(&other));
+                } else {
+                    a.setTexture(Some(&drawable.texture()));
+                }
                 a.setLoadAction(MTLLoadAction::Clear);
                 a.setStoreAction(MTLStoreAction::Store);
-                a.setClearColor(MTLClearColor { red: v, green: v, blue: v, alpha: 1.0 });
+                a.setClearColor(if via {
+                    if light { MTLClearColor { red: 0.0, green: 0.0, blue: 0.8, alpha: 1.0 } } else { MTLClearColor { red: 0.8, green: 0.0, blue: 0.0, alpha: 1.0 } }
+                } else {
+                    MTLClearColor { red: v, green: v, blue: v, alpha: 1.0 }
+                });
                 cmd.renderCommandEncoderWithDescriptor(&rpd).unwrap().endEncoding();
+                // NATIVE_VIA=cpu|buffer: write the drawable's IOSurface as
+                // linear memory, by the CPU or by the GPU into a no-copy
+                // buffer over its mapping (the GPU worker's way, docs/gpu.md),
+                // in a pattern a tiled layout would scramble.
+                if let Ok(via) = std::env::var("NATIVE_VIA") {
+                    let texture = drawable.texture();
+                    let surface = objc2_metal::MTLTexture::iosurface(&*texture).expect("drawable without IOSurface");
+                    write_pattern(&surface, light, &via, queue);
+                    // (The clear pass above is replaced: present what's written.)
+                    let cmd2 = queue.commandBuffer().unwrap();
+                    let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
+                    let event_time = shared().pending.map(|(t, _)| t);
+                    if let Some(event_time) = event_time {
+                        let handler = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                            let glass = unsafe { d.as_ref().presentedTime() };
+                            if glass > 0.0 {
+                                shared().metal_ms.push((glass - event_time) * 1e3);
+                            }
+                        });
+                        unsafe { d.addPresentedHandler(RcBlock::as_ptr(&handler)) };
+                    }
+                    cmd2.presentDrawable(d);
+                    cmd2.commit();
+                    return;
+                }
                 let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
                 let event_time = shared().pending.map(|(t, _)| t);
                 if let Some(event_time) = event_time {
@@ -276,6 +326,84 @@ fn apply(light: bool) {
             }
         }
     });
+}
+
+/// Left half red / right half blue (`light`), or top half green / bottom
+/// half red, written into `surface` as linear BGRA rows.
+fn write_pattern(surface: &objc2_io_surface::IOSurfaceRef, light: bool, via: &str, queue: &ProtocolObject<dyn MTLCommandQueue>) {
+    use objc2_io_surface::IOSurfaceLockOptions;
+    use objc2_metal::{MTLBlitCommandEncoder as _, MTLTexture as _};
+    let (w, h, stride) = (surface.width(), surface.height(), surface.bytes_per_row());
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let fmt = surface.pixel_format().to_be_bytes();
+        eprintln!(
+            "native: drawable IOSurface {w}x{h} bytesPerRow {stride} alloc {} planes {} format {}",
+            surface.alloc_size(),
+            surface.plane_count(),
+            String::from_utf8_lossy(&fmt)
+        );
+    });
+    let pixel = |x: usize, y: usize| -> u32 {
+        // BGRA in memory: 0xAARRGGBB little-endian.
+        let (r, g, b) = if light { if x < w / 2 { (200, 0, 0) } else { (0, 0, 200) } } else if y < h / 2 { (0, 200, 0) } else { (200, 0, 0) };
+        0xff00_0000 | (r << 16) | (g << 8) | b
+    };
+    unsafe { surface.lock(IOSurfaceLockOptions::empty(), std::ptr::null_mut()) };
+    let base = surface.base_address().as_ptr().cast::<u8>();
+    if via == "cpu" {
+        for y in 0..h {
+            let row = unsafe { std::slice::from_raw_parts_mut(base.add(y * stride).cast::<u32>(), w) };
+            for (x, p) in row.iter_mut().enumerate() {
+                *p = pixel(x, y);
+            }
+        }
+    } else {
+        // The pattern in a texture, copied by the GPU into a buffer over the
+        // surface's memory.
+        let device = objc2_metal::MTLCommandQueue::device(queue);
+        let desc = unsafe { objc2_metal::MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::BGRA8Unorm, w, h, false) };
+        let src = device.newTextureWithDescriptor(&desc).unwrap();
+        let mut pixels = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = pixel(x, y);
+            }
+        }
+        unsafe {
+            src.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                objc2_metal::MTLRegion { origin: objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 }, size: objc2_metal::MTLSize { width: w, height: h, depth: 1 } },
+                0,
+                NonNull::new(pixels.as_mut_ptr().cast()).unwrap(),
+                w * 4,
+            )
+        };
+        let page = 16384;
+        let len = surface.alloc_size().div_ceil(page) * page;
+        let buffer = unsafe {
+            device.newBufferWithBytesNoCopy_length_options_deallocator(NonNull::new(base.cast()).unwrap(), len, objc2_metal::MTLResourceOptions::StorageModeShared, None)
+        }
+        .expect("no-copy buffer over the IOSurface");
+        let cmd = queue.commandBuffer().unwrap();
+        let blit = objc2_metal::MTLCommandBuffer::blitCommandEncoder(&*cmd).unwrap();
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                &src,
+                0,
+                0,
+                objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                objc2_metal::MTLSize { width: w, height: h, depth: 1 },
+                &buffer,
+                0,
+                stride,
+                stride * h,
+            )
+        };
+        blit.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+    unsafe { surface.unlock(IOSurfaceLockOptions::empty(), std::ptr::null_mut()) };
 }
 
 fn summary(label: &str, samples: &[f64]) -> String {
@@ -397,6 +525,8 @@ fn main() {
             layer.setOpaque(true);
             layer.setMaximumDrawableCount(2);
             layer.setPresentsWithTransaction(std::env::var_os("NATIVE_WITH_TRANSACTION").is_some());
+            // NATIVE_FBONLY=0: drawables that aren't framebuffer-only.
+            layer.setFramebufferOnly(std::env::var("NATIVE_FBONLY").as_deref() != Ok("0"));
             let scale = screen.backingScaleFactor();
             layer.setContentsScale(scale);
             layer.setDrawableSize(objc2_foundation::NSSize {
