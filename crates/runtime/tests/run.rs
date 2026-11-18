@@ -316,6 +316,187 @@ fn guest_shares_a_buffer_with_a_host_compositor() {
     assert_eq!(exit, Exit::Code(0));
 }
 
+/// A Unix socket at a path too long for macOS's `sun_path` (104 bytes) but
+/// within Linux's (108): bound, connected and named as the guest gave it
+/// (guest/longsock.c), through a short alias of its directory.
+#[test]
+#[ignore = "needs scripts/build-guest.sh (nix cross toolchain)"]
+fn a_unix_socket_path_longer_than_macos_allows() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    // A directory of 90 bytes: the socket's path is 106.
+    let pad = 90 - dir.as_os_str().len() - 1;
+    let deep = dir.join("d".repeat(pad));
+    std::fs::create_dir(&deep).unwrap();
+    assert_eq!(deep.as_os_str().len(), 90);
+    let (exit, out) = run_args(&guest("longsock"), &[b"longsock", deep.as_os_str().as_encoded_bytes()]);
+    assert_eq!(String::from_utf8_lossy(&out), "longsock ok\n");
+    assert_eq!(exit, Exit::Code(0));
+}
+
+/// macwl-run with the GPU on (`gpu/build.sh`'s environment) and nixpkgs'
+/// Linux Mesa as the guest's Vulkan driver.
+fn gpu_setup() -> impl Fn() -> std::process::Command {
+    // gpu/build.sh once for every test of this process (it can't run twice
+    // at once).
+    static ENV: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    let env = ENV
+        .get_or_init(|| {
+            let build = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../gpu/build.sh")).stderr(std::process::Stdio::null()).output().unwrap();
+            assert!(build.status.success(), "gpu/build.sh failed");
+            String::from_utf8_lossy(&build.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix("export ")?.split_once('=').map(|(k, v)| (k.to_string(), v.replace("${MESA_KK_EXPERIMENTAL-custom_border}", "custom_border"))))
+                .collect()
+        })
+        .clone();
+    let mesa = std::path::PathBuf::from(linux_package("mesa"));
+    move || {
+        let mut cmd = macwl_run();
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.env("MACWL_ENV_VK_ICD_FILENAMES", mesa.join("share/vulkan/icd.d/virtio_icd.aarch64.json"));
+        cmd
+    }
+}
+
+/// A GPU context's worker dying (Metal aborts a process on misuse: why it's
+/// a process of its own) is a lost device to the guest, at once: a
+/// program waiting on fences gets VK_ERROR_DEVICE_LOST rather than hang
+/// or be told its work finished (gpu/fencebench.c, its worker killed).
+#[test]
+#[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
+fn a_gpu_workers_death_is_a_lost_device() {
+    use std::time::{Duration, Instant};
+    let gpu = gpu_setup();
+    let bench = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/gpu/fencebench-linux");
+    let mut child = gpu().arg(bench).args(["100000000", "0"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let children = |pid: u32| -> Vec<i32> {
+        let out = std::process::Command::new("pgrep").args(["-P", &pid.to_string()]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
+    };
+    // Its render server is macwl-run's child; the context's worker, the
+    // server's.
+    let start = Instant::now();
+    let worker = loop {
+        if let Some(w) = children(child.id()).into_iter().flat_map(|server| children(server as u32)).next() {
+            break w;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "no render worker");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
+    let killed = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if killed.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!("the guest hung after its GPU worker died");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    assert!(!status.success(), "{err}");
+    // VK_ERROR_DEVICE_LOST
+    assert!(err.contains(": -4"), "{err}");
+    assert!(killed.elapsed() < Duration::from_secs(2), "{:?} to notice", killed.elapsed());
+}
+
+/// Presenting (docs/gpu.md, step 4): a guest Vulkan client's frames reach
+/// the compositor as dma-bufs (Mesa's WSI on its prime path: a GPU copy
+/// into a linear buffer, which is a GPU blob's shared memory), each one
+/// finished before it's committed: gpu/keyframe.c under the headless
+/// compositor, which types `a`, `b` and Escape into it and dumps the
+/// frames it gets (grey, then red, then green).
+#[test]
+#[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
+fn a_gpu_client_presents_finished_frames_as_dma_bufs() {
+    use std::time::{Duration, Instant};
+    let gpu = gpu_setup();
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let built = std::process::Command::new("cargo").args(["build", "-q", "-p", "macwl-compositor"]).current_dir(root).status().unwrap();
+    assert!(built.success());
+    let dir = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(dir.path()).unwrap();
+    let mut compositor = std::process::Command::new(format!("{root}/target/debug/macwl-compositor"))
+        .current_dir(&dir)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("MACWL_TYPE", "a\\pb\\p\\e")
+        .env("RUST_LOG", "info")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !dir.join("wayland-mac").exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no compositor");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = gpu()
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("WAYLAND_DISPLAY", "wayland-mac")
+        .arg(format!("{root}/target/gpu/keyframe-linux"))
+        .output()
+        .unwrap();
+    let _ = compositor.kill();
+    let log = {
+        let mut s = String::new();
+        std::io::Read::read_to_string(compositor.stdout.as_mut().unwrap(), &mut s).unwrap();
+        s
+    };
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The middle pixel of each frame dumped (PPM: RGB).
+    let middle = |name: &str| -> [u8; 3] {
+        let d = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}\n{log}"));
+        let mut parts = d.splitn(4, |&b| b == b'\n');
+        let (_, size, _) = (parts.next(), parts.next().unwrap(), parts.next());
+        let px = parts.next().unwrap();
+        let size = String::from_utf8_lossy(size);
+        let (w, h) = size.split_once(' ').map(|(w, h)| (w.parse::<usize>().unwrap(), h.parse::<usize>().unwrap())).unwrap();
+        let i = ((h / 2) * w + w / 2) * 3;
+        [px[i], px[i + 1], px[i + 2]]
+    };
+    assert_eq!(middle("frame-0.ppm"), [26, 26, 26], "{log}");
+    assert_eq!(middle("frame-1.ppm"), [229, 77, 51], "{log}");
+    assert_eq!(middle("frame-2.ppm"), [51, 178, 77], "{log}");
+    // Dma-bufs: their buffers are GPU blobs, whole 16 KiB pages (a wl_shm
+    // pool would be the frame's size).
+    let lens: Vec<usize> = log.lines().filter_map(|l| l.split("pool_len=").nth(1)?.trim().parse().ok()).collect();
+    assert!(!lens.is_empty() && lens.iter().all(|l| l % 16384 == 0), "{log}");
+}
+
+/// The GPU (docs/gpu.md, step 2): Mesa's Venus driver finds the render
+/// node, `/dev/dri/renderD128`, and runs Vulkan on the Mac's GPU through
+/// it (virglrenderer's render server on KosmicKrisp): `vulkaninfo` names
+/// the device, and dEQP-VK's smoke and basic synchronization tests (fences,
+/// timeline semaphores, events: the node's syncobjs) pass.
+#[test]
+#[ignore = "needs nix and gpu/build.sh (virglrenderer, KosmicKrisp)"]
+fn venus_through_the_render_node() {
+    let gpu = gpu_setup();
+    let tools = std::path::PathBuf::from(linux_package("vulkan-tools"));
+    let out = gpu().arg(tools.join("bin/vulkaninfo")).arg("--summary").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Virtio-GPU Venus (Apple"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+    let cts = std::path::PathBuf::from(linux_package("vulkan-cts"));
+    let dir = tempfile::tempdir().unwrap();
+    let out = gpu()
+        .current_dir(dir.path())
+        .arg(cts.join("bin/.deqp-vk-wrapped"))
+        .arg(format!("--deqp-archive-dir={}", cts.join("archive-dir").display()))
+        .arg("--deqp-case=dEQP-VK.api.smoke.*,dEQP-VK.synchronization.basic.*")
+        .args(["--deqp-log-images=disable", "--deqp-log-shader-sources=disable", "--deqp-log-filename=/dev/null"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let passed = text.lines().find(|l| l.trim_start().starts_with("Passed:")).unwrap_or_else(|| panic!("no totals: {text}"));
+    assert!(text.lines().any(|l| l.trim_start().starts_with("Failed:") && l.contains(" 0/")), "{passed}\n{}", text.lines().filter(|l| l.contains("Fail")).collect::<Vec<_>>().join("\n"));
+    assert!(!passed.contains(" 0/"), "{passed}");
+}
+
 /// B2: the unmodified Rust Wayland client, built for Linux, opens a window on
 /// macwl-compositor (running here on a thread) and its frames arrive intact.
 #[test]

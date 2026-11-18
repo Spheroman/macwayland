@@ -1,0 +1,70 @@
+From 49c9e32232f58b085523f38bfedef83896545ef2 Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:00:38 -0800
+Subject: [PATCH 02/10] poly: Don't rasterize outputs only transform feedback
+ captures
+
+When the GS is linked to the fragment shader, nir_opt_varyings flags the
+generic output components the FS doesn't read but transform feedback
+captures with no_varying. The rasterization shader has already written
+them to the transform feedback buffers by then, so only store the
+components the next stage reads. Metal needs a vertex function's outputs
+to have the types the fragment function reads, and that's not true of a
+captured vec3 that the FS reads as a float.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/poly/nir/poly_nir_lower_gs.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/poly/nir/poly_nir_lower_gs.c b/src/poly/nir/poly_nir_lower_gs.c
+index 06ad3d0e40f..95661051dcd 100644
+--- a/src/poly/nir/poly_nir_lower_gs.c
++++ b/src/poly/nir/poly_nir_lower_gs.c
+@@ -212,6 +212,9 @@ struct lower_output_to_var_slot {
+    nir_variable *selected_var;
+    nir_alu_type type;
+    unsigned nr_components;
++
++   /* Components stored for the next stage, not only for transform feedback */
++   uint8_t varying_mask;
+ };
+ 
+ static bool
+@@ -239,6 +242,8 @@ collect_output_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ 
+    unsigned component = nir_intrinsic_component(intr);
+    output->nr_components = MAX2(output->nr_components, component + 1);
++   if (!sem.no_varying)
++      output->varying_mask |= BITFIELD_BIT(component);
+ 
+    return false;
+ }
+@@ -884,8 +889,24 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
+             nir_bcsel(b, nir_ieq(b, rs.stream, rast_stream), value, killed);
+       }
+ 
++      /* Linking flags the generic outputs the next stage doesn't read but
++       * transform feedback captures, which was written above. Don't rasterize
++       * those, a driver may need its outputs to match the next stage's inputs.
++       */
++      unsigned component = 0;
++      if (slot >= VARYING_SLOT_VAR0) {
++         if (output->varying_mask == 0)
++            continue;
++
++         component = ffs(output->varying_mask) - 1;
++         unsigned end = util_last_bit(output->varying_mask);
++         value = nir_channels(b, value, BITFIELD_RANGE(component,
++                                                       end - component));
++      }
++
+       nir_store_output(b, value, nir_imm_int(b, 0),
+                        .src_type = output->type,
++                       .component = component,
+                        .io_semantics.location = slot);
+    }
+ 
+-- 
+2.55.0
+

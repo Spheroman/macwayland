@@ -32,7 +32,7 @@ fn resolve<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64,
 fn host_only(r: Resolved) -> Result<CString, i64> {
     match r.target {
         Target::Host(h) => Ok(h),
-        Target::Proc(_) | Target::Shm(_) => Err(errno::EACCES),
+        Target::Proc(_) | Target::Shm(_) | Target::Dev(_) => Err(errno::EACCES),
     }
 }
 
@@ -100,6 +100,7 @@ pub(super) fn openat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, 
             FdEntry::new(unsafe { OwnedFd::from_raw_fd(fd) }).path(guest)
         }
         Target::Proc(rest) => proc::open(p, &ByRef(mem), &rest)?,
+        Target::Dev(path) => crate::drm::open(&path, r.guest)?,
         Target::Shm(name) => {
             let fd = shm::open_named(&name, abi::open_flags_to_darwin(flags), mode as u32 & !p.umask())?;
             FdEntry::new(fd).path(r.guest)
@@ -160,6 +161,10 @@ fn fd_stat(p: &Process, fd: u64) -> Result<libc::stat, i64> {
         st.st_gid = unsafe { libc::getgid() };
         return Ok(st);
     }
+    // The render node: the device it is (libdrm finds it by its number).
+    if let crate::fs::FileKind::Drm(_) = &entry.kind {
+        return crate::drm::stat(b"/dev/dri/renderD128");
+    }
     shm::fstat(p.fds.host(fd)?)
 }
 
@@ -194,6 +199,7 @@ fn stat_at<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u64, path: u64,
         }
         Target::Shm(name) => shm::fstat(shm::open_named(&name, libc::O_RDONLY, 0)?.as_raw_fd()),
         Target::Proc(rest) => proc::stat(p, &ByRef(mem), &rest, follow),
+        Target::Dev(path) => crate::drm::stat(&path),
     }
 }
 
@@ -247,6 +253,7 @@ fn write_statx<M: GuestMemory + ?Sized>(mem: &M, buf: u64, st: &libc::stat) -> R
 pub(super) fn statfs<M: GuestMemory + ?Sized>(p: &Process, mem: &M, path: u64, buf: u64) -> Result<i64, i64> {
     const PROC_SUPER_MAGIC: i64 = 0x9fa0;
     const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const SYSFS_MAGIC: i64 = 0x6265_6572;
     match resolve(p, mem, at::FDCWD as u64, path, true)?.target {
         Target::Host(h) => {
             let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -255,6 +262,7 @@ pub(super) fn statfs<M: GuestMemory + ?Sized>(p: &Process, mem: &M, path: u64, b
         }
         Target::Proc(_) => write_statfs(mem, buf, &unsafe { std::mem::zeroed() }, Some(PROC_SUPER_MAGIC)),
         Target::Shm(_) => write_statfs(mem, buf, &unsafe { std::mem::zeroed() }, Some(TMPFS_MAGIC)),
+        Target::Dev(_) => write_statfs(mem, buf, &unsafe { std::mem::zeroed() }, Some(SYSFS_MAGIC)),
     }
 }
 
@@ -308,6 +316,7 @@ pub(super) fn readlinkat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u
     let target = match resolve(p, mem, dirfd, path, false)?.target {
         Target::Host(h) => crate::fs::host_readlink(&h)?,
         Target::Proc(rest) => proc::readlink(p, &ByRef(mem), &rest)?,
+        Target::Dev(path) => crate::drm::readlink(&path)?,
         Target::Shm(_) => return Err(errno::EINVAL), // never a link
     };
     let n = target.len().min(size as usize);
@@ -332,6 +341,7 @@ pub(super) fn faccessat<M: GuestMemory + ?Sized>(p: &Process, mem: &M, dirfd: u6
             ok(unsafe { libc::faccessat(libc::AT_FDCWD, h.as_ptr(), mode as i32, hf) } as i64).map(|_| 0)
         }
         Target::Proc(rest) => proc::exists(p, &ByRef(mem), &rest).map(|_| 0),
+        Target::Dev(path) => crate::drm::exists(&path).map(|_| 0),
         Target::Shm(name) => {
             let want = if mode & 2 != 0 { libc::O_RDWR } else { libc::O_RDONLY };
             shm::open_named(&name, want, 0).map(|_| 0)

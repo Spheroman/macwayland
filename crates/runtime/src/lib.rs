@@ -414,12 +414,14 @@ fn strace_args(space: &Space, nr: u64, args: &[u64; 6]) -> String {
 }
 
 /// Who made a call, for a line of the system call log: with many processes
-/// in the VM their lines mix, so the time (in ms since the host started),
-/// pid and tid.
+/// in the VM their lines mix, so the time (as the call returns, in µs on the
+/// host's uptime clock: a guest's CLOCK_MONOTONIC, and what the shell's and
+/// compositor's traces say), pid and tid.
 fn who(process: &Process, thread: &Thread) -> String {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1e3;
-    format!("{ms:.1} {}/{} ", process.pid, thread.tid)
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts) };
+    let us = ts.tv_sec as f64 * 1e6 + ts.tv_nsec as f64 / 1e3;
+    format!("{us:.1} {}/{} ", process.pid, thread.tid)
 }
 
 fn strace_line(line: std::fmt::Arguments) {

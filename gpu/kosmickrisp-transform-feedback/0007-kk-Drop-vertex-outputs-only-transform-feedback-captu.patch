@@ -1,0 +1,80 @@
+From 786d438e646ca15e146cbec49422f7633742e97d Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:20:55 -0800
+Subject: [PATCH 07/10] kk: Drop vertex outputs only transform feedback
+ captures
+
+Linking keeps the output components the FS doesn't read but transform
+feedback captures, flagged no_varying and now in stores of their own, and
+the hardware vertex lowering keeps a captured point size the topology
+doesn't use, flagged no_sysval_output. A Metal vertex function captures
+nothing, and Metal rejects a pipeline whose vertex outputs don't have the
+types its fragment function reads, or that writes a point size for lines
+or triangles, so drop them from hardware vertex stages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/compiler/nir_to_msl.h |  3 ++-
+ src/kosmickrisp/vulkan/kk_shader.c    | 27 +++++++++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.h b/src/kosmickrisp/compiler/nir_to_msl.h
+index d4f63b5012f..40e11bae4f5 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.h
++++ b/src/kosmickrisp/compiler/nir_to_msl.h
+@@ -130,5 +130,6 @@ static const nir_shader_compiler_options kk_nir_options = {
+    /* Metal does not support double. */
+    .lower_doubles_options = (nir_lower_doubles_options)(~0),
+    .lower_int64_options = nir_lower_ufind_msb64 | nir_lower_subgroup_shuffle64,
+-   .io_options = nir_io_mediump_is_32bit | nir_io_non_interpolated_as_uint,
++   .io_options = nir_io_mediump_is_32bit | nir_io_non_interpolated_as_uint |
++                 nir_io_vectorizer_keeps_no_varying_separate,
+ };
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 3110a8e63b5..f3e8b3a94ef 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -1002,6 +1002,29 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
+    return progress;
+ }
+ 
++/* Linking and the hardware vertex lowering keep the outputs only transform
++ * feedback captures, flagging them no_varying or no_sysval_output. A Metal
++ * vertex function captures nothing, its outputs must have the types the
++ * fragment function reads, and it may only write a point size for points. */
++static bool
++remove_xfb_only_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_store_output ||
++       !nir_instr_xfb_write_mask(intr))
++      return false;
++
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   bool sysval = nir_slot_is_sysval_output(sem.location, MESA_SHADER_FRAGMENT) &&
++                 !sem.no_sysval_output;
++   bool varying = nir_slot_is_varying(sem.location, MESA_SHADER_FRAGMENT) &&
++                  !sem.no_varying;
++   if (sysval || varying)
++      return false;
++
++   nir_instr_remove(&intr->instr);
++   return true;
++}
++
+ /* Consumes nir */
+ static void
+ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+@@ -1010,6 +1033,10 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+ {
+    NIR_PASS(_, nir, kk_nir_lower_poly);
+ 
++   if (nir->info.stage == MESA_SHADER_VERTEX)
++      NIR_PASS(_, nir, nir_shader_intrinsics_pass, remove_xfb_only_output,
++               nir_metadata_control_flow, NULL);
++
+    msl_optimize_nir(nir);
+    modify_nir_info(nir);
+ 
+-- 
+2.55.0
+

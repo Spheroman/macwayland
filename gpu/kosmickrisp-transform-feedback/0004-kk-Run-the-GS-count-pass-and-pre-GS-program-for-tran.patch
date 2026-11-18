@@ -1,0 +1,465 @@
+From 7c179454c4e8853b1f05d0cbdd3c8f2300923c47 Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:01:56 -0800
+Subject: [PATCH 04/10] kk: Run the GS count pass and pre-GS program for
+ transform feedback
+
+poly lowers a GS capturing transform feedback to two more programs: a
+count pass writing each input primitive's output counts, when they are not
+static, and the pre-GS program, which turns their prefix sum into each
+primitive's place in the buffers, advances the buffer offsets past the
+draw's output and counts the transform feedback queries. Compile them
+with the GS, keep them in the pipeline, and dispatch them between the
+stage feeding the GS and the GS.
+
+Without transform feedback state yet, the geometry parameters point the
+buffer offsets at zeroes, so nothing fits and nothing is written, and the
+counters at scratch, which the pre-GS program also gets for the pipeline
+statistics KK doesn't expose. nir_ro_to_rw_poly needs no lowering on Apple
+GPUs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/libkk/kk_geometry.cl          | 16 +++-
+ src/kosmickrisp/vulkan/kk_cmd_buffer.h        |  7 ++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c          | 72 ++++++++++++++++
+ src/kosmickrisp/vulkan/kk_device.c            | 13 +++
+ src/kosmickrisp/vulkan/kk_device.h            |  9 ++
+ .../vulkan/kk_nir_lower_descriptors.c         | 10 +++
+ src/kosmickrisp/vulkan/kk_shader.c            | 82 ++++++++++++++++++-
+ src/kosmickrisp/vulkan/kk_shader.h            |  8 ++
+ 8 files changed, 210 insertions(+), 7 deletions(-)
+
+diff --git a/src/kosmickrisp/libkk/kk_geometry.cl b/src/kosmickrisp/libkk/kk_geometry.cl
+index dd102f9dacc..65c37306908 100644
+--- a/src/kosmickrisp/libkk/kk_geometry.cl
++++ b/src/kosmickrisp/libkk/kk_geometry.cl
+@@ -49,11 +49,21 @@ libkk_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
+                         global struct poly_geometry_params *p,
+                         global struct poly_heap *heap, uint64_t vs_outputs,
+                         uint32_t index_size_B, uint32_t index_buffer_range_el,
+-                        uint32_t prim, uint32_t max_indices,
+-                        enum poly_gs_shape shape)
++                        uint32_t prim, uint32_t is_prefix_summing,
++                        uint32_t max_indices, enum poly_gs_shape shape)
+ {
+    /* Prefix summing only serves transform feedback */
+    poly_gs_setup_indirect(index_buffer, draw, vp, p, heap, vs_outputs,
+                           index_size_B, index_buffer_range_el, prim,
+-                          false /* is_prefix_summing */, max_indices, shape);
++                          is_prefix_summing, max_indices, shape);
++}
++
++/* Prefix sums the GS count buffer, one workgroup per count word, so the GS
++ * knows where each input primitive's transform feedback output goes */
++KERNEL(1024)
++libkk_prefix_sum_geom(constant struct poly_geometry_params *p)
++{
++   local uint scratch[32];
++   poly_prefix_sum(scratch, p->count_buffer, p->input_primitives,
++                   p->count_buffer_stride / 4, cl_group_id.x, 1024);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index 20e585458b8..31e82ca3140 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -93,6 +93,13 @@ struct kk_per_draw_data {
+ 
+    /* Whether the last vertex of a primitive is its provoking vertex */
+    uint32_t provoking_last;
++
++   /* Vertex stream rasterized when a GS writes several */
++   uint32_t rasterization_stream;
++
++   /* Scratch the GS transform feedback and query program writes statistics
++    * KK does not expose to */
++   uint64_t scratch_addr;
+ };
+ 
+ struct kk_attachment {
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 126f94bc100..65956a619f6 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1277,6 +1277,29 @@ kk_gs_in_prim(struct kk_cmd_buffer *cmd)
+       cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+ }
+ 
++/* Transform feedback writes no output and its counters go to scratch, so
++ * nothing fits in the buffers */
++static void
++kk_set_xfb_params(struct kk_cmd_buffer *cmd, struct poly_geometry_params *p)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   uint64_t zeroes = dev->xfb_scratch->gpu;
++   uint64_t scratch = zeroes + KK_XFB_ZERO_SIZE;
++
++   for (uint32_t i = 0; i < POLY_MAX_SO_BUFFERS; ++i) {
++      p->xfb_base_original[i] = zeroes;
++      p->xfb_size[i] = 0u;
++      p->xfb_offs_ptrs[i] = zeroes;
++   }
++
++   for (uint32_t i = 0; i < POLY_MAX_VERTEX_STREAMS; ++i) {
++      p->xfb_prims_generated_counter[i] = scratch;
++      p->prims_generated_counter[i] = scratch;
++      p->xfb_overflow[i] = scratch;
++   }
++   p->xfb_any_overflow = scratch;
++}
++
+ static uint64_t
+ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+                           const struct kk_draw_data *draw, bool restart)
+@@ -1298,6 +1321,13 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+    struct poly_geometry_params params;
+    poly_geometry_params_init(&params, mode, wg_size);
+ 
++   kk_set_xfb_params(cmd, &params);
++
++   /* The GS count pass writes each input primitive's counts, prefix summed
++    * for transform feedback */
++   params.count_buffer_stride = gs->info.gs.count_words * sizeof(uint32_t);
++   bool prefix_sum = gs->info.gs.prefix_sum;
++
+    if (indirect) {
+       /* The indirect setup kernel writes the draw and allocates from the
+        * heap, including the index buffer */
+@@ -1307,6 +1337,11 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+       poly_geometry_params_set_draw(&params, mode, shape, max_indices,
+                                     draw->grid.size.x, draw->grid.size.y);
+ 
++      uint32_t count_size_B =
++         params.input_primitives * params.count_buffer_stride;
++      if (prefix_sum && count_size_B)
++         params.count_buffer = kk_pool_alloc(cmd, count_size_B, 4).gpu;
++
+       gfx->gs.index_count = params.draw.index_count;
+       gfx->gs.instance_count = params.draw.instance_count;
+ 
+@@ -2060,6 +2095,9 @@ kk_upload_per_draw_data(struct kk_cmd_buffer *cmd, uint32_t upload_mask,
+          &cmd->vk.dynamic_graphics_state;
+       gfx->per_draw_data.provoking_last =
+          dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
++      gfx->per_draw_data.rasterization_stream = dyn->rs.rasterization_stream;
++      gfx->per_draw_data.scratch_addr =
++         kk_cmd_buffer_device(cmd)->xfb_scratch->gpu + KK_XFB_ZERO_SIZE;
+    }
+ 
+    struct kk_ptr shader_data_gpu =
+@@ -2202,6 +2240,14 @@ kk_draw_without_restart(struct kk_cmd_buffer *cmd,
+    return draw;
+ }
+ 
++/* Whether the GS's transform feedback and query program runs. Until there is
++ * transform feedback state, a GS capturing it always does, to scratch. */
++static bool
++kk_gs_captures(struct kk_cmd_buffer *cmd, const struct kk_shader *gs)
++{
++   return gs->info.gs.xfb;
++}
++
+ /* Runs the stage feeding the GS and the GS compute pass, returning the draw
+  * that rasterizes its output. */
+ static struct kk_draw_data
+@@ -2236,6 +2282,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+          .heap = kk_heap(cmd),
+          .vs_outputs = (tes ? tes : vs)->info.outputs_written,
+          .prim = mode,
++         .is_prefix_summing = gs->info.gs.prefix_sum,
+          .max_indices = gs->info.gs.max_indices,
+          .shape = shape,
+       };
+@@ -2277,6 +2324,31 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+       enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
+    kk_dispatch_compute(enc, grid_vs, local_size);
+ 
++   /* Transform feedback places each primitive's output from the GS's counts
++    * and the buffers' offsets, which the pre-GS program advances past the
++    * draw's output, counting queries, before the GS runs. */
++   if (kk_gs_captures(cmd, gs)) {
++      if (gs->info.gs.count_words) {
++         mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
++                                          MTL_STAGE_DISPATCH);
++         mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.gs_count);
++         kk_dispatch_compute(enc, grid_gs, local_size);
++      }
++
++      if (gs->info.gs.prefix_sum) {
++         libkk_prefix_sum_geom(
++            cmd, kk_grid_1d(1024u * gs->info.gs.count_words), true,
++            geometry_params);
++         enc = cs_get_compute(cmd);
++      }
++
++      mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
++                                       MTL_STAGE_DISPATCH);
++      mtl_compute_set_pipeline_state(enc, vs->pipeline.gfx.pre_gs);
++      mtl_dispatch_threads(enc, (struct mtl_size){1, 1, 1},
++                           (struct mtl_size){1, 1, 1});
++   }
++
+    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+    mtl_compute_set_pipeline_state(
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 17e9f10e6fa..972b9380efe 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -331,6 +331,14 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   /* Transform feedback points unbound buffers' offsets at the zeroed start
++    * and counters nothing reads at the rest */
++   result = kk_alloc_bo(dev, &dev->vk.base, KK_XFB_SCRATCH_SIZE, 16,
++                        &dev->xfb_scratch);
++   if (result != VK_SUCCESS)
++      goto fail_lib;
++   memset(dev->xfb_scratch->cpu, 0, KK_XFB_SCRATCH_SIZE);
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -340,6 +348,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    return VK_SUCCESS;
+ 
++fail_lib:
++   kk_device_finish_lib(dev);
+ fail_sampler_heap:
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ fail_query_table:
+@@ -387,6 +397,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    if (dev->heap)
+       kk_destroy_bo(dev, dev->heap);
+ 
++   if (dev->xfb_scratch)
++      kk_destroy_bo(dev, dev->xfb_scratch);
++
+    if (dev->has_queue) {
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index 5c964f96643..c2413b29db2 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -105,9 +105,18 @@ struct kk_device {
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
+ 
++   /* Zeroes, then scratch, for transform feedback, see KK_XFB_ZERO_SIZE */
++   struct kk_bo *xfb_scratch;
++
+    bool gpu_capture_active;
+ };
+ 
++/* kk_device::xfb_scratch holds KK_XFB_ZERO_SIZE bytes that stay zero, the
++ * offsets of unbound transform feedback buffers, then scratch for counters
++ * nothing reads */
++#define KK_XFB_ZERO_SIZE    64u
++#define KK_XFB_SCRATCH_SIZE 4096u
++
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ 
+ static inline struct kk_physical_device *
+diff --git a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+index 3b54ffddd8e..d6e9ac07638 100644
+--- a/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ b/src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -825,6 +825,16 @@ lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+       return lower_sysval_to_per_draw(b, intrin, geometry_params);
+    case nir_intrinsic_load_provoking_last:
+       return lower_sysval_to_per_draw(b, intrin, provoking_last);
++   case nir_intrinsic_load_rasterization_stream:
++      return lower_sysval_to_per_draw(b, intrin, rasterization_stream);
++   case nir_intrinsic_load_stat_query_address_poly:
++      /* KK exposes no pipeline statistics, the pre-GS program writes them to
++       * scratch */
++      return lower_sysval_to_per_draw(b, intrin, scratch_addr);
++   case nir_intrinsic_ro_to_rw_poly:
++      b->cursor = nir_instr_remove(&intrin->instr);
++      nir_def_rewrite_uses(&intrin->def, intrin->src[0].ssa);
++      return true;
+    case nir_intrinsic_load_index_size_poly:
+       return lower_sysval_to_per_draw(b, intrin, index_size);
+    case nir_intrinsic_load_first_vertex:
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 23343420006..eca5a6d9106 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -857,6 +857,13 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+       pipe->gfx.render = NULL;
+       pipe->gfx.ds_handle = NULL;
+ 
++      if (pipe->gfx.gs_count)
++         mtl_release(pipe->gfx.gs_count);
++      if (pipe->gfx.pre_gs)
++         mtl_release(pipe->gfx.pre_gs);
++      pipe->gfx.gs_count = NULL;
++      pipe->gfx.pre_gs = NULL;
++
+       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i)
+          mtl_release(pipe->gfx.pre_render[i]);
+ 
+@@ -874,6 +881,10 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+ 
+    ralloc_free((void *)shader->gs_main.entrypoint_name);
+    ralloc_free((void *)shader->gs_main.code);
++   ralloc_free((void *)shader->gs_count.entrypoint_name);
++   ralloc_free((void *)shader->gs_count.code);
++   ralloc_free((void *)shader->pre_gs.entrypoint_name);
++   ralloc_free((void *)shader->pre_gs.code);
+ 
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+@@ -1155,9 +1166,24 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+                &shader->info.gs);
+ 
+       /* Only transform feedback and pipeline statistics need these, and KK
+-       * exposes neither */
+-      ralloc_free(count);
+-      ralloc_free(pre_gs);
++       * exposes no pipeline statistics */
++      if (shader->info.gs.xfb) {
++         /* Counts the GS output of each input primitive, when the GS's counts
++          * are not static, to place it in the buffers */
++         if (count) {
++            count->info.stage = MESA_SHADER_COMPUTE;
++            memset(&count->info.cs, 0, sizeof(count->info.cs));
++            count->xfb_info = NULL;
++            kk_compile_msl(pdev, count, state, &shader->gs_count, apply_wa19);
++         }
++
++         /* Advances the buffer offsets and counts queries before the GS */
++         msl_preprocess_nir(pre_gs);
++         kk_compile_msl(pdev, pre_gs, state, &shader->pre_gs, false);
++      } else {
++         ralloc_free(count);
++         ralloc_free(pre_gs);
++      }
+ 
+       nir->info.stage = MESA_SHADER_COMPUTE;
+       memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+@@ -1482,6 +1508,10 @@ gather_graphics_pipeline_create_info(
+ 
+       if (s->info.stage == MESA_SHADER_GEOMETRY) {
+          kk_msl_copy(&vs->gs_main, &s->gs_main);
++         if (s->gs_count.code)
++            kk_msl_copy(&vs->gs_count, &s->gs_count);
++         if (s->pre_gs.code)
++            kk_msl_copy(&vs->pre_gs, &s->pre_gs);
+          gs = s;
+       }
+    }
+@@ -1557,6 +1587,21 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+          &pipe->gfx.pre_render[pipe->gfx.pre_render_count++]);
+       if (result != VK_SUCCESS)
+          return VK_ERROR_INVALID_SHADER_NV;
++
++      if (vs->gs_count.code) {
++         result = kk_compile_compute_pipeline(device, &vs->gs_count,
++                                              KK_POLY_WG_SIZE,
++                                              &pipe->gfx.gs_count);
++         if (result != VK_SUCCESS)
++            return VK_ERROR_INVALID_SHADER_NV;
++      }
++
++      if (vs->pre_gs.code) {
++         result = kk_compile_compute_pipeline(device, &vs->pre_gs, 1u,
++                                              &pipe->gfx.pre_gs);
++         if (result != VK_SUCCESS)
++            return VK_ERROR_INVALID_SHADER_NV;
++      }
+    }
+ 
+    const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+@@ -1842,6 +1887,17 @@ kk_msl_serialize(const struct msl_compile_data *data, struct blob *blob)
+    blob_write_bytes(blob, data->code, code_length);
+ }
+ 
++/* For the GS count pass and pre-GS program, which only transform feedback
++ * needs */
++static void
++kk_msl_serialize_optional(const struct msl_compile_data *data,
++                          struct blob *blob)
++{
++   blob_write_uint8(blob, data->code != NULL);
++   if (data->code != NULL)
++      kk_msl_serialize(data, blob);
++}
++
+ static bool
+ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+                     struct blob *blob)
+@@ -1855,8 +1911,11 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+          kk_msl_serialize(&shader->msl_data[stage], blob);
+       }
+    }
+-   if (kk_has_gs_main(&shader->info))
++   if (kk_has_gs_main(&shader->info)) {
+       kk_msl_serialize(&shader->gs_main, blob);
++      kk_msl_serialize_optional(&shader->gs_count, blob);
++      kk_msl_serialize_optional(&shader->pre_gs, blob);
++   }
+ 
+    return !blob->out_of_memory;
+ }
+@@ -1883,6 +1942,17 @@ kk_msl_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
+    return VK_SUCCESS;
+ }
+ 
++static VkResult
++kk_msl_deserialize_optional(struct blob_reader *blob,
++                            struct msl_compile_data *data)
++{
++   if (!blob_read_uint8(blob))
++      return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
++                           : VK_SUCCESS;
++
++   return kk_msl_deserialize(blob, data);
++}
++
+ static VkResult
+ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+                       uint32_t binary_version,
+@@ -1917,6 +1987,10 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+ 
+    if (kk_has_gs_main(&info)) {
+       result = kk_msl_deserialize(blob, &shader->gs_main);
++      if (result == VK_SUCCESS)
++         result = kk_msl_deserialize_optional(blob, &shader->gs_count);
++      if (result == VK_SUCCESS)
++         result = kk_msl_deserialize_optional(blob, &shader->pre_gs);
+       if (result != VK_SUCCESS)
+          goto fail;
+    }
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index b6039438e5c..b1657f823fc 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -127,6 +127,9 @@ struct kk_pipeline_handles {
+          mtl_compute_pipeline_state *pre_render[4];
+          mtl_depth_stencil_state *ds_handle;
+          uint32_t pre_render_count;
++         /* GS count pass and pre-GS program, for transform feedback */
++         mtl_compute_pipeline_state *gs_count;
++         mtl_compute_pipeline_state *pre_gs;
+       } gfx;
+       mtl_compute_pipeline_state *cs;
+    };
+@@ -146,6 +149,11 @@ struct kk_shader {
+    /* Compute pass of a GS. Its rasterization VS is in
+     * msl_data[MESA_SHADER_GEOMETRY]. */
+    struct msl_compile_data gs_main;
++   /* With transform feedback, the GS count pass (if the GS's counts are not
++    * static) and the pre-GS program, which places each draw's output in the
++    * buffers and counts queries. */
++   struct msl_compile_data gs_count;
++   struct msl_compile_data pre_gs;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+-- 
+2.55.0
+

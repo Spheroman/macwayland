@@ -27,7 +27,7 @@ fn read_host(p: &Process, t: &Thread, fd: u64, data: &mut [u8], off: Option<u64>
         FileKind::TimerFd(timer) => return kfd::timerfd_read(p, t, &entry, timer, data),
         FileKind::Inotify(_) => return super::inotify_read(p, t, &entry, data),
         FileKind::SignalFd(signalfd) => return super::signalfd_read(p, t, &entry, signalfd, data),
-        FileKind::Epoll(_) | FileKind::PidFd(_) => return Err(errno::EINVAL),
+        FileKind::Epoll(_) | FileKind::PidFd(_) | FileKind::Drm(_) | FileKind::Sync(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
     let host = entry.host.as_raw_fd();
@@ -62,7 +62,7 @@ fn write_host(p: &Process, t: &Thread, fd: u64, data: &[u8], off: Option<u64>) -
     let entry = p.fds.get(fd)?;
     match &entry.kind {
         FileKind::EventFd(state) => return kfd::eventfd_write(&entry, state, data),
-        FileKind::TimerFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::SignalFd(_) | FileKind::PidFd(_) => return Err(errno::EINVAL),
+        FileKind::TimerFd(_) | FileKind::Epoll(_) | FileKind::Inotify(_) | FileKind::SignalFd(_) | FileKind::PidFd(_) | FileKind::Drm(_) | FileKind::Sync(_) => return Err(errno::EINVAL),
         FileKind::Plain => {}
     }
     let host = entry.host.as_raw_fd();
@@ -316,6 +316,23 @@ pub(super) fn set_nonblocking(host: i32, on: bool) -> Result<(), i64> {
 pub(super) fn ioctl<M: GuestMemory + ?Sized>(p: &Process, t: &Thread, mem: &M, fd: u64, req: u64, arg: u64) -> Result<i64, i64> {
     let file = p.fds.get(fd)?;
     let host = file.host.as_raw_fd();
+    // The GPU's: its render node, sync files, and blobs' dma-buf ioctls.
+    if let FileKind::Drm(node) = &file.kind {
+        return crate::drm::node::ioctl(node, p, t, &crate::memory::ByRef(mem), req, arg);
+    }
+    match (req >> 8) & 0xff {
+        0x3e /* '>' */ => {
+            if let Some(crate::drm::sync::Token::SyncFile(fence)) = crate::drm::sync::token_of_fd(p, fd) {
+                return crate::drm::node::sync_file_ioctl(p, &crate::memory::ByRef(mem), &fence, req, arg);
+            }
+        }
+        0x62 /* 'b' */ => {
+            if let Some(r) = crate::drm::node::dma_buf_ioctl(p, t, host, &crate::memory::ByRef(mem), req, arg) {
+                return r;
+            }
+        }
+        _ => {}
+    }
     // Changing a terminal from the background: SIGTTOU, as Linux checks
     // (`tcsetpgrp` checks for itself).
     if matches!(req, tty::TCSETS | tty::TCSETSW | tty::TCSETSF | tty::TCSETS2 | tty::TCSETSW2 | tty::TCSETSF2 | tty::TCSBRK | tty::TCXONC | tty::TCFLSH)

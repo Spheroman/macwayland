@@ -165,6 +165,63 @@ fn unhex(s: &[u8]) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Where short aliases for long socket directories live (see
+/// [`short_socket_path`]).
+fn alias_base() -> Vec<u8> {
+    format!("/tmp/macwl-{}/s", unsafe { libc::getuid() }).into_bytes()
+}
+
+/// A Unix socket path too long for Darwin's `sun_path` (104 bytes, NUL
+/// included, where Linux's holds 108, and a guest path can grow on its
+/// way to the host's) as one through a short alias of its directory: a
+/// symlink `/tmp/macwl-UID/s/HASH` to the directory, which `bind` and
+/// `connect` follow. (Darwin has no public `bindat`/`connectat`.)
+fn short_socket_path(path: &[u8]) -> Result<Vec<u8>, i64> {
+    use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
+    let slash = path.iter().rposition(|&b| b == b'/').ok_or(errno::ENAMETOOLONG)?;
+    let (dir, name) = (if slash == 0 { &b"/"[..] } else { &path[..slash] }, &path[slash + 1..]);
+    // FNV-1a of the directory: a name for its alias.
+    let hash = dir.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    let base = alias_base();
+    let base_path = std::path::Path::new(std::ffi::OsStr::from_bytes(&base));
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(base_path).map_err(|e| errno::from_io(&e))?;
+    // Ours alone: not another user's, nor a symlink planted in /tmp.
+    let meta = std::fs::symlink_metadata(base_path).map_err(|e| errno::from_io(&e))?;
+    if !meta.is_dir() || std::os::unix::fs::MetadataExt::uid(&meta) != unsafe { libc::getuid() } {
+        return Err(errno::ENAMETOOLONG);
+    }
+    let alias = base_path.join(format!("{hash:016x}"));
+    let target = std::path::Path::new(std::ffi::OsStr::from_bytes(dir));
+    if std::fs::read_link(&alias).ok().as_deref() != Some(target) {
+        let _ = std::fs::remove_file(&alias);
+        match std::os::unix::fs::symlink(target, &alias) {
+            Ok(()) => {}
+            // Made meanwhile by another thread or host: fine if it's right.
+            Err(_) if std::fs::read_link(&alias).ok().as_deref() == Some(target) => {}
+            Err(e) => return Err(errno::from_io(&e)),
+        }
+    }
+    let short = [alias.as_os_str().as_bytes(), b"/", name].concat();
+    if short.len() >= 104 {
+        return Err(errno::ENAMETOOLONG);
+    }
+    Ok(short)
+}
+
+/// A host socket path through an alias of [`short_socket_path`]'s as the
+/// path it stands for.
+fn unalias_socket_path(path: &[u8]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let base = alias_base();
+    let Some(rest) = path.strip_prefix(base.as_slice()).and_then(|r| r.strip_prefix(b"/")) else { return path.to_vec() };
+    let Some(slash) = rest.iter().position(|&b| b == b'/') else { return path.to_vec() };
+    let alias = [&base[..], b"/", &rest[..slash]].concat();
+    match std::fs::read_link(std::ffi::OsStr::from_bytes(&alias)) {
+        Ok(dir) => [dir.as_os_str().as_bytes(), &rest[slash..]].concat(),
+        Err(_) => path.to_vec(),
+    }
+}
+
 /// A guest `sockaddr` as a host one. Unix paths go through the guest
 /// filesystem; abstract names (leading NUL, Linux-only) become files in the
 /// runtime's private directory.
@@ -188,13 +245,11 @@ fn addr_to_host<M: GuestMemory + ?Sized>(p: &Process, mem: &M, addr: u64, len: u
                 // bind creates the last component, connect follows it.
                 match p.fs.resolve(&p.fds, crate::abi::at::FDCWD as u64, &path[..end], true)?.target {
                     Target::Host(h) => h.into_bytes(),
-                    Target::Proc(_) | Target::Shm(_) => return Err(errno::ECONNREFUSED),
+                    Target::Proc(_) | Target::Shm(_) | Target::Dev(_) => return Err(errno::ECONNREFUSED),
                 }
             };
             // Darwin's sun_path holds 104 bytes, NUL included.
-            if host_path.len() >= 104 {
-                return Err(errno::ENAMETOOLONG);
-            }
+            let host_path = if host_path.len() >= 104 { short_socket_path(&host_path)? } else { host_path };
             let mut out = vec![0u8, libc::AF_UNIX as u8];
             out.extend_from_slice(&host_path);
             out.push(0);
@@ -229,7 +284,7 @@ fn addr_to_guest(p: &Process, host: &[u8]) -> Vec<u8> {
                     return out;
                 }
             }
-            out.extend(p.fs.guest_path_of_host(path));
+            out.extend(p.fs.guest_path_of_host(&unalias_socket_path(path)));
             out.push(0);
             out
         }

@@ -209,6 +209,24 @@ impl<'vm> Vcpu<'vm> {
 
     /// Run the guest until it exits to the host, and return why.
     pub fn run(&mut self) -> Result<Exit, HvError> {
+        // MACWL_WAKE_TRACE=1: runs of the guest that took over 10 µs, and
+        // how long the host had been away before (to see whether entering
+        // the guest after a long sleep is slow).
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("MACWL_WAKE_TRACE").is_some()) {
+            thread_local!(static LAST_EXIT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) });
+            let entered = std::time::Instant::now();
+            let away = LAST_EXIT.get().map(|t| entered.duration_since(t));
+            let r = check("hv_vcpu_run", unsafe { hv_vcpu_run(self.id) });
+            let exited = std::time::Instant::now();
+            LAST_EXIT.set(Some(exited));
+            let ran = exited.duration_since(entered);
+            if ran.as_micros() > 10 {
+                eprintln!("vcpu {}: ran {:.1} µs after {:.1} µs in the host", self.id, ran.as_secs_f64() * 1e6, away.map_or(0.0, |a| a.as_secs_f64() * 1e6));
+            }
+            r?;
+            return Ok(unsafe { *self.exit });
+        }
         check("hv_vcpu_run", unsafe { hv_vcpu_run(self.id) })?;
         Ok(unsafe { *self.exit })
     }

@@ -1,0 +1,95 @@
+From f3b47ccef4382183c835d6272fe505f39c6a4086 Mon Sep 17 00:00:00 2001
+From: Jack Wen <jackwen04@gmail.com>
+Date: Sat, 14 Nov 2026 16:21:23 -0800
+Subject: [PATCH 09/10] kk: Implement vkCmdDrawIndirectByteCountEXT
+
+A kernel turns the bytes captured past the counter offset into the vertex
+count of an indirect draw.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kosmickrisp/libkk/kk_query.cl    | 16 +++++++++++
+ src/kosmickrisp/vulkan/kk_cmd_draw.c | 43 ++++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+)
+
+diff --git a/src/kosmickrisp/libkk/kk_query.cl b/src/kosmickrisp/libkk/kk_query.cl
+index 21b2b6d056e..7295c75cd67 100644
+--- a/src/kosmickrisp/libkk/kk_query.cl
++++ b/src/kosmickrisp/libkk/kk_query.cl
+@@ -102,3 +102,19 @@ libkk_copy_xfb_counters(constant struct libkk_xfb_counter_copy *push)
+ 
+    *(push->dest[i]) = push->src[i] ? *(push->src[i]) : 0;
+ }
++
++/* vkCmdDrawIndirectByteCountEXT: the vertex count is the bytes captured past
++ * counter_offset over the vertex stride */
++KERNEL(1)
++libkk_draw_from_byte_count(global uint32_t *out_draw,
++                           constant uint32_t *byte_count, uint32_t counter_offset,
++                           uint32_t vertex_stride, uint32_t instance_count,
++                           uint32_t first_instance)
++{
++   int32_t bytes = (int32_t)(*byte_count) - (int32_t)counter_offset;
++
++   out_draw[0] = max(bytes, 0) / vertex_stride; /* vertexCount */
++   out_draw[1] = instance_count;
++   out_draw[2] = 0;                           /* firstVertex */
++   out_draw[3] = first_instance;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 0488a75dc45..090596232f3 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -2799,6 +2799,49 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
+    kk_draw(cmd, &data);
+ }
+ 
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
++                               uint32_t instanceCount, uint32_t firstInstance,
++                               VkBuffer counterBuffer,
++                               VkDeviceSize counterBufferOffset,
++                               uint32_t counterOffset, uint32_t vertexStride)
++{
++   if (instanceCount == 0)
++      return;
++
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   VK_FROM_HANDLE(kk_buffer, counter, counterBuffer);
++
++   const struct vk_dynamic_graphics_state *dyn =
++      &cmd->vk.dynamic_graphics_state;
++
++   /* The GPU turns the byte count into an indirect draw */
++   struct kk_ptr draw = kk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4u);
++   if (unlikely(!draw.gpu))
++      return;
++
++   libkk_draw_from_byte_count(
++      cmd, kk_grid_1d(1), true, draw.gpu,
++      vk_buffer_address(&counter->vk, counterBufferOffset), counterOffset,
++      vertexStride, instanceCount, firstInstance);
++
++   struct kk_draw_command data = {
++      .prim = vk_topology_to_mesa(dyn->ia.primitive_topology),
++      .upload_mask = build_per_draw_upload_mask(cmd),
++      .indirect = true,
++      .predicate_count = cmd->state.cond_render.enabled ? 1u : 0u,
++      .predicate_op[0] = cmd->state.cond_render.inverted
++                            ? KK_PREDICATE_EQ_ZERO
++                            : KK_PREDICATE_NEQ_ZERO,
++      .draw_count = 1,
++      .predicate_addr[0] = cmd->state.cond_render.address,
++      .indirect_command.addr = draw.gpu,
++      .indirect_command.stride = sizeof(VkDrawIndirectCommand),
++   };
++
++   kk_draw(cmd, &data);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
+                                       uint32_t firstBinding,
+-- 
+2.55.0
+

@@ -157,8 +157,18 @@ pub(super) fn mmap<M: GuestMemory + ?Sized>(p: &Process, mem: &M, args: [u64; 6]
         p.file_maps().forget(base as u64, base as u64 + len.next_multiple_of(4096));
         return Ok(base);
     }
-    let host = p.fds.host(fd)?;
+    let mut host = p.fds.host(fd)?;
+    let mut offset = offset;
     let path = p.fds.get(fd)?.path.clone();
+    // The render node: a blob, at the offset `VIRTGPU_MAP` gave it.
+    let _blob;
+    if let crate::fs::FileKind::Drm(node) = &p.fds.get(fd)?.kind {
+        if !shared {
+            return Err(errno::EINVAL);
+        }
+        let (blob_fd, inner, keep) = crate::drm::mapping(node, offset)?;
+        (host, offset, _blob) = (blob_fd, inner, keep);
+    }
     // A memfd sealed against writing can't be mapped shared and writable.
     if shared && prot & mm::PROT_WRITE != 0 && ShmFile::of(host).is_some_and(|f| f.write_sealed()) {
         return Err(errno::EPERM);

@@ -1,0 +1,1688 @@
+diff --git a/meson.build b/meson.build
+index 79aa049b..dbff1af5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -489,7 +489,7 @@ if with_unstable_apis
+ endif
+ 
+ subdir('src')
+-if with_vrend and not with_host_windows
++if (with_vrend or with_venus) and not with_host_windows
+    subdir('vtest')
+ endif
+ 
+diff --git a/src/meson.build b/src/meson.build
+index 1603feff..1b7174f5 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -230,6 +230,12 @@ if with_venus
+    virgl_sources += venus_sources
+    virgl_sources += venus_codegen
+    virgl_depends += [venus_dep]
++   # Drawing into the compositor's drawable (macwl, vkr_direct.h).
++   if host_machine.system() == 'darwin'
++      virgl_sources += ['venus/vkr_direct.c']
++      virgl_depends += [dependency('appleframeworks', modules : ['IOSurface', 'CoreFoundation', 'Metal'])]
++      virgl_depends += [declare_dependency(link_args : ['-lobjc'])]
++   endif
+ endif
+ 
+ if with_drm_renderers
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index 4f87d5ac..06b1cf05 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -3,6 +3,19 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#ifdef __APPLE__
++/* (First, and its BSD list macros gone: util/list.h has its own.) */
++#include <sys/event.h>
++#undef LIST_ENTRY
++#undef LIST_HEAD
++#undef LIST_INIT
++#undef LIST_FIRST
++#undef LIST_NEXT
++#undef LIST_EMPTY
++#undef LIST_FOREACH
++#undef LIST_INSERT_HEAD
++#undef LIST_REMOVE
++#endif
+ #include "proxy_context.h"
+ 
+ #include <fcntl.h>
+@@ -114,12 +127,21 @@ proxy_context_retire_timeline_fences_locked(struct proxy_context *ctx,
+     */
+    if (timeline->cur_seqno == cur_seqno && !list_is_empty(&timeline->fences)) {
+       timeline->cur_seqno_stall_count++;
+-      if (timeline->cur_seqno_stall_count < 100 ||
+-          proxy_socket_is_connected(&ctx->socket))
++      if (!atomic_load(&ctx->sync_thread.hung_up) &&
++          (timeline->cur_seqno_stall_count < 100 ||
++           proxy_socket_is_connected(&ctx->socket)))
+          return false;
+ 
+       /* socket has been disconnected */
+       force_retire_all = true;
++      /* Tell the client first that the context is lost (its worker died):
++       * a fence id of UINT64_MAX, which no client submits, before the
++       * fences are retired, so they can be failed rather than signaled.
++       */
++      if (!timeline->lost_reported) {
++         timeline->lost_reported = true;
++         ctx->base.fence_retire(&ctx->base, ring_idx, UINT64_MAX);
++      }
+    }
+ 
+    timeline->cur_seqno = cur_seqno;
+@@ -175,6 +197,24 @@ proxy_context_sync_thread(void *arg)
+          .fd = ctx->socket.fd,
+       },
+    };
++#ifdef __APPLE__
++   /* macOS's poll() doesn't report a stream socket's peer going (POLLHUP)
++    * when no events are asked for, and POLLIN would wake for every reply.
++    * A kqueue watching the socket for reading with a low-water mark no
++    * reply reaches says only when it ends (EV_EOF). */
++   int kq = kqueue();
++   if (kq >= 0) {
++      struct kevent ev;
++      EV_SET(&ev, ctx->socket.fd, EVFILT_READ, EV_ADD, NOTE_LOWAT, INT32_MAX, NULL);
++      if (kevent(kq, &ev, 1, NULL, 0, NULL) == 0) {
++         poll_fds[1].fd = kq;
++         poll_fds[1].events = POLLIN;
++      } else {
++         close(kq);
++         kq = -1;
++      }
++   }
++#endif
+ 
+    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
+ 
+@@ -188,9 +228,38 @@ proxy_context_sync_thread(void *arg)
+          break;
+       }
+ 
++      /* A hung-up socket stays readable: stop watching it once it has gone,
++       * or this thread spins until the context is destroyed. */
++      bool hung_up = poll_fds[1].revents & (POLLHUP | POLLERR | POLLNVAL);
++#ifdef __APPLE__
++      if (kq >= 0 && poll_fds[1].fd == kq && (poll_fds[1].revents & POLLIN)) {
++         struct kevent ev;
++         const struct timespec zero = { 0, 0 };
++         hung_up = kevent(kq, NULL, 0, &ev, 1, &zero) == 1 && (ev.flags & EV_EOF);
++      }
++#endif
++      if (hung_up) {
++         atomic_store(&ctx->sync_thread.hung_up, true);
++         poll_fds[1].fd = -1;
++         /* The context is lost whether or not fences are pending: say so
++          * (a fence id of UINT64_MAX, see below). */
++         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++            mtx_lock(&ctx->timeline_mutex);
++         if (!ctx->timelines[0].lost_reported) {
++            ctx->timelines[0].lost_reported = true;
++            ctx->base.fence_retire(&ctx->base, 0, UINT64_MAX);
++         }
++         if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
++            mtx_unlock(&ctx->timeline_mutex);
++      }
++
+       proxy_context_retire_fences_internal(ctx);
+    }
+ 
++#ifdef __APPLE__
++   if (kq >= 0)
++      close(kq);
++#endif
+    return 0;
+ }
+ 
+diff --git a/src/proxy/proxy_context.h b/src/proxy/proxy_context.h
+index ce29ecae..62b77dfe 100644
+--- a/src/proxy/proxy_context.h
++++ b/src/proxy/proxy_context.h
+@@ -22,6 +22,8 @@ struct proxy_timeline {
+    struct list_head fences;
+ 
+    int cur_seqno_stall_count;
++   /* the client has been told the context is lost */
++   bool lost_reported;
+ };
+ 
+ struct proxy_context {
+@@ -58,6 +60,8 @@ struct proxy_context {
+       thrd_t thread;
+       bool created;
+       bool stop;
++      /* the socket hung up (the context's worker went) */
++      atomic_bool hung_up;
+    } sync_thread;
+ };
+ 
+diff --git a/src/venus/vkr_buffer.c b/src/venus/vkr_buffer.c
+index bba1f6a5..f0e8bab4 100644
+--- a/src/venus/vkr_buffer.c
++++ b/src/venus/vkr_buffer.c
+@@ -5,6 +5,9 @@
+ 
+ #include "vkr_buffer.h"
+ 
++#include "vkr_device_memory.h"
++#include "vkr_direct.h"
++
+ #include "vkr_buffer_gen.h"
+ #include "vkr_physical_device.h"
+ 
+@@ -37,6 +40,18 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
+     * vkr_physical_device_init_memory_properties as well.
+     */
+ 
++   /* With host memory import, a dma-buf here is host shm imported as host
++    * memory (vkr_dispatch_vkAllocateMemory): say so to the driver, which
++    * knows nothing of dma-bufs. */
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   if (dev && dev->physical_device->use_host_memory_import) {
++      VkExternalMemoryBufferCreateInfo *ext = vkr_find_struct(
++         args->pCreateInfo->pNext, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
++      if (ext && (ext->handleTypes & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT |
++                                      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)))
++         ext->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
++   }
++
+    vkr_buffer_create_and_add(dispatch->data, args);
+ }
+ 
+@@ -83,6 +98,8 @@ vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   vkr_direct_buffer_bound(vkr_buffer_from_handle(args->buffer),
++                           vkr_device_memory_from_handle(args->memory));
+    vn_replace_vkBindBufferMemory_args_handle(args);
+    args->ret =
+       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
+@@ -95,6 +112,10 @@ vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
++   for (uint32_t i = 0; i < args->bindInfoCount; i++) {
++      vkr_direct_buffer_bound(vkr_buffer_from_handle(args->pBindInfos[i].buffer),
++                              vkr_device_memory_from_handle(args->pBindInfos[i].memory));
++   }
+    vn_replace_vkBindBufferMemory2_args_handle(args);
+    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+ }
+diff --git a/src/venus/vkr_buffer.h b/src/venus/vkr_buffer.h
+index d1575b50..50f7c7e0 100644
+--- a/src/venus/vkr_buffer.h
++++ b/src/venus/vkr_buffer.h
+@@ -10,6 +10,10 @@
+ 
+ struct vkr_buffer {
+    struct vkr_object base;
++
++   /* For vkr_direct: what names the shared memory it's bound to. */
++   bool direct_key_valid;
++   char direct_key[64];
+ };
+ VKR_DEFINE_OBJECT_CAST(buffer, VK_OBJECT_TYPE_BUFFER, VkBuffer)
+ 
+diff --git a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+index 766c5c71..267c0cec 100644
+--- a/src/venus/vkr_command_buffer.c
++++ b/src/venus/vkr_command_buffer.c
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include "vkr_command_buffer.h"
++#include "vkr_buffer.h"
++#include "vkr_image.h"
+ 
+ #include "vkr_command_buffer_gen.h"
+ 
+@@ -113,6 +115,7 @@ vkr_dispatch_vkResetCommandBuffer(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+    struct vn_device_proc_table *vk = &cmd->device->proc_table;
+ 
++   cmd->direct.valid = false;
+    vn_replace_vkResetCommandBuffer_args_handle(args);
+    args->ret = vk->ResetCommandBuffer(args->commandBuffer, args->flags);
+ }
+@@ -125,6 +128,7 @@ vkr_dispatch_vkBeginCommandBuffer(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+    struct vn_device_proc_table *vk = &cmd->device->proc_table;
+ 
++   cmd->direct.valid = false;
+    vn_replace_vkBeginCommandBuffer_args_handle(args);
+    args->ret = vk->BeginCommandBuffer(args->commandBuffer, args->pBeginInfo);
+ }
+@@ -349,6 +353,14 @@ static void
+ vkr_dispatch_vkCmdCopyImageToBuffer(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdCopyImageToBuffer *args)
+ {
++   if (args->regionCount >= 1 && args->pRegions) {
++      const VkBufferImageCopy *r = &args->pRegions[0];
++      vkr_direct_note_copy(vkr_command_buffer_from_handle(args->commandBuffer),
++                           vkr_image_from_handle(args->srcImage),
++                           vkr_buffer_from_handle(args->dstBuffer), args->regionCount,
++                           r->bufferOffset, r->bufferRowLength, r->imageOffset.x,
++                           r->imageOffset.y, r->imageExtent.width, r->imageExtent.height);
++   }
+    VKR_CMD_CALL(CmdCopyImageToBuffer, args, args->srcImage, args->srcImageLayout,
+                 args->dstBuffer, args->regionCount, args->pRegions);
+ }
+@@ -357,6 +369,15 @@ static void
+ vkr_dispatch_vkCmdCopyImageToBuffer2(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCmdCopyImageToBuffer2 *args)
+ {
++   const VkCopyImageToBufferInfo2 *info = args->pCopyImageToBufferInfo;
++   if (info && info->regionCount >= 1 && info->pRegions) {
++      const VkBufferImageCopy2 *r = &info->pRegions[0];
++      vkr_direct_note_copy(vkr_command_buffer_from_handle(args->commandBuffer),
++                           vkr_image_from_handle(info->srcImage),
++                           vkr_buffer_from_handle(info->dstBuffer), info->regionCount,
++                           r->bufferOffset, r->bufferRowLength, r->imageOffset.x,
++                           r->imageOffset.y, r->imageExtent.width, r->imageExtent.height);
++   }
+    VKR_CMD_CALL(CmdCopyImageToBuffer2, args, args->pCopyImageToBufferInfo);
+ }
+ 
+diff --git a/src/venus/vkr_command_buffer.h b/src/venus/vkr_command_buffer.h
+index 90b6d384..04605965 100644
+--- a/src/venus/vkr_command_buffer.h
++++ b/src/venus/vkr_command_buffer.h
+@@ -17,10 +17,15 @@ struct vkr_command_pool {
+ };
+ VKR_DEFINE_OBJECT_CAST(command_pool, VK_OBJECT_TYPE_COMMAND_POOL, VkCommandPool)
+ 
++#include "vkr_direct.h"
++
+ struct vkr_command_buffer {
+    struct vkr_object base;
+ 
+    struct vkr_device *device;
++
++   /* A prime blit it records (vkr_direct). */
++   struct vkr_direct_copy direct;
+ };
+ VKR_DEFINE_OBJECT_CAST(command_buffer, VK_OBJECT_TYPE_COMMAND_BUFFER, VkCommandBuffer)
+ 
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 929254b8..1a473a1f 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -135,7 +135,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+    ext_count += physical_dev->KHR_external_fence_fd;
+-   if (ext_count > args->pCreateInfo->enabledExtensionCount) {
++   /* (With host memory import, the guest's external memory extensions are
++    * ours, emulated: they're taken out, so the list is always rebuilt.) */
++   if (ext_count > args->pCreateInfo->enabledExtensionCount ||
++       physical_dev->use_host_memory_import) {
+       exts = malloc(sizeof(*exts) * ext_count);
+       if (!exts) {
+          args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -148,6 +151,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
+          const char *name = args->pCreateInfo->ppEnabledExtensionNames[i];
+          if (!strcmp(name, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+             has_external_memory_host = true;
++         if (physical_dev->use_host_memory_import &&
++             (!strcmp(name, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) ||
++              !strcmp(name, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)))
++            continue;
+          exts[ext_count++] = name;
+       }
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index fd393c16..8268d82f 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -376,7 +376,12 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    VkExportMemoryAllocateInfo local_export_info;
+    VkImportMemoryHostPointerInfoEXT local_host_import;
+ 
+-   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
++   /* With host memory import, memory the guest may export (a dma-buf: WSI's
++    * prime buffers, its sync-file probe) is host shm too, whatever its type:
++    * shm is what an export hands out. */
++   const bool export_as_shm = might_export && physical_dev->use_host_memory_import;
++   if (((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || export_as_shm) &&
++       !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+        * If the client driver is using external memory and requesting dma_buf, without
+        * dma_buf fd export support, we must use gbm bo import path instead of forcing
+@@ -425,7 +430,15 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+             }
+          }
+       } else if (physical_dev->use_host_memory_import) {
+-         /* Allocate shm and import it as host memory. */
++         /* Allocate shm and import it as host memory. An export request
++          * goes: import and export together are invalid, and the export is
++          * the shm (valid_fd_types). */
++         if (export_info) {
++            void *prev_of_export_info = vkr_find_prev_struct(
++               alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++            vkr_pnext_set_next(prev_of_export_info, export_info->pNext);
++            export_info = NULL;
++         }
+          shm = vkr_shm_alloc(alloc_info->allocationSize,
+                              physical_dev->min_imported_host_pointer_alignment);
+          if (!shm) {
+diff --git a/src/venus/vkr_direct.c b/src/venus/vkr_direct.c
+new file mode 100644
+index 00000000..01ee0353
+--- /dev/null
++++ b/src/venus/vkr_direct.c
+@@ -0,0 +1,813 @@
++/*
++ * Copyright 2026 macwayland contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* See vkr_direct.h. macOS only. */
++
++/* The system's first: <sys/queue.h> (through Mach's) has list macros of
++ * its own, which Mesa's util/list.h then defines its way. */
++#include <IOSurface/IOSurfaceRef.h>
++#include <fcntl.h>
++#include <libproc.h>
++#include <mach/mach.h>
++#include <objc/message.h>
++#include <objc/runtime.h>
++#include <pthread.h>
++#include <servers/bootstrap.h>
++#include <sys/proc_info.h>
++#include <unistd.h>
++#undef LIST_ENTRY
++#undef LIST_HEAD
++#undef LIST_INIT
++#undef LIST_FIRST
++#undef LIST_NEXT
++#undef LIST_EMPTY
++#undef LIST_FOREACH
++#undef LIST_INSERT_HEAD
++#undef LIST_REMOVE
++
++#include "vkr_direct.h"
++
++#include "vkr_buffer.h"
++#include "vkr_command_buffer.h"
++#include "vkr_device.h"
++#include "vkr_device_memory.h"
++#include "vkr_image.h"
++#include "vkr_queue.h"
++
++/* Messages with macwl-shell (crates/shell, `direct`): fixed layouts, packed
++ * to 4 bytes as Mach messages are. */
++enum {
++   MSG_HELLO = 1,   /* worker → shell; reply port: the worker's */
++   MSG_OFFER = 2,   /* shell → worker */
++   MSG_REVOKE = 3,  /* shell → worker */
++   MSG_CLAIM = 4,   /* worker → shell */
++   MSG_DONE = 5,    /* worker → shell */
++   MSG_REVOKED = 6, /* worker → shell */
++   MSG_REKEY = 7,   /* shell → worker: an offer's keys, as an OFFER without its port */
++};
++
++#define MAX_KEYS 8
++#define MAX_OFFERS 4
++#define MAX_TARGETS 6
++
++#pragma pack(push, 4)
++struct msg_offer {
++   mach_msg_header_t header;
++   mach_msg_body_t body;
++   mach_msg_port_descriptor_t surface;
++   uint64_t id;
++   uint32_t width, height, key_count;
++   char keys[MAX_KEYS][VKR_DIRECT_KEY_SIZE];
++};
++
++struct msg_id {
++   mach_msg_header_t header;
++   uint64_t id;
++   char key[VKR_DIRECT_KEY_SIZE];
++};
++#pragma pack(pop)
++
++struct offer {
++   bool used;
++   bool claimed;
++   uint64_t id;
++   IOSurfaceRef surface;
++   uint32_t width, height, key_count;
++   char keys[MAX_KEYS][VKR_DIRECT_KEY_SIZE];
++};
++
++/* A VkImage over a texture over a drawable's IOSurface (drawables recycle a
++ * few IOSurfaces, so these are kept). */
++struct target {
++   bool used;
++   VkDevice device;
++   struct vn_device_proc_table *vk;
++   IOSurfaceID surface_id;
++   VkFormat format;
++   uint32_t width, height;
++   void *texture; /* id<MTLTexture> */
++   VkImage image;
++   VkDeviceMemory memory;
++   uint64_t last_use;
++   uint32_t in_flight;
++};
++
++/* A copy in flight, waited for by the waiter thread. */
++struct pending {
++   struct list_head head;
++   VkDevice device;
++   struct vn_device_proc_table *vk;
++   VkFence fence;
++   VkCommandPool pool;
++   VkCommandBuffer cmd;
++   uint64_t offer_id;
++   struct target *target;
++};
++
++/* What a queue keeps for its copies. */
++struct queue_state {
++   bool used;
++   VkQueue queue;
++   VkCommandPool pool;
++   VkSemaphore semaphore;
++};
++
++static struct {
++   pthread_mutex_t mutex;
++   pthread_cond_t cond;
++   bool started;
++   /* The channel: the shell's port, ours. */
++   mach_port_t shell;
++   mach_port_t port;
++   time_t tried;
++   struct offer offers[MAX_OFFERS];
++   struct target targets[MAX_TARGETS];
++   struct queue_state queues[4];
++   uint64_t uses;
++   struct list_head pending;
++   /* Command pools are used by the submitter and the waiter: this guards
++    * them. */
++   pthread_mutex_t pool_mutex;
++} direct = {
++   .mutex = PTHREAD_MUTEX_INITIALIZER,
++   .cond = PTHREAD_COND_INITIALIZER,
++   .pool_mutex = PTHREAD_MUTEX_INITIALIZER,
++};
++
++static bool
++trace(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = getenv("MACWL_DIRECT_TRACE") != NULL;
++   return on;
++}
++
++/* The key of shared memory `fd`: its POSIX shm object's name, which macOS
++ * keeps after unlinking ('s' then the name; as macwl's runtime and
++ * compositor make it). */
++static bool
++shm_key(int fd, char key[VKR_DIRECT_KEY_SIZE])
++{
++   struct pshm_fdinfo info;
++   int n = proc_pidfdinfo(getpid(), fd, PROC_PIDFDPSHMINFO, &info, sizeof(info));
++   if (n != (int)sizeof(info))
++      return false;
++   size_t len = strnlen(info.pshminfo.pshm_name, sizeof(info.pshminfo.pshm_name));
++   if (len == 0 || len >= VKR_DIRECT_KEY_SIZE - 1)
++      return false;
++   memset(key, 0, VKR_DIRECT_KEY_SIZE);
++   key[0] = 's';
++   memcpy(key + 1, info.pshminfo.pshm_name, len);
++   return true;
++}
++
++static void
++send_id(uint32_t msg, uint64_t id, const char *key)
++{
++   if (direct.shell == MACH_PORT_NULL)
++      return;
++   struct msg_id m;
++   memset(&m, 0, sizeof(m));
++   m.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
++   m.header.msgh_size = sizeof(m);
++   m.header.msgh_remote_port = direct.shell;
++   m.header.msgh_id = msg;
++   m.id = id;
++   if (key)
++      memcpy(m.key, key, VKR_DIRECT_KEY_SIZE);
++   kern_return_t kr = mach_msg(&m.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(m), 0,
++                               MACH_PORT_NULL, 100, MACH_PORT_NULL);
++   if (kr != KERN_SUCCESS) {
++      if (trace())
++         vkr_log("direct: send %u failed: %d", msg, kr);
++      if (kr == MACH_SEND_INVALID_DEST) {
++         mach_port_deallocate(mach_task_self(), direct.shell);
++         direct.shell = MACH_PORT_NULL;
++      }
++   }
++}
++
++static void
++drop_offer(struct offer *o)
++{
++   if (o->surface)
++      CFRelease(o->surface);
++   memset(o, 0, sizeof(*o));
++}
++
++/* Messages from the shell. */
++static void *
++receiver(UNUSED void *arg)
++{
++   union {
++      struct msg_offer offer;
++      struct msg_id id;
++      uint8_t bytes[sizeof(struct msg_offer) + 128];
++   } buf;
++   for (;;) {
++      memset(&buf, 0, sizeof(buf));
++      kern_return_t kr = mach_msg(&buf.offer.header, MACH_RCV_MSG, 0, sizeof(buf), direct.port,
++                                  MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
++      if (kr != KERN_SUCCESS) {
++         if (trace())
++            vkr_log("direct: receive failed: %d", kr);
++         if (kr == MACH_RCV_TOO_LARGE)
++            continue;
++         return NULL;
++      }
++      pthread_mutex_lock(&direct.mutex);
++      switch (buf.offer.header.msgh_id) {
++      case MSG_OFFER: {
++         struct msg_offer *m = &buf.offer;
++         IOSurfaceRef surface = IOSurfaceLookupFromMachPort(m->surface.name);
++         mach_port_deallocate(mach_task_self(), m->surface.name);
++         struct offer *slot = NULL;
++         for (int i = 0; i < MAX_OFFERS && !slot; i++) {
++            if (!direct.offers[i].used)
++               slot = &direct.offers[i];
++         }
++         if (!surface || !slot) {
++            if (surface)
++               CFRelease(surface);
++            /* (Not taken: as good as revoked.) */
++            send_id(MSG_REVOKED, m->id, NULL);
++            break;
++         }
++         slot->used = true;
++         slot->claimed = false;
++         slot->id = m->id;
++         slot->surface = surface;
++         slot->width = m->width;
++         slot->height = m->height;
++         slot->key_count = MIN2(m->key_count, MAX_KEYS);
++         memcpy(slot->keys, m->keys, sizeof(slot->keys));
++         if (trace())
++            vkr_log("direct: offer %" PRIu64 " %ux%u, %u keys", m->id, m->width, m->height,
++                    slot->key_count);
++         break;
++      }
++      case MSG_REKEY: {
++         /* (Laid out as an offer, its descriptor empty.) */
++         struct msg_offer *m = &buf.offer;
++         for (int i = 0; i < MAX_OFFERS; i++) {
++            struct offer *o = &direct.offers[i];
++            if (o->used && o->id == m->id) {
++               o->key_count = MIN2(m->key_count, MAX_KEYS);
++               memcpy(o->keys, m->keys, sizeof(o->keys));
++               if (trace())
++                  vkr_log("direct: offer %" PRIu64 " now %u keys", m->id, o->key_count);
++            }
++         }
++         break;
++      }
++      case MSG_REVOKE: {
++         for (int i = 0; i < MAX_OFFERS; i++) {
++            struct offer *o = &direct.offers[i];
++            if (o->used && o->id == buf.id.id && !o->claimed) {
++               drop_offer(o);
++               send_id(MSG_REVOKED, buf.id.id, NULL);
++            }
++         }
++         break;
++      }
++      default:
++         break;
++      }
++      pthread_mutex_unlock(&direct.mutex);
++   }
++}
++
++/* Waits for copies, tells the shell each is done, frees what it used. */
++static void *
++waiter(UNUSED void *arg)
++{
++   pthread_mutex_lock(&direct.mutex);
++   for (;;) {
++      while (list_is_empty(&direct.pending))
++         pthread_cond_wait(&direct.cond, &direct.mutex);
++      struct pending *p = list_first_entry(&direct.pending, struct pending, head);
++      pthread_mutex_unlock(&direct.mutex);
++
++      VkResult r = p->vk->WaitForFences(p->device, 1, &p->fence, VK_TRUE, UINT64_MAX);
++
++      pthread_mutex_lock(&direct.mutex);
++      list_del(&p->head);
++      if (r == VK_SUCCESS)
++         send_id(MSG_DONE, p->offer_id, NULL);
++      else
++         send_id(MSG_REVOKED, p->offer_id, NULL);
++      p->target->in_flight--;
++      pthread_mutex_unlock(&direct.mutex);
++
++      pthread_mutex_lock(&direct.pool_mutex);
++      p->vk->FreeCommandBuffers(p->device, p->pool, 1, &p->cmd);
++      pthread_mutex_unlock(&direct.pool_mutex);
++      p->vk->DestroyFence(p->device, p->fence, NULL);
++      free(p);
++
++      pthread_mutex_lock(&direct.mutex);
++   }
++   return NULL;
++}
++
++/* Connect to the shell, if one listens: its bootstrap name is in
++ * $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY.direct. Called with the mutex held. */
++static void
++ensure_channel(void)
++{
++   if (!direct.started) {
++      list_inithead(&direct.pending);
++      direct.started = true;
++   }
++   if (direct.shell != MACH_PORT_NULL)
++      return;
++   time_t now = time(NULL);
++   if (direct.tried && now - direct.tried < 1)
++      return;
++   direct.tried = now;
++
++   const char *dir = getenv("XDG_RUNTIME_DIR");
++   const char *display = getenv("WAYLAND_DISPLAY");
++   if (!display)
++      return;
++   char path[1024];
++   if (display[0] == '/')
++      snprintf(path, sizeof(path), "%s.direct", display);
++   else if (dir)
++      snprintf(path, sizeof(path), "%s/%s.direct", dir, display);
++   else
++      return;
++   int fd = open(path, O_RDONLY | O_CLOEXEC);
++   if (fd < 0)
++      return;
++   char name[128] = { 0 };
++   ssize_t n = read(fd, name, sizeof(name) - 1);
++   close(fd);
++   while (n > 0 && (name[n - 1] == '\n' || name[n - 1] == 0))
++      name[--n] = 0;
++   if (n <= 0)
++      return;
++
++   mach_port_t shell;
++   if (bootstrap_look_up(bootstrap_port, name, &shell) != KERN_SUCCESS)
++      return;
++   if (direct.port == MACH_PORT_NULL) {
++      if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &direct.port) !=
++          KERN_SUCCESS) {
++         mach_port_deallocate(mach_task_self(), shell);
++         return;
++      }
++      pthread_t t;
++      pthread_create(&t, NULL, receiver, NULL);
++      pthread_detach(t);
++      pthread_create(&t, NULL, waiter, NULL);
++      pthread_detach(t);
++   }
++   mach_msg_header_t hello;
++   memset(&hello, 0, sizeof(hello));
++   hello.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND);
++   hello.msgh_size = sizeof(hello);
++   hello.msgh_remote_port = shell;
++   hello.msgh_local_port = direct.port;
++   hello.msgh_id = MSG_HELLO;
++   if (mach_msg(&hello, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(hello), 0, MACH_PORT_NULL, 100,
++                MACH_PORT_NULL) != KERN_SUCCESS) {
++      mach_port_deallocate(mach_task_self(), shell);
++      return;
++   }
++   direct.shell = shell;
++   if (trace())
++      vkr_log("direct: connected to %s", name);
++}
++
++void
++vkr_direct_buffer_bound(struct vkr_buffer *buf, struct vkr_device_memory *mem)
++{
++   buf->direct_key_valid = false;
++   if (!mem || !mem->shm)
++      return;
++   buf->direct_key_valid = shm_key(mem->shm->fd, buf->direct_key);
++   if (buf->direct_key_valid) {
++      pthread_mutex_lock(&direct.mutex);
++      ensure_channel();
++      pthread_mutex_unlock(&direct.mutex);
++   }
++}
++
++void
++vkr_direct_note_copy(struct vkr_command_buffer *cmd,
++                     struct vkr_image *src,
++                     struct vkr_buffer *dst,
++                     uint32_t region_count,
++                     uint64_t buffer_offset,
++                     uint32_t buffer_row_length,
++                     int32_t image_x,
++                     int32_t image_y,
++                     uint32_t width,
++                     uint32_t height)
++{
++   if (!dst || !dst->direct_key_valid || !src)
++      return;
++   /* The whole image, in one region: the prime blit. (The buffer's layout,
++    * its rows aligned, doesn't matter: the drawable gets an image copy.) */
++   (void)buffer_offset;
++   (void)buffer_row_length;
++   if (region_count != 1 || image_x != 0 || image_y != 0 || width != src->width ||
++       height != src->height)
++      return;
++   if (src->format != VK_FORMAT_B8G8R8A8_UNORM && src->format != VK_FORMAT_B8G8R8A8_SRGB)
++      return;
++   cmd->direct.valid = true;
++   cmd->direct.src = src->base.handle.image;
++   cmd->direct.format = src->format;
++   cmd->direct.width = width;
++   cmd->direct.height = height;
++   memcpy(cmd->direct.key, dst->direct_key, VKR_DIRECT_KEY_SIZE);
++}
++
++/* The offer for a copy, if there is one. Mutex held. */
++static struct offer *
++offer_for(const struct vkr_direct_copy *c)
++{
++   for (int i = 0; i < MAX_OFFERS; i++) {
++      struct offer *o = &direct.offers[i];
++      if (!o->used || o->claimed || o->width != c->width || o->height != c->height)
++         continue;
++      for (uint32_t k = 0; k < o->key_count; k++) {
++         if (!memcmp(o->keys[k], c->key, VKR_DIRECT_KEY_SIZE))
++            return o;
++      }
++   }
++   return NULL;
++}
++
++bool
++vkr_direct_find(uint32_t submit_count,
++                const VkCommandBuffer *const *cmd_buffers,
++                const uint32_t *cmd_buffer_counts,
++                struct vkr_direct_copy *copies)
++{
++   bool any = false;
++   pthread_mutex_lock(&direct.mutex);
++   /* (A shell may come after this worker's buffers did: look again, at most
++    * once a second, once there are buffers to offer for.) */
++   if (direct.started && direct.shell == MACH_PORT_NULL)
++      ensure_channel();
++   bool offered = false;
++   for (int i = 0; i < MAX_OFFERS; i++)
++      offered |= direct.offers[i].used && !direct.offers[i].claimed;
++   for (uint32_t i = 0; i < submit_count; i++) {
++      copies[i].valid = false;
++      if (!offered || any)
++         continue;
++      for (uint32_t j = 0; j < cmd_buffer_counts[i]; j++) {
++         struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(cmd_buffers[i][j]);
++         if (cmd && cmd->direct.valid && offer_for(&cmd->direct)) {
++            copies[i] = cmd->direct;
++            any = true;
++            break;
++         }
++      }
++   }
++   pthread_mutex_unlock(&direct.mutex);
++   return any;
++}
++
++static void *
++new_texture(IOSurfaceRef surface, VkFormat format, uint32_t width, uint32_t height)
++{
++   /* id<MTLDevice>: KosmicKrisp's, found as it finds it (mtl_device.m: the
++    * first supporting MTLGPUFamilyMetal4), since a texture is a device's. */
++   extern void *MTLCopyAllDevices(void);
++   static void *device;
++   if (!device) {
++      void *all = MTLCopyAllDevices();
++      unsigned long n = ((unsigned long (*)(void *, SEL))objc_msgSend)(all, sel_registerName("count"));
++      for (unsigned long i = 0; i < n && !device; i++) {
++         void *d = ((void *(*)(void *, SEL, unsigned long))objc_msgSend)(
++            all, sel_registerName("objectAtIndex:"), i);
++         if (((BOOL (*)(void *, SEL, long))objc_msgSend)(d, sel_registerName("supportsFamily:"),
++                                                         5002 /* MTLGPUFamilyMetal4 */))
++            device = ((void *(*)(void *, SEL))objc_msgSend)(d, sel_registerName("retain"));
++      }
++      ((void (*)(void *, SEL))objc_msgSend)(all, sel_registerName("release"));
++   }
++   if (!device)
++      return NULL;
++   /* MTLPixelFormatBGRA8Unorm, or its sRGB view: the same bytes. */
++   unsigned long pixel_format = format == VK_FORMAT_B8G8R8A8_SRGB ? 81 : 80;
++   void *desc = ((void *(*)(Class, SEL, unsigned long, unsigned long, unsigned long, BOOL))
++                    objc_msgSend)(objc_getClass("MTLTextureDescriptor"),
++                                  sel_registerName(
++                                     "texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
++                                  pixel_format, width, height, NO);
++   if (!desc)
++      return NULL;
++   /* ShaderRead | ShaderWrite | RenderTarget */
++   ((void (*)(void *, SEL, unsigned long))objc_msgSend)(desc, sel_registerName("setUsage:"),
++                                                        1 | 2 | 4);
++   return ((void *(*)(void *, SEL, void *, IOSurfaceRef, unsigned long))objc_msgSend)(
++      device, sel_registerName("newTextureWithDescriptor:iosurface:plane:"), desc, surface, 0);
++}
++
++static void
++release_target(struct target *t)
++{
++   if (t->image)
++      t->vk->DestroyImage(t->device, t->image, NULL);
++   if (t->memory)
++      t->vk->FreeMemory(t->device, t->memory, NULL);
++   if (t->texture)
++      ((void (*)(void *, SEL))objc_msgSend)(t->texture, sel_registerName("release"));
++   memset(t, 0, sizeof(*t));
++}
++
++/* The VkImage over `surface`'s texture. Mutex held. */
++static struct target *
++target_for(struct vkr_device *dev, IOSurfaceRef surface, VkFormat format, uint32_t width,
++           uint32_t height)
++{
++   VkDevice device = dev->base.handle.device;
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   IOSurfaceID id = IOSurfaceGetID(surface);
++   struct target *free_slot = NULL, *oldest = NULL;
++   for (int i = 0; i < MAX_TARGETS; i++) {
++      struct target *t = &direct.targets[i];
++      if (t->used && t->device == device && t->surface_id == id && t->format == format &&
++          t->width == width && t->height == height) {
++         t->last_use = ++direct.uses;
++         return t;
++      }
++      if (!t->used && !free_slot)
++         free_slot = t;
++      if (t->used && !t->in_flight && (!oldest || t->last_use < oldest->last_use))
++         oldest = t;
++   }
++   if (!free_slot) {
++      if (!oldest)
++         return NULL;
++      release_target(oldest);
++      free_slot = oldest;
++   }
++   struct target *t = free_slot;
++   t->device = device;
++   t->vk = vk;
++   t->surface_id = id;
++   t->format = format;
++   t->width = width;
++   t->height = height;
++   t->texture = new_texture(surface, format, width, height);
++   if (!t->texture)
++      goto fail;
++
++   const VkExternalMemoryImageCreateInfo external = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
++   };
++   const VkImageCreateInfo image_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &external,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = { width, height, 1 },
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   if (vk->CreateImage(device, &image_info, NULL, &t->image) != VK_SUCCESS)
++      goto fail;
++   VkMemoryRequirements req;
++   vk->GetImageMemoryRequirements(device, t->image, &req);
++   const VkMemoryDedicatedAllocateInfo dedicated = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .image = t->image,
++   };
++   const VkImportMemoryMetalHandleInfoEXT import = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
++      .pNext = &dedicated,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
++      .handle = t->texture,
++   };
++   const VkMemoryAllocateInfo alloc = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &import,
++      .allocationSize = req.size,
++      .memoryTypeIndex = req.memoryTypeBits ? (uint32_t)__builtin_ctz(req.memoryTypeBits) : 0,
++   };
++   if (vk->AllocateMemory(device, &alloc, NULL, &t->memory) != VK_SUCCESS)
++      goto fail;
++   if (vk->BindImageMemory(device, t->image, t->memory, 0) != VK_SUCCESS)
++      goto fail;
++   t->used = true;
++   t->last_use = ++direct.uses;
++   return t;
++
++fail:
++   if (trace())
++      vkr_log("direct: no image over surface %u", id);
++   release_target(t);
++   return NULL;
++}
++
++static struct queue_state *
++queue_state_for(struct vkr_queue *queue)
++{
++   VkQueue q = queue->base.handle.queue;
++   struct queue_state *free_slot = NULL;
++   for (unsigned i = 0; i < ARRAY_SIZE(direct.queues); i++) {
++      if (direct.queues[i].used && direct.queues[i].queue == q)
++         return &direct.queues[i];
++      if (!direct.queues[i].used && !free_slot)
++         free_slot = &direct.queues[i];
++   }
++   if (!free_slot)
++      return NULL;
++   VkDevice device = queue->device->base.handle.device;
++   struct vn_device_proc_table *vk = &queue->device->proc_table;
++   const VkCommandPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
++      .queueFamilyIndex = queue->family,
++   };
++   const VkSemaphoreCreateInfo sem_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++   if (vk->CreateCommandPool(device, &pool_info, NULL, &free_slot->pool) != VK_SUCCESS)
++      return NULL;
++   if (vk->CreateSemaphore(device, &sem_info, NULL, &free_slot->semaphore) != VK_SUCCESS) {
++      vk->DestroyCommandPool(device, free_slot->pool, NULL);
++      return NULL;
++   }
++   free_slot->queue = q;
++   free_slot->used = true;
++   return free_slot;
++}
++
++static void
++barrier(struct vn_device_proc_table *vk,
++        VkCommandBuffer cmd,
++        VkImage image,
++        VkImageLayout from,
++        VkImageLayout to,
++        VkAccessFlags src_access,
++        VkAccessFlags dst_access)
++{
++   const VkImageMemoryBarrier b = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = src_access,
++      .dstAccessMask = dst_access,
++      .oldLayout = from,
++      .newLayout = to,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
++   };
++   vk->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++bool
++vkr_direct_submit(struct vkr_queue *queue,
++                  uint32_t submit_count,
++                  const struct vkr_direct_copy *copies,
++                  const VkSubmitInfo2 *waits,
++                  VkSemaphore *signal_out)
++{
++   VkDevice device = queue->device->base.handle.device;
++   struct vn_device_proc_table *vk = &queue->device->proc_table;
++   bool submitted = false;
++
++   pthread_mutex_lock(&direct.mutex);
++   for (uint32_t i = 0; i < submit_count && !submitted; i++) {
++      const struct vkr_direct_copy *c = &copies[i];
++      if (!c->valid)
++         continue;
++      struct offer *o = offer_for(c);
++      struct queue_state *qs = queue_state_for(queue);
++      if (!o || !qs)
++         continue;
++      struct target *t = target_for(queue->device, o->surface, c->format, c->width, c->height);
++      if (!t)
++         continue;
++
++      struct pending *p = calloc(1, sizeof(*p));
++      if (!p)
++         continue;
++      p->device = device;
++      p->vk = vk;
++      p->pool = qs->pool;
++      p->offer_id = o->id;
++      p->target = t;
++      const VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++      if (vk->CreateFence(device, &fence_info, NULL, &p->fence) != VK_SUCCESS) {
++         free(p);
++         continue;
++      }
++      const VkCommandBufferAllocateInfo cmd_info = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++         .commandPool = qs->pool,
++         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++         .commandBufferCount = 1,
++      };
++      pthread_mutex_lock(&direct.pool_mutex);
++      VkResult r = vk->AllocateCommandBuffers(device, &cmd_info, &p->cmd);
++      if (r == VK_SUCCESS) {
++         const VkCommandBufferBeginInfo begin = {
++            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++         };
++         vk->BeginCommandBuffer(p->cmd, &begin);
++         /* As WSI's blit: the source from PRESENT_SRC and back. */
++         barrier(vk, p->cmd, c->src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
++                 VK_ACCESS_TRANSFER_READ_BIT);
++         barrier(vk, p->cmd, t->image, VK_IMAGE_LAYOUT_UNDEFINED,
++                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
++         const VkImageCopy region = {
++            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++            .extent = { c->width, c->height, 1 },
++         };
++         vk->CmdCopyImage(p->cmd, c->src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->image,
++                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++         barrier(vk, p->cmd, c->src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT,
++                 VK_ACCESS_MEMORY_READ_BIT);
++         r = vk->EndCommandBuffer(p->cmd);
++      }
++      pthread_mutex_unlock(&direct.pool_mutex);
++      if (r != VK_SUCCESS) {
++         vk->DestroyFence(device, p->fence, NULL);
++         free(p);
++         continue;
++      }
++
++      /* Its waits (the submit's), then the blit's submit waits for it. */
++      const VkSemaphoreSubmitInfo *w = waits[i].pWaitSemaphoreInfos;
++      uint32_t wait_count = waits[i].waitSemaphoreInfoCount;
++      VkSemaphore *sems = calloc(wait_count + 1, sizeof(*sems));
++      VkPipelineStageFlags *stages = calloc(wait_count + 1, sizeof(*stages));
++      uint64_t *values = calloc(wait_count + 1, sizeof(*values));
++      bool timeline = false;
++      for (uint32_t k = 0; k < wait_count; k++) {
++         sems[k] = w[k].semaphore;
++         stages[k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++         values[k] = w[k].value;
++         timeline |= w[k].value != 0;
++      }
++      uint64_t signal_value = 0;
++      const VkTimelineSemaphoreSubmitInfo timeline_info = {
++         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++         .waitSemaphoreValueCount = wait_count,
++         .pWaitSemaphoreValues = values,
++         .signalSemaphoreValueCount = 1,
++         .pSignalSemaphoreValues = &signal_value,
++      };
++      const VkSubmitInfo submit = {
++         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .pNext = timeline ? &timeline_info : NULL,
++         .waitSemaphoreCount = wait_count,
++         .pWaitSemaphores = sems,
++         .pWaitDstStageMask = stages,
++         .commandBufferCount = 1,
++         .pCommandBuffers = &p->cmd,
++         .signalSemaphoreCount = 1,
++         .pSignalSemaphores = &qs->semaphore,
++      };
++
++      o->claimed = true;
++      send_id(MSG_CLAIM, o->id, c->key);
++      r = vk->QueueSubmit(queue->base.handle.queue, 1, &submit, p->fence);
++      free(sems);
++      free(stages);
++      free(values);
++      if (r != VK_SUCCESS) {
++         /* (Claimed, not done: the shell gives the drawable up at the
++          * frame's fence.) */
++         send_id(MSG_REVOKED, o->id, NULL);
++         drop_offer(o);
++         pthread_mutex_lock(&direct.pool_mutex);
++         vk->FreeCommandBuffers(device, qs->pool, 1, &p->cmd);
++         pthread_mutex_unlock(&direct.pool_mutex);
++         vk->DestroyFence(device, p->fence, NULL);
++         free(p);
++         continue;
++      }
++      if (trace())
++         vkr_log("direct: frame of %s into offer %" PRIu64, c->key + 1, o->id);
++      t->in_flight++;
++      drop_offer(o);
++      list_addtail(&p->head, &direct.pending);
++      pthread_cond_signal(&direct.cond);
++      signal_out[i] = qs->semaphore;
++      submitted = true;
++   }
++   pthread_mutex_unlock(&direct.mutex);
++   return submitted;
++}
+diff --git a/src/venus/vkr_direct.h b/src/venus/vkr_direct.h
+new file mode 100644
+index 00000000..daf023cf
+--- /dev/null
++++ b/src/venus/vkr_direct.h
+@@ -0,0 +1,125 @@
++/*
++ * Copyright 2026 macwayland contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Drawing a client's frame into the compositor's drawable (macOS, macwl;
++ * docs/gpu.md in macwayland, "Drawing into the drawable").
++ *
++ * Mesa's WSI on a render node presents through a "prime blit": a command
++ * buffer copying the swapchain image into a linear buffer, whose memory is
++ * the dma-buf the compositor gets (here, shared memory: a vkr_shm). The
++ * compositor (macwl-shell) offers a drawable's IOSurface for the frames of
++ * the buffers it has seen committed, named by their shm objects' names.
++ * When such a blit is submitted, the worker first copies the swapchain
++ * image into the drawable (a texture over its IOSurface, imported as a
++ * VkImage), in a submission of its own that takes the blit's waits; the
++ * blit follows as before. The compositor is told the drawable is claimed
++ * as that's submitted, and when its copy is done, and presents it then:
++ * the frame reaches the display without the blit or the compositor's
++ * composite on the way.
++ */
++
++#ifndef VKR_DIRECT_H
++#define VKR_DIRECT_H
++
++#include "vkr_common.h"
++
++#define VKR_DIRECT_KEY_SIZE 64
++
++struct vkr_buffer;
++struct vkr_command_buffer;
++struct vkr_device_memory;
++struct vkr_image;
++struct vkr_queue;
++
++/* What a command buffer copies into an offered buffer: the prime blit. */
++struct vkr_direct_copy {
++   bool valid;
++   VkImage src;
++   VkFormat format;
++   uint32_t width, height;
++   char key[VKR_DIRECT_KEY_SIZE];
++};
++
++#ifdef __APPLE__
++
++/* The key of a buffer bound to `mem` (its shm object's name), if any. */
++void
++vkr_direct_buffer_bound(struct vkr_buffer *buf, struct vkr_device_memory *mem);
++
++/* Note a copy recorded into `cmd`; called before handle replacement. */
++void
++vkr_direct_note_copy(struct vkr_command_buffer *cmd,
++                     struct vkr_image *src,
++                     struct vkr_buffer *dst,
++                     uint32_t region_count,
++                     uint64_t buffer_offset,
++                     uint32_t buffer_row_length,
++                     int32_t image_x,
++                     int32_t image_y,
++                     uint32_t width,
++                     uint32_t height);
++
++/* Before handle replacement: whether submit `i` of these carries a blit for
++ * an offered drawable. Fills `copies` (one per submit; invalid if not). */
++bool
++vkr_direct_find(uint32_t submit_count,
++                const VkCommandBuffer *const *cmd_buffers,
++                const uint32_t *cmd_buffer_counts,
++                struct vkr_direct_copy *copies);
++
++/* Submit (after handle replacement) the drawable copies for `copies`, each
++ * taking its submit's waits and signalling `*signal_out[i]` (a semaphore
++ * the submit is then to wait on instead). Returns false if none was
++ * submitted (then nothing changes). The queue's vk_mutex is held. */
++bool
++vkr_direct_submit(struct vkr_queue *queue,
++                  uint32_t submit_count,
++                  const struct vkr_direct_copy *copies,
++                  const VkSubmitInfo2 *waits,
++                  VkSemaphore *signal_out);
++
++#else
++
++static inline void
++vkr_direct_buffer_bound(UNUSED struct vkr_buffer *buf, UNUSED struct vkr_device_memory *mem)
++{
++}
++
++static inline void
++vkr_direct_note_copy(UNUSED struct vkr_command_buffer *cmd,
++                     UNUSED struct vkr_image *src,
++                     UNUSED struct vkr_buffer *dst,
++                     UNUSED uint32_t region_count,
++                     UNUSED uint64_t buffer_offset,
++                     UNUSED uint32_t buffer_row_length,
++                     UNUSED int32_t image_x,
++                     UNUSED int32_t image_y,
++                     UNUSED uint32_t width,
++                     UNUSED uint32_t height)
++{
++}
++
++static inline bool
++vkr_direct_find(UNUSED uint32_t submit_count,
++                UNUSED const VkCommandBuffer *const *cmd_buffers,
++                UNUSED const uint32_t *cmd_buffer_counts,
++                UNUSED struct vkr_direct_copy *copies)
++{
++   return false;
++}
++
++static inline bool
++vkr_direct_submit(UNUSED struct vkr_queue *queue,
++                  UNUSED uint32_t submit_count,
++                  UNUSED const struct vkr_direct_copy *copies,
++                  UNUSED const VkSubmitInfo2 *waits,
++                  UNUSED VkSemaphore *signal_out)
++{
++   return false;
++}
++
++#endif
++
++#endif /* VKR_DIRECT_H */
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index e1dee8e0..721ce3b3 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -31,7 +31,14 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+     * situation because the app does not consider the memory external.
+     */
+ 
+-   vkr_image_create_and_add(dispatch->data, args);
++   VkFormat format = args->pCreateInfo->format;
++   VkExtent3D extent = args->pCreateInfo->extent;
++   struct vkr_image *img = vkr_image_create_and_add(dispatch->data, args);
++   if (img) {
++      img->format = format;
++      img->width = extent.width;
++      img->height = extent.height;
++   }
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
+index 70a98002..ad68b976 100644
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -10,6 +10,10 @@
+ 
+ struct vkr_image {
+    struct vkr_object base;
++
++   /* For vkr_direct: what it is. */
++   VkFormat format;
++   uint32_t width, height;
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
+diff --git a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
+index f6531e1c..c28c8e54 100644
+--- a/src/venus/vkr_physical_device.c
++++ b/src/venus/vkr_physical_device.c
+@@ -372,14 +372,23 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
+                                           !physical_dev->KHR_external_memory_fd &&
+                                           !physical_dev->EXT_external_memory_dma_buf;
+    if (physical_dev->use_host_memory_import) {
++      /* VK_EXT_external_memory_dma_buf too: memory the guest exports as a
++       * dma-buf is host shm as well (vkr_dispatch_vkAllocateMemory), its fd
++       * the blob's. That puts the guest's Wayland WSI on its prime path: a
++       * GPU copy into a linear buffer it presents as a dma-buf, which a
++       * compositor maps, rather than a CPU copy into wl_shm. */
+       VkExtensionProperties *new_exts =
+-         realloc(exts, sizeof(*exts) * (advertised_count + 1));
++         realloc(exts, sizeof(*exts) * (advertised_count + 2));
+       if (new_exts) {
+          exts = new_exts;
+          strcpy(new_exts[advertised_count].extensionName,
+                 VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+          new_exts[advertised_count].specVersion = 0;
+          advertised_count++;
++         strcpy(new_exts[advertised_count].extensionName,
++                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
++         new_exts[advertised_count].specVersion = 1;
++         advertised_count++;
+       } else {
+          vkr_log("failed to inject VK_KHR_external_memory_fd");
+       }
+diff --git a/src/venus/vkr_queue.c b/src/venus/vkr_queue.c
+index d75a2294..b25624e3 100644
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "vkr_queue.h"
++#include "vkr_direct.h"
+ 
+ #include "vn_protocol_renderer_queue.h"
+ 
+@@ -364,6 +365,21 @@ vkr_dispatch_vkGetDeviceQueue(struct vn_dispatch_context *dispatch,
+    return;
+ }
+ 
++#define VKR_DIRECT_MAX_SUBMITS 8
++
++/* vkr_direct: whether these submits carry a prime blit for an offered
++ * drawable (before handle replacement). */
++static bool
++vkr_queue_direct_find(uint32_t count,
++                      const VkCommandBuffer *const *cmds,
++                      const uint32_t *cmd_counts,
++                      struct vkr_direct_copy *copies)
++{
++   if (!count || count > VKR_DIRECT_MAX_SUBMITS)
++      return false;
++   return vkr_direct_find(count, cmds, cmd_counts, copies);
++}
++
+ static void
+ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkQueueSubmit *args)
+@@ -372,11 +388,81 @@ vkr_dispatch_vkQueueSubmit(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   struct vkr_direct_copy copies[VKR_DIRECT_MAX_SUBMITS];
++   bool direct = false;
++   if (args->pSubmits && args->submitCount <= VKR_DIRECT_MAX_SUBMITS) {
++      const VkCommandBuffer *cmds[VKR_DIRECT_MAX_SUBMITS];
++      uint32_t cmd_counts[VKR_DIRECT_MAX_SUBMITS];
++      for (uint32_t i = 0; i < args->submitCount; i++) {
++         cmds[i] = args->pSubmits[i].pCommandBuffers;
++         cmd_counts[i] = cmds[i] ? args->pSubmits[i].commandBufferCount : 0;
++      }
++      direct = vkr_queue_direct_find(args->submitCount, cmds, cmd_counts, copies);
++   }
++
+    vn_replace_vkQueueSubmit_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
+-   args->ret =
+-      vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
++   if (direct) {
++      /* The drawable copy takes a blit submit's waits; the submit then waits
++       * for the copy. Submits with more than a timeline in pNext are left. */
++      const uint32_t n = args->submitCount;
++      VkSubmitInfo submits[VKR_DIRECT_MAX_SUBMITS];
++      VkTimelineSemaphoreSubmitInfo timelines[VKR_DIRECT_MAX_SUBMITS];
++      VkSubmitInfo2 waits[VKR_DIRECT_MAX_SUBMITS];
++      VkSemaphoreSubmitInfo *wait_infos[VKR_DIRECT_MAX_SUBMITS] = { 0 };
++      VkSemaphore signals[VKR_DIRECT_MAX_SUBMITS] = { 0 };
++      static const VkPipelineStageFlags all = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++      static const uint64_t zero = 0;
++      memcpy(submits, args->pSubmits, n * sizeof(*submits));
++      memset(waits, 0, sizeof(waits));
++      for (uint32_t i = 0; i < n; i++) {
++         if (!copies[i].valid)
++            continue;
++         const VkSubmitInfo *s = &args->pSubmits[i];
++         const VkBaseInStructure *next = s->pNext;
++         if (next && (next->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO ||
++                      next->pNext)) {
++            copies[i].valid = false;
++            continue;
++         }
++         const VkTimelineSemaphoreSubmitInfo *t = (const void *)next;
++         wait_infos[i] = calloc(s->waitSemaphoreCount + 1, sizeof(VkSemaphoreSubmitInfo));
++         for (uint32_t k = 0; k < s->waitSemaphoreCount; k++) {
++            wait_infos[i][k] = (VkSemaphoreSubmitInfo){
++               .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++               .semaphore = s->pWaitSemaphores[k],
++               .value = t && k < t->waitSemaphoreValueCount ? t->pWaitSemaphoreValues[k] : 0,
++               .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            };
++         }
++         waits[i].waitSemaphoreInfoCount = s->waitSemaphoreCount;
++         waits[i].pWaitSemaphoreInfos = wait_infos[i];
++      }
++      if (vkr_direct_submit(queue, n, copies, waits, signals)) {
++         for (uint32_t i = 0; i < n; i++) {
++            if (!signals[i])
++               continue;
++            submits[i].waitSemaphoreCount = 1;
++            submits[i].pWaitSemaphores = &signals[i];
++            submits[i].pWaitDstStageMask = &all;
++            if (submits[i].pNext) {
++               timelines[i] = *(const VkTimelineSemaphoreSubmitInfo *)submits[i].pNext;
++               timelines[i].waitSemaphoreValueCount = 1;
++               timelines[i].pWaitSemaphoreValues = &zero;
++               submits[i].pNext = &timelines[i];
++            }
++         }
++         args->ret = vk->QueueSubmit(args->queue, n, submits, args->fence);
++      } else {
++         args->ret = vk->QueueSubmit(args->queue, n, args->pSubmits, args->fence);
++      }
++      for (uint32_t i = 0; i < n; i++)
++         free(wait_infos[i]);
++   } else {
++      args->ret =
++         vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
++   }
+    mtx_unlock(&queue->vk_mutex);
+ }
+ 
+@@ -413,11 +499,55 @@ vkr_dispatch_vkQueueSubmit2(UNUSED struct vn_dispatch_context *dispatch,
+    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
+    struct vn_device_proc_table *vk = &queue->device->proc_table;
+ 
++   struct vkr_direct_copy copies[VKR_DIRECT_MAX_SUBMITS];
++   bool direct = false;
++   if (args->pSubmits && args->submitCount <= VKR_DIRECT_MAX_SUBMITS) {
++      const VkCommandBuffer *cmd_lists[VKR_DIRECT_MAX_SUBMITS];
++      VkCommandBuffer handles[VKR_DIRECT_MAX_SUBMITS][16];
++      uint32_t cmd_counts[VKR_DIRECT_MAX_SUBMITS];
++      for (uint32_t i = 0; i < args->submitCount; i++) {
++         const VkSubmitInfo2 *s = &args->pSubmits[i];
++         cmd_counts[i] = s->pCommandBufferInfos ? MIN2(s->commandBufferInfoCount, 16) : 0;
++         for (uint32_t j = 0; j < cmd_counts[i]; j++)
++            handles[i][j] = s->pCommandBufferInfos[j].commandBuffer;
++         cmd_lists[i] = handles[i];
++      }
++      direct = vkr_queue_direct_find(args->submitCount, cmd_lists, cmd_counts, copies);
++   }
++
+    vn_replace_vkQueueSubmit2_args_handle(args);
+ 
+    mtx_lock(&queue->vk_mutex);
+-   args->ret =
+-      vk->QueueSubmit2(args->queue, args->submitCount, args->pSubmits, args->fence);
++   if (direct) {
++      const uint32_t n = args->submitCount;
++      VkSubmitInfo2 submits[VKR_DIRECT_MAX_SUBMITS];
++      VkSemaphoreSubmitInfo waits_on_copy[VKR_DIRECT_MAX_SUBMITS];
++      VkSemaphore signals[VKR_DIRECT_MAX_SUBMITS] = { 0 };
++      memcpy(submits, args->pSubmits, n * sizeof(*submits));
++      for (uint32_t i = 0; i < n; i++) {
++         if (copies[i].valid && args->pSubmits[i].pNext)
++            copies[i].valid = false;
++      }
++      if (vkr_direct_submit(queue, n, copies, args->pSubmits, signals)) {
++         for (uint32_t i = 0; i < n; i++) {
++            if (!signals[i])
++               continue;
++            waits_on_copy[i] = (VkSemaphoreSubmitInfo){
++               .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
++               .semaphore = signals[i],
++               .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++            };
++            submits[i].waitSemaphoreInfoCount = 1;
++            submits[i].pWaitSemaphoreInfos = &waits_on_copy[i];
++         }
++         args->ret = vk->QueueSubmit2(args->queue, n, submits, args->fence);
++      } else {
++         args->ret = vk->QueueSubmit2(args->queue, n, args->pSubmits, args->fence);
++      }
++   } else {
++      args->ret =
++         vk->QueueSubmit2(args->queue, args->submitCount, args->pSubmits, args->fence);
++   }
+    mtx_unlock(&queue->vk_mutex);
+ }
+ 
+diff --git a/src/virgl_util.c b/src/virgl_util.c
+index b770a0a9..a2242039 100644
+--- a/src/virgl_util.c
++++ b/src/virgl_util.c
+@@ -29,6 +29,11 @@
+ #include "virgl_util.h"
+ 
+ #include <errno.h>
++#ifdef __APPLE__
++#include <fcntl.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#endif
+ #ifdef HAVE_EVENTFD_H
+ #include <sys/eventfd.h>
+ #endif
+@@ -88,7 +93,7 @@ bool equal_func(const void *key1, const void *key2)
+ 
+ bool has_eventfd(void)
+ {
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
+    return true;
+ #else
+    return false;
+@@ -99,6 +104,26 @@ int create_eventfd(unsigned int initval)
+ {
+ #ifdef HAVE_EVENTFD_H
+    return eventfd(initval, EFD_CLOEXEC | EFD_NONBLOCK);
++#elif defined(__APPLE__)
++   /* No eventfds on macOS. A FIFO opened for reading and writing is one fd
++    * that is both written to and polled (and can be passed to another
++    * process, as vtest does), as an eventfd is; it's unlinked at once.
++    * Each write of 8 bytes is one wakeup to read; flush_eventfd drains. */
++   char path[64];
++   static unsigned counter;
++   for (int tries = 0; tries < 16; tries++) {
++      snprintf(path, sizeof(path), "/tmp/virgl-efd-%d-%u", (int)getpid(),
++               __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED));
++      if (mkfifo(path, 0600) == 0)
++         break;
++      if (errno != EEXIST)
++         return -1;
++   }
++   int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++   unlink(path);
++   if (fd >= 0 && initval)
++      write_eventfd(fd, initval);
++   return fd;
+ #else
+    (void)initval;
+    return -1;
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index 39e9ea27..ec3f80a9 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -40,6 +40,7 @@
+ 
+ #include "virgl_context.h"
+ #include "virgl_fence.h"
++#include "virgl_util.h"
+ 
+ #include <sys/uio.h>
+ #include <sys/socket.h>
+@@ -983,7 +984,7 @@ int vtest_get_param(UNUSED uint32_t length_dw)
+    case VCMD_PARAM_MAX_TIMELINE_COUNT:
+       resp[0] = true;
+       /* TODO until we have a timerfd */
+-#ifdef HAVE_EVENTFD_H
++#if defined(HAVE_EVENTFD_H) || defined(__APPLE__)
+       if (!getenv("VIRGL_DISABLE_MT"))
+          resp[1] = VTEST_MAX_TIMELINE_COUNT;
+ #endif
+@@ -2130,12 +2131,7 @@ static int vtest_sync_wait_init(struct vtest_sync_wait *wait,
+ {
+    uint32_t i;
+ 
+-#ifdef HAVE_EVENTFD_H
+-   wait->fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+-#else
+-   /* TODO pipe */
+-   wait->fd = -1;
+-#endif
++   wait->fd = create_eventfd(0);
+    if (wait->fd < 0)
+       return -ENODEV;
+ 
+diff --git a/vtest/vtest_shm.c b/vtest/vtest_shm.c
+index efaad8a0..50ad5819 100644
+--- a/vtest/vtest_shm.c
++++ b/vtest/vtest_shm.c
+@@ -33,6 +33,26 @@
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
++#ifdef __APPLE__
++/* No memfds on macOS: an anonymous (unlinked) POSIX shm object, as Venus
++ * itself uses. macOS sizes one only once, so it's made at its size. */
++#include "util/anon_file.h"
++
++int vtest_new_shm(uint32_t handle, size_t size)
++{
++   (void)handle;
++   int fd = os_create_anonymous_file(size, "vtest-res");
++   if (fd < 0)
++      return report_failed_call("os_create_anonymous_file", -errno);
++   return fd;
++}
++
++int vtest_shm_check(void)
++{
++   return 1;
++}
++#else
++
+ static int memfd_create(const char *name, unsigned int flags)
+ {
+ #ifdef __NR_memfd_create
+@@ -77,4 +97,4 @@ int vtest_shm_check(void)
+ 
+     return 0;
+ }
+-
++#endif

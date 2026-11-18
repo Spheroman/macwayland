@@ -12,7 +12,7 @@ native Mac app, measured.
    │  Linux system calls
    ▼
  Track B runtime: Hypervisor.framework, no guest kernel      ← static apps work
-   │  Wayland over a host unix socket; buffers as IOSurfaces
+   │  Wayland over a host unix socket; buffers in shared memory
    ▼
  macwl-compositor (Smithay, wayland_frontend only)           ← working
    │  committed buffers
@@ -364,9 +364,38 @@ from a static Linux binary.
    `SCM_CREDENTIALS`, `sendmmsg`/`recvmmsg`, autobind, host socket paths over
    103 bytes (Darwin's `sun_path` limit).
 10. **B2 milestone.** Done (see Done).
-11. **GPU.** Split Vulkan driver (state tracking and shader translation in the
-    guest, Metal calls on the host) over a shared-memory command ring, plus
-    IOSurface swapchains.
+11. **GPU.** Design (2026-11-14, `docs/gpu.md`): stock Mesa in the guest
+    (Venus for Vulkan, Zink on it for GL and GLES), the runtime as a
+    virtio-gpu kernel driver (`/dev/dri/renderD128`: blobs as shm objects,
+    timeline syncobjs, sync_files), and virglrenderer's Venus renderer on
+    KosmicKrisp in a helper process. Frames are linear textures over shm,
+    offered as LINEAR linux-dmabuf buffers: the shell's zero-copy `wl_shm`
+    path. A split driver (KosmicKrisp in the guest, its Metal calls
+    remoted) is the fallback if Venus's overhead shows. Step 1 done
+    (2026-11-14, `gpu/vtest.sh`): Venus over vtest on the Mac, Linux
+    `vulkaninfo`, `vkcube` and dEQP-VK (1899 of 1900 that run pass) under
+    macwl-run, and GLES through Zink; Zink says only GL 2.1 and GLES 2.0
+    until KosmicKrisp has transform feedback (4.6 and 3.2 by override).
+    Step 2 done (2026-11-14, `gpu/run.sh`): the runtime is a virtio-gpu
+    driver, `/dev/dri/renderD128` with its sysfs, timeline syncobjs and
+    sync files, virglrenderer `dlopen`ed in proxy mode; Venus runs through
+    it as on Linux (`vkcube`, the dEQP-VK subset, fences ~40–70 µs over
+    native a round trip). Transform feedback in KosmicKrisp (our patch,
+    `gpu/kosmickrisp-transform-feedback.patch`): Zink says GL 3.3 and
+    GLES 3.1 without an override. A render worker's death is a lost
+    device to the guest at once. Step 3 done: 91–95% of native frame rate
+    draw-bound (10,000 draws a frame), 95–100% GPU-bound; a fence's round
+    trip ~40 µs over native, broken down (`MACWL_GPU_TRACE`). Step 4
+    done: zero-copy presenting (the guest WSI's prime path: a GPU copy into
+    a dma-buf that is shared memory the shell draws from; linux-dmabuf in
+    the compositor); Zink presents the same way. A guest GPU client's key →
+    glass was ~1.5–2 ms over native Metal (`gpu/latency.sh`); after the
+    GPU warm-up on keys, keys flushed at once and framebuffer-only
+    drawables, ~1 ms on an idle machine; with implicit fencing (Venus
+    commits at once, the shell's GPU waits for the client's fence, told by
+    macwl-run over a socket) ~0.5 ms (key → GPU done p50; docs/gpu.md);
+    for a full-screen client, ~0.4 ms with its frames drawn by the GPU
+    worker straight into the shell's drawable (~1.1 composited).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with

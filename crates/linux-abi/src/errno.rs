@@ -22,6 +22,7 @@ pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;
 pub const EXDEV: i64 = 18;
 pub const ENODEV: i64 = 19;
+pub const ETIME: i64 = 62;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;

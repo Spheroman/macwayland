@@ -195,6 +195,12 @@ fn environment() -> Vec<Vec<u8>> {
     {
         env.push([&b"FONTCONFIG_FILE="[..], conf.as_os_str().as_bytes()].concat());
     }
+    // With the GPU, Venus commits a frame without waiting for its drawing:
+    // the compositor waits instead, told of the buffer's fence
+    // (docs/gpu.md, "Implicit fencing"; ~0.6 ms of a key's latency).
+    if linux_abi::drm::enabled() {
+        env.push(b"venus_implicit_fencing=true".to_vec());
+    }
     // MACWL_ENV_<NAME>=value sets <NAME> for the guest (replacing the above):
     // without --root, say, PATH=Linux tools, since the Mac's /bin holds Mac
     // programs.
