@@ -12,6 +12,9 @@
 //! window between two dark greys. ScreenCaptureKit watches the display, and the
 //! first captured frame showing the new shade gives event → displayTime.
 //!
+//! `NATIVE_WITH_TRANSACTION=1` presents the metal mode's drawables inside a
+//! Core Animation transaction (`presentsWithTransaction`).
+//!
 //! `native-probe metal --no-capture [samples]` skips ScreenCaptureKit and
 //! reports presentedTime alone: capturing the screen can make WindowServer
 //! composite a full-screen window it would otherwise show directly, which
@@ -256,8 +259,20 @@ fn apply(light: bool) {
                     });
                     unsafe { d.addPresentedHandler(RcBlock::as_ptr(&handler)) };
                 }
-                cmd.presentDrawable(d);
-                cmd.commit();
+                // NATIVE_WITH_TRANSACTION=1: present as part of a Core
+                // Animation transaction, the path a layer's `contents` takes
+                // (docs/gpu.md, "IOSurface direct display": a frame slower).
+                if layer.presentsWithTransaction() {
+                    cmd.commit();
+                    cmd.waitUntilScheduled();
+                    CATransaction::begin();
+                    d.present();
+                    CATransaction::commit();
+                    CATransaction::flush();
+                } else {
+                    cmd.presentDrawable(d);
+                    cmd.commit();
+                }
             }
         }
     });
@@ -381,6 +396,7 @@ fn main() {
             layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
             layer.setOpaque(true);
             layer.setMaximumDrawableCount(2);
+            layer.setPresentsWithTransaction(std::env::var_os("NATIVE_WITH_TRANSACTION").is_some());
             let scale = screen.backingScaleFactor();
             layer.setContentsScale(scale);
             layer.setDrawableSize(objc2_foundation::NSSize {

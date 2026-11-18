@@ -665,6 +665,8 @@ native-probe, the system call log), on the direct full-screen path:
   it through a no-copy buffer over its memory), but it saves at most the
   0.5 ms composite, may cost a frame in Core Animation's transaction, and
   can't be timed with `presentedTime`. Not built.
+  Tried natively on 2026-11-18 (see "IOSurface direct display" below):
+  it does cost the frame.
 - Left to try: the runtime's wake of a blocked guest thread (102–132 µs
   against native's 45 after idle), Venus's per-frame CPU work (~0.35 ms),
   the prime path's blit (rendering straight to linear memory).
@@ -733,6 +735,35 @@ runs 8.30 / 9.08 → 7.96 / 7.89. **About 0.5 ms over native**, under step
 these runs, p90 ~5 ms, as the machine's other work had then.) What's left
 is mostly the composite's full-screen copy (~0.25 ms GPU) and the
 client's ~0.2 ms of Venus CPU work.
+
+### IOSurface direct display, 2026-11-18
+
+The composite left after implicit fencing (~0.25 ms on the GPU, a full-
+screen copy at memory bandwidth, plus ~0.2 ms encoding and scheduling)
+would go if the client's buffer were an IOSurface the shell's layer showed
+as its `contents`. Whether that's as quick to glass as a framebuffer-only
+drawable was the question, tried natively before any plumbing
+(`native-probe`):
+
+- A layer's `contents` has no `presentedTime`, and ScreenCaptureKit makes
+  WindowServer composite, so neither times it. Watching the replaced
+  surface go out of use (`IOSurfaceIsInUse`) looked like a signal (for a
+  drawable it lagged `presentedTime` by ~0.5 ms once) but wasn't steady:
+  a drawable's surface was sometimes released 0.08 ms after the event, and
+  the contents path's median moved 5.3 → 8.9 ms between identical runs.
+  Nor do a CVDisplayLink's timestamps mark the refreshes (`presentedTime`s
+  fall evenly across its period).
+- What does tell: a full-screen CAMetalLayer presenting inside a Core
+  Animation transaction (`presentsWithTransaction`, the path a `contents`
+  change takes, `NATIVE_WITH_TRANSACTION=1`), against presenting as usual,
+  two pairs of 100: p50 17.26 / 15.75 ms against 7.42 / 7.30, min 5.28 /
+  4.15 against 3.53 / 3.15. **About a frame slower.**
+
+So showing a client's IOSurface through Core Animation would trade the
+~0.4 ms composite for a frame (8.3 ms). Not built. Saving the composite
+would need the client's frame drawn into the drawable itself (the
+drawable's IOSurface handed to the GPU worker each frame), which
+CAMetalLayer's ownership of its drawables makes awkward.
 
 ## Transform feedback in KosmicKrisp, 2026-11-14
 
