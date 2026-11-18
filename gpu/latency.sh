@@ -15,7 +15,8 @@ n=${1:-40}
 mode=${2:-fifo}
 cargo build -q --release -p macwl-shell -p macwl-runtime
 "$root/scripts/sign-hv.sh" "$root/target/release/macwl-run" >/dev/null 2>&1
-eval "$("$here/build.sh")"
+gpu_env=$("$here/build.sh")
+eval "$gpu_env"
 [ -e "$root/target/gpu/roots/linux-mesa" ] || nix build --max-jobs 0 --out-link "$root/target/gpu/roots/linux-mesa" nixpkgs#legacyPackages.aarch64-linux.mesa.out >&2
 export MACWL_ENV_VK_ICD_FILENAMES=$(readlink "$root/target/gpu/roots/linux-mesa")/share/vulkan/icd.d/virtio_icd.aarch64.json
 runtime=/tmp/macwl-latency-$(id -u)

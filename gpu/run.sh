@@ -7,7 +7,8 @@
 #   gpu/run.sh vulkaninfo --summary
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-eval "$("$here/build.sh")"
+gpu_env=$("$here/build.sh")
+eval "$gpu_env"
 if [ -z "${MACWL_ENV_VK_ICD_FILENAMES:-}" ]; then
     [ -e "$here/../target/gpu/roots/linux-mesa" ] || nix build --max-jobs 0 --out-link "$here/../target/gpu/roots/linux-mesa" nixpkgs#legacyPackages.aarch64-linux.mesa.out >&2
     export MACWL_ENV_VK_ICD_FILENAMES=$(readlink "$here/../target/gpu/roots/linux-mesa")/share/vulkan/icd.d/virtio_icd.aarch64.json

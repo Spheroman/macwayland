@@ -19,9 +19,14 @@ if [ ! -x "$out/virglrenderer/build/vtest/virgl_test_server" ] || [ "$patch" -nt
         git clone -q https://gitlab.freedesktop.org/virgl/virglrenderer.git "$out/virglrenderer"
     fi
     git -C "$out/virglrenderer" checkout -q -f "$rev"
+    # (Files the patch adds stay behind, untracked, and would stop it
+    # applying; the build directory is left alone.)
+    git -C "$out/virglrenderer" clean -q -f -- src vtest
     git -C "$out/virglrenderer" apply "$patch"
     (cd "$out/virglrenderer" && nix-shell "$here/build-shell.nix" --run \
         '[ -d build ] || meson setup build -Dvrend=false -Dvenus=true -Drender-server-mode=process; ninja -C build') >&2
+    # Built from this patch (ninja needn't relink the test server).
+    touch "$out/virglrenderer/build/vtest/virgl_test_server"
 fi
 ln -sf ../virglrenderer/build/src/libvirglrenderer.1.dylib "$out/bin/"
 ln -sf ../virglrenderer/build/server/virgl_render_server "$out/bin/"

@@ -741,6 +741,8 @@ struct Renderer {
     /// Clients' frames drawn into our drawable by their GPU worker
     /// (`direct`; MACWL_DIRECT=0 is off).
     direct_on: bool,
+    /// The drawable count is ours to change (MACWL_DRAWABLES not set).
+    drawables_free: bool,
     direct: Option<direct::Direct>,
     /// The full-screen surface's buffers' keys (what an offer is for).
     window: Option<(u32, Vec<direct::Key>)>,
@@ -878,6 +880,13 @@ impl Renderer {
             let s = direct.state.0.lock().unwrap();
             (s.offer.is_some(), s.has_peers())
         };
+        // Three drawables only while one is held on offer (or about to be).
+        if self.drawables_free {
+            let want = if self.window.is_some() && peers { 3 } else { 2 };
+            if self.layer.maximumDrawableCount() != want && !(want == 2 && offered) {
+                self.layer.setMaximumDrawableCount(want);
+            }
+        }
         match (&self.window, offered) {
             (Some((_, keys)), false) if peers => {
                 if let Some(drawable) = self.layer.nextDrawable() {
@@ -1493,9 +1502,11 @@ fn main() {
         .map(|i| args.get(i + 1).and_then(|n| n.parse().ok()).unwrap_or(40));
     let frame_latency: f32 =
         std::env::var("MACWL_FRAME_LATENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    // (Direct drawing holds a drawable on offer: a third for the rest.)
     let direct_on = env_flag("MACWL_DIRECT", true);
-    let drawables: usize = std::env::var("MACWL_DRAWABLES").ok().and_then(|v| v.parse().ok()).unwrap_or(if direct_on { 3 } else { 2 });
+    // (Direct drawing takes a third while it holds one on offer: with three
+    // all the time, composited frames reached the glass ~3 refreshes later.)
+    let drawables_set = std::env::var("MACWL_DRAWABLES").ok().and_then(|v| v.parse::<usize>().ok());
+    let drawables = drawables_set.unwrap_or(2);
     let vsync = env_flag("MACWL_VSYNC", true);
     let fb_only = env_flag("MACWL_FBONLY", true);
     let on_demand = std::env::var("MACWL_PACING").map(|v| v != "link").unwrap_or(true);
@@ -1730,6 +1741,7 @@ fn main() {
         key_pending,
         auto_keys,
         direct_on,
+        drawables_free: drawables_set.is_none(),
         direct: None,
         window: None,
     };

@@ -801,7 +801,9 @@ How (on by default; `MACWL_DIRECT=0` is off):
   after as before, so the client's buffer is right for anything that
   composites it later.
 - **The shell** (`crates/shell/src/direct.rs`): while one opaque surface
-  exactly fills the drawable, holds a drawable (three, not two) and offers
+  exactly fills the drawable, holds a drawable (three while it does, two
+  otherwise: with three all the time, composited frames reached the glass
+  ~3 refreshes later, p50 35.6 against 10.6–13.8 ms) and offers
   its IOSurface for that surface's buffers (REKEY as it learns more);
   presents it on DONE, from the receive thread; for a frame claimed (or
   presented already), keeps the scene's books and draws nothing. When
@@ -830,6 +832,14 @@ About 0.4 ms over native, from ~1.1 for a full-screen client composited
 against composited: 11.41 / 12.11 / 12.07 against 13.26 / 12.48 / 12.95
 (native's 10.92 / 9.56 / 11.26 were high throughout: composited by
 WindowServer, it seems, after the display woke).
+
+The Mac was on battery for all of this (Low Power Mode: everything
+slower; key → commit 0.7–0.9 ms where it had been ~0.5), so these are
+comparisons more than figures. Again later, the drawable count switching
+as above, two rounds of 80: key → glass p50 direct 12.17 / 12.51, with
+three drawables fixed 11.78 / 12.86, composited 14.50 / 13.45, native
+11.31; at 1× (never direct) direct on and off alike (11.33 / 13.02). To
+measure again on mains power.
 
 ## Transform feedback in KosmicKrisp, 2026-11-14
 

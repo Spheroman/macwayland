@@ -17,7 +17,8 @@
 set -eu
 socket=${1:?usage: gpu/vtest.sh SOCKET}
 here=$(cd "$(dirname "$0")" && pwd)
-eval "$("$here/build.sh")"
+gpu_env=$("$here/build.sh")
+eval "$gpu_env"
 out=$here/../target/gpu
 export RENDER_SERVER_EXEC_PATH=$out/virglrenderer/build/server/virgl_render_server
 export DYLD_LIBRARY_PATH=$MACWL_GPU_DYLD_LIBRARY_PATH:$out/virglrenderer/build/src
