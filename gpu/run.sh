@@ -9,7 +9,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 eval "$("$here/build.sh")"
 if [ -z "${MACWL_ENV_VK_ICD_FILENAMES:-}" ]; then
-    nix build --max-jobs 0 --out-link "$here/../target/gpu/roots/linux-mesa" nixpkgs#legacyPackages.aarch64-linux.mesa.out >&2
+    [ -e "$here/../target/gpu/roots/linux-mesa" ] || nix build --max-jobs 0 --out-link "$here/../target/gpu/roots/linux-mesa" nixpkgs#legacyPackages.aarch64-linux.mesa.out >&2
     export MACWL_ENV_VK_ICD_FILENAMES=$(readlink "$here/../target/gpu/roots/linux-mesa")/share/vulkan/icd.d/virtio_icd.aarch64.json
 fi
 exec "$here/../target/debug/macwl-run" "$@"

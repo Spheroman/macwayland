@@ -391,7 +391,8 @@ from a static Linux binary.
     the compositor); Zink presents the same way. A guest GPU client's key →
     glass was ~1.5–2 ms over native Metal (`gpu/latency.sh`); after the
     GPU warm-up on keys, keys flushed at once and framebuffer-only
-    drawables, 0.65 ms (p50, warm GPU; to confirm on an idle machine).
+    drawables, 0.65 ms with the GPU kept warm by other work, ~0.9–1.1 ms
+    on an idle machine (p50 and min, three alternating pairs; docs/gpu.md).
 12. **Real apps.** In progress. Done: `epoll` (on kqueue; a fork child gets
     its own kqueue watching the same fds), `eventfd` and `timerfd` (kqueue
     based, so epoll can watch them), pseudo-terminals (`/dev/ptmx` with

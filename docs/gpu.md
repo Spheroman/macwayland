@@ -637,6 +637,18 @@ native-probe, the system call log), on the direct full-screen path:
   covers most of it). The shell now draws its background and surfaces in
   one pass (no separate clear pass; the composite's 0.5 ms is reading the
   client's frame, not the clear).
+- **On an idle machine** (2026-11-18; plugged in, nothing heavy running):
+  three alternating pairs of 200 keys, native `native-probe metal
+  --no-capture 200` against `gpu/latency.sh 200`. Native p50 6.97, 5.92,
+  6.53 ms; keyframe 7.23, 7.61, 7.82; its key → commit 0.98–1.08. Means:
+  p50 6.47 against 7.55, **~1.1 ms over native**; p90 9.84 against 10.26
+  (+0.4); min 2.69 against 3.57 (+0.9, the steadiest: a key's phase in
+  the 8.3 ms frame moves p50 by ±0.5 ms between runs of the same thing).
+  So the warm 0.65 doesn't hold once the GPU sleeps between keys: ~0.9–1.1
+  ms over native, at the target rather than under it. (A fourth native run,
+  p50 20.75 and min 16.6, went through compositing and is left out.) Key
+  → commit is most of the difference; the warm-up covers part of the
+  GPU's wake, not all.
 - Where a blocked guest thread's wake goes after ~150 ms idle
   (`MACWL_WAKE_TRACE=1` times guest runs): 81 µs from a message to the
   guest's next clock reading, native 35; ~10 of it is waiting in `poll`

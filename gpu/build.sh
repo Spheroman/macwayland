@@ -25,9 +25,24 @@ if [ ! -x "$out/virglrenderer/build/vtest/virgl_test_server" ] || [ "$patch" -nt
 fi
 ln -sf ../virglrenderer/build/src/libvirglrenderer.1.dylib "$out/bin/"
 ln -sf ../virglrenderer/build/server/virgl_render_server "$out/bin/"
-# (GC roots, so a collection doesn't take them while they're in use.)
-nix build --out-link "$out/roots/kk-main" --impure -f "$here/kosmickrisp-main.nix" >&2
-nix build --out-link "$out/roots/vulkan-loader" nixpkgs#vulkan-loader >&2
+# Everything from Nix is a GC root, so a collection doesn't take it while
+# it's in use, and is built once: `nixpkgs` floats with the registry, and
+# building again on every bump would fetch a new world (or rebuild Mesa).
+# root LINK ARGS...: nix build ARGS into roots/LINK unless LINK is there
+# (Nix names a non-default output's link LINK-OUTPUT: linux-glibc-dev;
+# remove roots/ to move to the registry's current nixpkgs.)
+root() {
+    link=$1
+    shift
+    [ -e "$out/roots/$link" ] || nix build --out-link "$out/roots/${link%-bin}" "$@" >&2
+}
+# KosmicKrisp again only when its recipe or patches change.
+kkstamp=$out/roots/.kk-main
+if [ ! -e "$out/roots/kk-main" ] || [ ! -e "$kkstamp" ] || [ -n "$(find "$here/kosmickrisp-main.nix" "$here/kosmickrisp-transform-feedback" -newer "$kkstamp" | head -1)" ]; then
+    nix build --out-link "$out/roots/kk-main" --impure -f "$here/kosmickrisp-main.nix" >&2
+    touch "$kkstamp"
+fi
+root vulkan-loader nixpkgs#vulkan-loader
 # fencebench for Linux (glibc, from nixpkgs' cache: no Linux builder needed)
 # and for macOS, to compare (docs/gpu.md, step 2).
 # (drawbench too, its shaders compiled to SPIR-V with glslang.)
@@ -35,15 +50,14 @@ for src in "$here/drawbench.c" "$here/keyframe.c" "$here/shaders/draw.vert" "$he
     [ "$src" -nt "$out/drawbench-linux" ] && rm -f "$out/fencebench-linux"
 done
 if [ ! -x "$out/fencebench-linux" ] || [ "$here/fencebench.c" -nt "$out/fencebench-linux" ]; then
-    nix build --out-link "$out/roots/glslang" nixpkgs#glslang >&2
+    root glslang-bin nixpkgs#glslang
     for stage in vert frag; do
         "$(readlink "$out/roots/glslang-bin")/bin/glslangValidator" -V --vn "draw_$stage" -o "$out/draw.$stage.h" "$here/shaders/draw.$stage" >&2
     done
-    # (Nix names a non-default output's link LINK-OUTPUT: linux-glibc-dev.)
-    nix build --max-jobs 0 --out-link "$out/roots/linux-glibc" "nixpkgs#legacyPackages.aarch64-linux.glibc^out,dev" >&2
-    nix build --max-jobs 0 --out-link "$out/roots/linux-vulkan-loader" "nixpkgs#legacyPackages.aarch64-linux.vulkan-loader^out" >&2
-    nix build --out-link "$out/roots/vulkan-headers" nixpkgs#vulkan-headers >&2
-    nix build --out-link "$out/roots/lld" nixpkgs#llvmPackages.lld >&2
+    root linux-glibc --max-jobs 0 "nixpkgs#legacyPackages.aarch64-linux.glibc^out,dev"
+    root linux-vulkan-loader --max-jobs 0 "nixpkgs#legacyPackages.aarch64-linux.vulkan-loader^out"
+    root vulkan-headers nixpkgs#vulkan-headers
+    root lld nixpkgs#llvmPackages.lld
     gl=$(readlink "$out/roots/linux-glibc")
     clang --target=aarch64-unknown-linux-gnu -O2 -nostdinc -isystem "$(readlink "$out/roots/linux-glibc-dev")/include" \
         -isystem "$(clang -print-resource-dir)/include" -I "$(readlink "$out/roots/vulkan-headers")/include" \
@@ -63,9 +77,9 @@ if [ ! -x "$out/fencebench-linux" ] || [ "$here/fencebench.c" -nt "$out/fenceben
         "$gl/lib/crt1.o" "$gl/lib/crti.o" "$out/drawbench.o" -L"$gl/lib" -L"$(readlink "$out/roots/linux-vulkan-loader")/lib" \
         -lvulkan -lc -lm "$gl/lib/crtn.o"
     # keyframe (Linux only: a Wayland client): libwayland and xdg-shell.
-    nix build --max-jobs 0 --out-link "$out/roots/linux-wayland" "nixpkgs#legacyPackages.aarch64-linux.wayland^out,dev" >&2
-    nix build --max-jobs 0 --out-link "$out/roots/wayland-protocols" "nixpkgs#legacyPackages.aarch64-linux.wayland-protocols" >&2
-    nix build --out-link "$out/roots/wayland-scanner" nixpkgs#wayland-scanner >&2
+    root linux-wayland --max-jobs 0 "nixpkgs#legacyPackages.aarch64-linux.wayland^out,dev"
+    root wayland-protocols --max-jobs 0 "nixpkgs#legacyPackages.aarch64-linux.wayland-protocols"
+    root wayland-scanner-bin nixpkgs#wayland-scanner
     xdg=$(readlink "$out/roots/wayland-protocols")/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
     scanner=$(readlink "$out/roots/wayland-scanner-bin")/bin/wayland-scanner
     "$scanner" client-header "$xdg" "$out/xdg-shell-client-protocol.h"
